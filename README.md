@@ -1,53 +1,30 @@
 # RepoPrompt CE
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-black)
+![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
 
-**The open-source macOS Context IDE for AI coding agents.**
+**A native macOS app and agent orchestrator for context engineering.**
 
-RepoPrompt CE helps you assemble, inspect, and hand off rich codebase context.
-Pick the right files across one or more repositories, summarize project
-structure and Git history, and package it all into a dense, reviewable prompt
-for ChatGPT, Claude, Codex, Cursor, and other AI coding tools — or hand that
-context straight to agents through the bundled MCP server and CLI.
+RepoPrompt CE helps coding agents understand your codebase before they act. It
+assembles focused, reviewable context from files, CodeMaps, repository
+structure, and Git diffs, then hands that context to AI tools and CLI agents.
 
-> **Heads up:** RepoPrompt CE is built largely *with* and *for* AI coding
-> agents. This README is written for people getting started; the deeper
-> day-to-day development workflow lives in [`AGENTS.md`](AGENTS.md) and is
-> geared toward agents.
+RepoPrompt CE also builds an agent harness around its bundled MCP server.
+Connect MCP-compatible clients and CLI agents to search repositories, inspect
+files, curate context, run agent sessions, and orchestrate work through a shared
+native macOS interface.
 
-## Features
+## Get Started
 
-- **Curate context** — Build focused, reviewable context for an AI model from
-  one or more repositories.
-- **Combine everything** — Merge selected files, project-structure maps,
-  function/type CodeMaps, and Git diffs into a single prompt.
-- **Discover automatically** — Run Context Builder to find relevant code and
-  produce an optimized prompt for you.
-- **Think it through** — Plan, review, and ask follow-up questions in built-in
-  chat, including an Oracle flow for second opinions.
-- **Run agents** — Drive longer sessions in Agent Mode with supported
-  CLI-backed providers.
-- **Connect your tools** — Let external MCP clients search, inspect, and select
-  repository context from your own setup.
+Choose one of these local setup paths. You do not need to open Xcode.
 
-## Quick Start
+### Build and launch locally
 
-RepoPrompt CE currently runs as a local source build — you do not need to open
-Xcode.
+For development and quick evaluation, double-click
+[`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command) in Finder.
 
-**Requirements**
-
-- macOS 14 (Sonoma) or later
-- Xcode 26, or the matching Command Line Tools with the macOS 26 SDK
-
-**Run the app**
-
-1. Double-click [`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command)
-   in Finder. The launcher builds and opens RepoPrompt CE for you.
-2. Keep the small launcher terminal open while you use the app.
-
-**Launcher controls**
+The launcher builds RepoPrompt CE from source, opens the debug app, and keeps a
+small terminal window available for rebuild, status, and stop controls.
 
 | Key | Action                                      |
 | --- | ------------------------------------------- |
@@ -56,42 +33,65 @@ Xcode.
 | `x` | Stop the app                                |
 | `q` | Close the launcher without stopping the app |
 
-**Install a local production build**
+### Install a local production build
 
-Double-click
+For a release-mode app under `/Applications`, double-click
 [`Install RepoPrompt CE Local Production.command`](Install%20RepoPrompt%20CE%20Local%20Production.command)
-in Finder to build and install a release-mode app under `/Applications` using
-your own self-signed local certificate. The resulting app is local-only: it is
-not notarized and should not be redistributed.
+in Finder.
+
+The installer builds RepoPrompt CE from source and installs
+`/Applications/RepoPrompt CE.app` using a dedicated self-signed certificate
+trusted only on your Mac. macOS may ask you to approve the certificate.
+
+The resulting app is local-only. It is not notarized and should not be copied to
+another Mac or redistributed.
+
+### Source-build requirements
+
+- macOS 26 or later
+- Xcode 26, or matching Command Line Tools with the macOS 26 SDK
+
+## Features
+
+- **Context engineering**: Build dense, reviewable prompts with the files and
+  repository details an AI model actually needs.
+- **Codebase orientation**: Combine file trees, selected file contents, line
+  slices, CodeMaps, and Git diffs.
+- **Context Builder**: Let an agent explore the repository, identify relevant
+  files, and curate context within a token budget.
+- **Agent orchestration**: Run and coordinate CLI-backed coding agents from the
+  native macOS app.
+- **MCP server and CLI integration**: Connect external MCP-compatible tools and
+  CLI agents to RepoPrompt CE's repository context and agent harness.
+- **Multi-root workspaces**: Work across related repositories, packages, and
+  documentation folders in one workspace.
+- **Reviewable handoffs**: Inspect and refine selected context before sending it
+  to another model or agent.
 
 ## About the Community Edition
 
-RepoPrompt CE is the open-source community edition of RepoPrompt, originally a
-paid macOS app. It removes paid activation flows and license keys while keeping
-the core prompt, copy, chat, CodeMap, Agent Mode, and custom-provider features
-available without paid license gates.
+RepoPrompt CE is the free, open-source community edition of RepoPrompt. It is a
+native macOS workspace for context engineering, agent orchestration, and local
+development.
 
 Maintainers track release signing, Sparkle metadata, dependency pins, and
 third-party notices in
 [`docs/open-source-readiness.md`](docs/open-source-readiness.md).
 
-## Documentation
+## Contributor Documentation
 
-The detailed development workflow is split across focused docs — most are
-oriented toward contributors and agents:
-
-- [`AGENTS.md`](AGENTS.md) — start here for coordinated builds, tests, launches,
-  live MCP checks, source placement, and contribution preflight.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution policy and pull request
-  steps.
-- [`docs/architecture/source-layout.md`](docs/architecture/source-layout.md) —
-  source ownership and placement rules.
-- [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md)
-  — Agent Mode provider architecture.
-- [`docs/releasing.md`](docs/releasing.md) — release-candidate and publishing
-  workflows.
-- [`docs/open-source-readiness.md`](docs/open-source-readiness.md) — public
-  readiness inventory.
+- [`AGENTS.md`](AGENTS.md): coordinated builds, tests, launches, live MCP
+  checks, source placement, and contribution preflight
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): contribution policy and pull request
+  steps
+- [`docs/architecture/source-layout.md`](docs/architecture/source-layout.md):
+  source ownership and placement rules
+- [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):
+  Agent Mode provider architecture
+- [`docs/releasing.md`](docs/releasing.md): release-candidate and publishing
+  workflows
+- [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public
+  readiness inventory
 
 ## License
 
