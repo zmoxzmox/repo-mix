@@ -29,6 +29,7 @@ run(){
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 finish(){
     local status=$? now total
+    [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
     now="$(date +%s)"
     total=$((now - START_TIME))
     if (( status == 0 )); then
@@ -65,6 +66,7 @@ PREFER_STABLE_DEBUG_SIGNING="${PREFER_STABLE_DEBUG_SIGNING:-1}"
 DEBUG_SECURE_STORAGE_BACKEND="${DEBUG_SECURE_STORAGE_BACKEND:-}"
 REPOPROMPT_PROVISIONING_PROFILE="${REPOPROMPT_PROVISIONING_PROFILE:-}"
 APP_ENTITLEMENTS_TEMPLATE="${APP_ENTITLEMENTS_TEMPLATE:-$ROOT_DIR/AppBundle/RepoPrompt.entitlements.template}"
+APP_ENTITLEMENTS=""
 USE_ADHOC_SIGNING=0
 DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
 warn_adhoc_signing(){
@@ -186,13 +188,14 @@ if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     run rm -f "$PROFILE_PLIST"
     [[ "$PROFILE_APP_IDENTIFIER" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] || fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
     run cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+    APP_ENTITLEMENTS="$(mktemp)"
     run python3 - <<PY
 from pathlib import Path
 s=Path('$APP_ENTITLEMENTS_TEMPLATE').read_text()
 for k,v in {'__BUNDLE_ID__':'$BUNDLE_ID','__SIGNING_TEAM_ID__':'$SIGNING_TEAM_ID'}.items(): s=s.replace(k,v)
-Path('$APP_BUNDLE/Contents/RepoPrompt.entitlements').write_text(s)
+Path('$APP_ENTITLEMENTS').write_text(s)
 PY
-    run plutil -lint "$APP_BUNDLE/Contents/RepoPrompt.entitlements"
+    run plutil -lint "$APP_ENTITLEMENTS"
 fi
 
 phase "Copying dynamic frameworks"
@@ -242,7 +245,7 @@ sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 APP_SIGN_ARGS=(--deep)
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
-    APP_SIGN_ARGS+=(--entitlements "$APP_BUNDLE/Contents/RepoPrompt.entitlements")
+    APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
 fi
 sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
