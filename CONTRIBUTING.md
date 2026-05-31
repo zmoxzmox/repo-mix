@@ -5,21 +5,14 @@ work manageable and gives maintainers room to review changes carefully.
 
 ## Contribution Gate
 
-The initial approved-contributor list is made up of RepoPrompt customers who
-submitted a GitHub username through the claim form and matched an eligible
-customer record.
-
 New issues and pull requests from accounts that are not approved are closed
 automatically. Maintainers may reopen worthwhile issues after review.
 
-The gate uses [`.github/APPROVED_CONTRIBUTORS`](.github/APPROVED_CONTRIBUTORS).
-Each entry has one capability:
+The gate uses a private repository secret maintained by the project
+maintainers. Each entry has one capability:
 
 - `issue`: issues stay open.
 - `pr`: issues and pull requests stay open.
-
-Approved contributors may open a pull request to propose additions or removals.
-Core contributors decide whether to merge those changes.
 
 The allowlist does not grant repository access. Invitations and organization
 membership are managed separately.

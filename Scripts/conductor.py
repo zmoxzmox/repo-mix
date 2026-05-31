@@ -128,7 +128,7 @@ Operation commands:
   ./conductor smoke [--launch] [--workspace <name>] [--window-id <id>] [--agent-run]
     (without --launch, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
-  ./conductor release preflight|package
+  ./conductor release preflight|artifact|package
 
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
@@ -761,8 +761,11 @@ class OperationRegistry:
         "SIGN_IDENTITY",
         "SIGNING_TEAM_ID",
         "ALLOW_ADHOC_SIGNING",
+        "RELEASE_ALLOW_ADHOC_SIGNING",
         "PREFER_STABLE_DEBUG_SIGNING",
         "DEBUG_SECURE_STORAGE_BACKEND",
+        "REPOPROMPT_PROVISIONING_PROFILE",
+        "APP_ENTITLEMENTS_TEMPLATE",
         "BUNDLE_ID",
     ]
     DEBUG_ENV_KEYS = [
@@ -914,6 +917,8 @@ class OperationRegistry:
             subcommand = args.get("subcommand")
             if subcommand == "package":
                 return [script("package_app.sh"), "release"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
+            if subcommand == "artifact":
+                return [script("release.sh"), "artifact"], ["build", "debugArtifact", "release"], cwd, env, effective_timeout
             if subcommand == "preflight":
                 release_script = self.repo_root / "Scripts" / "release.sh"
                 if release_script.exists():
@@ -967,7 +972,7 @@ class OperationRegistry:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
-        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") == "package"):
+        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"artifact", "package"}):
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
@@ -2886,7 +2891,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         args.update({"subcommand": ns.subcommand, "logFile": ns.log_file, "windowId": ns.window_id})
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
-        parser.add_argument("subcommand", choices=["preflight", "package"])
+        parser.add_argument("subcommand", choices=["preflight", "artifact", "package"])
         ns = parser.parse_args(rest)
         args["subcommand"] = ns.subcommand
     else:

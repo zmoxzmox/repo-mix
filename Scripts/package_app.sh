@@ -60,8 +60,11 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
 fi
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 ALLOW_ADHOC_SIGNING="${ALLOW_ADHOC_SIGNING:-0}"
+RELEASE_ALLOW_ADHOC_SIGNING="${RELEASE_ALLOW_ADHOC_SIGNING:-0}"
 PREFER_STABLE_DEBUG_SIGNING="${PREFER_STABLE_DEBUG_SIGNING:-1}"
 DEBUG_SECURE_STORAGE_BACKEND="${DEBUG_SECURE_STORAGE_BACKEND:-}"
+REPOPROMPT_PROVISIONING_PROFILE="${REPOPROMPT_PROVISIONING_PROFILE:-}"
+APP_ENTITLEMENTS_TEMPLATE="${APP_ENTITLEMENTS_TEMPLATE:-$ROOT_DIR/AppBundle/RepoPrompt.entitlements.template}"
 USE_ADHOC_SIGNING=0
 DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
 warn_adhoc_signing(){
@@ -69,6 +72,10 @@ warn_adhoc_signing(){
     echo "WARNING: RepoPrompt debug runtime will use ephemeral in-memory secure storage instead of macOS Keychain for API keys and secure permission documents."
     echo "WARNING: Keychain consent prompts should be avoided, but secrets and secure permission changes saved in this run will not persist across app launches."
     echo "WARNING: Use explicit SIGN_IDENTITY=\"Apple Development: ...\" for real local Keychain persistence."
+}
+warn_release_candidate_signing(){
+    echo "WARNING: Using explicit ad-hoc signing for a release-candidate package."
+    echo "WARNING: This artifact exercises release packaging only. It is not notarizable, distributable, or suitable for GitHub Releases."
 }
 if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && [[ "$PREFER_STABLE_DEBUG_SIGNING" == "1" || "$PREFER_STABLE_DEBUG_SIGNING" == "true" ]]; then
     AUTO_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/"Apple Development: / { print $2; exit }')"
@@ -79,14 +86,20 @@ if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && [[ "$PREFER_STABLE_DEBUG_S
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
     if (( IS_RELEASE )); then
-        fail "Release packaging requires SIGN_IDENTITY and will not produce an ad-hoc signed app. Set SIGN_IDENTITY to a stable Apple signing identity for team $SIGNING_TEAM_ID."
+        if [[ "$RELEASE_ALLOW_ADHOC_SIGNING" != "1" && "$RELEASE_ALLOW_ADHOC_SIGNING" != "true" ]]; then
+            fail "Release packaging requires SIGN_IDENTITY and will not produce an ad-hoc signed app by default. Set SIGN_IDENTITY to a stable Apple signing identity for team $SIGNING_TEAM_ID."
+        fi
+        USE_ADHOC_SIGNING=1
+        SIGN_IDENTITY="-"
+        warn_release_candidate_signing
+    else
+        if [[ "$ALLOW_ADHOC_SIGNING" != "1" && "$ALLOW_ADHOC_SIGNING" != "true" ]]; then
+            fail "Debug ad-hoc signing is disabled by default. Set ALLOW_ADHOC_SIGNING=1 to build an ad-hoc package, or set SIGN_IDENTITY for stable signing."
+        fi
+        USE_ADHOC_SIGNING=1
+        SIGN_IDENTITY="-"
+        warn_adhoc_signing
     fi
-    if [[ "$ALLOW_ADHOC_SIGNING" != "1" && "$ALLOW_ADHOC_SIGNING" != "true" ]]; then
-        fail "Debug ad-hoc signing is disabled by default. Set ALLOW_ADHOC_SIGNING=1 to build an ad-hoc package, or set SIGN_IDENTITY for stable signing."
-    fi
-    USE_ADHOC_SIGNING=1
-    SIGN_IDENTITY="-"
-    warn_adhoc_signing
 else
     if (( ! IS_RELEASE )) && (( ! SIGN_IDENTITY_WAS_EXPLICIT )) && [[ -z "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then
         echo "WARNING: Auto-detected debug signing will use ephemeral in-memory secure storage to avoid macOS Keychain prompts."
@@ -98,7 +111,7 @@ else
     fi
 fi
 
-if (( IS_RELEASE )); then
+if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
 elif [[ -n "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then
     case "$DEBUG_SECURE_STORAGE_BACKEND" in
@@ -163,6 +176,25 @@ Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 
+if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
+    phase "Embedding release provisioning profile and entitlements"
+    [[ -f "$REPOPROMPT_PROVISIONING_PROFILE" ]] || fail "Signed release packaging requires REPOPROMPT_PROVISIONING_PROFILE pointing to the RepoPrompt CE Developer ID provisioning profile."
+    [[ -f "$APP_ENTITLEMENTS_TEMPLATE" ]] || fail "Missing release entitlements template: $APP_ENTITLEMENTS_TEMPLATE"
+    PROFILE_PLIST="$(mktemp)"
+    run security cms -D -i "$REPOPROMPT_PROVISIONING_PROFILE" -o "$PROFILE_PLIST"
+    PROFILE_APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
+    run rm -f "$PROFILE_PLIST"
+    [[ "$PROFILE_APP_IDENTIFIER" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] || fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
+    run cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+    run python3 - <<PY
+from pathlib import Path
+s=Path('$APP_ENTITLEMENTS_TEMPLATE').read_text()
+for k,v in {'__BUNDLE_ID__':'$BUNDLE_ID','__SIGNING_TEAM_ID__':'$SIGNING_TEAM_ID'}.items(): s=s.replace(k,v)
+Path('$APP_BUNDLE/Contents/RepoPrompt.entitlements').write_text(s)
+PY
+    run plutil -lint "$APP_BUNDLE/Contents/RepoPrompt.entitlements"
+fi
+
 phase "Copying dynamic frameworks"
 printf 'Framework destination: %s\n' "$APP_BUNDLE/Contents/Frameworks"
 echo_cmd find "$ROOT_DIR/.build" -path '*/Sparkle.framework' -type d -prune -print -exec cp -R {} "$APP_BUNDLE/Contents/Frameworks/" ';'
@@ -208,7 +240,11 @@ verify_signed_app_identity(){
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_path "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-sign_path "$APP_BUNDLE" --deep
+APP_SIGN_ARGS=(--deep)
+if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
+    APP_SIGN_ARGS+=(--entitlements "$APP_BUNDLE/Contents/RepoPrompt.entitlements")
+fi
+sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
 if [[ "$(python3 - <<PY
@@ -218,7 +254,13 @@ PY
 )" != "True" ]]; then
     phase "Updating compatibility app bundle link"
     run mkdir -p "$(dirname "$COMPAT_APP_BUNDLE")"
-    if (( USE_ADHOC_SIGNING )); then warn_adhoc_signing; fi
+    if (( USE_ADHOC_SIGNING )); then
+        if (( IS_RELEASE )); then
+            warn_release_candidate_signing
+        else
+            warn_adhoc_signing
+        fi
+    fi
     run ln -sfn "$APP_BUNDLE" "$COMPAT_APP_BUNDLE"
     printf 'Compatibility link: %s -> %s\n' "$COMPAT_APP_BUNDLE" "$APP_BUNDLE"
 fi

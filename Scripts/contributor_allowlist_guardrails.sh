@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-allowlist="${CONTRIBUTOR_ALLOWLIST_FILE:-.github/APPROVED_CONTRIBUTORS}"
+allowlist="${CONTRIBUTOR_ALLOWLIST_FILE:-.github/APPROVED_CONTRIBUTORS.example}"
 if [[ ! -f "$allowlist" ]]; then
   printf 'ERROR: contributor allowlist is missing: %s\n' "$allowlist" >&2
   exit 1

@@ -4,6 +4,26 @@ Original RepoPrompt CE code is released under the Apache License, Version 2.0, a
 
 This file currently records notice material identified during focused attribution remediation. It is **not** a complete dependency inventory or audit. Additional third-party notice curation remains pending as described in [`docs/open-source-readiness.md`](docs/open-source-readiness.md).
 
+## Sparkle
+
+RepoPrompt CE vendors the upstream Sparkle 2.9.2 Swift Package Manager
+distribution. The copied license is included at
+[`ThirdPartyLicenses/sparkle/LICENSE`](ThirdPartyLicenses/sparkle/LICENSE), and
+the downloaded asset checksum and provenance are recorded under
+[`Vendor/Sparkle/`](Vendor/Sparkle/).
+
+## UniversalCharsetDetection / uchardet
+
+RepoPrompt CE vendors UniversalCharsetDetection and uchardet source. Their
+copied licenses and author notice are included under
+[`ThirdPartyLicenses/universal-charset-detection/`](ThirdPartyLicenses/universal-charset-detection/).
+
+## PCRE2 and SLJIT
+
+RepoPrompt CE includes PCRE2 source and its SLJIT dependency. Their copied
+licenses are included at [`ThirdPartyLicenses/pcre2/LICENSE.txt`](ThirdPartyLicenses/pcre2/LICENSE.txt)
+and [`ThirdPartyLicenses/sljit/LICENSE`](ThirdPartyLicenses/sljit/LICENSE).
+
 ## Tree-sitter grammar packages and runtime
 
 RepoPrompt CE links Tree-sitter grammar package products through fixed, source-preserving SwiftPM revision pins. Those package dependencies still require attribution when distributed.

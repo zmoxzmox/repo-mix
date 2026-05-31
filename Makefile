@@ -1,4 +1,4 @@
-.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest dev-status dev-build dev-swift-build dev-run dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-stop-app dev-daemon-stop clean
+.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-preflight release-artifact dev-status dev-build dev-swift-build dev-run dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 
@@ -54,6 +54,12 @@ conductor-selftest:
 	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_conductor_lifecycle.py
 
+release-preflight:
+	./Scripts/release.sh preflight
+
+release-artifact:
+	./Scripts/release.sh artifact
+
 dev-status:
 	./conductor status
 
@@ -95,6 +101,12 @@ dev-check-format-tools:
 
 dev-install-format-tools:
 	./conductor install-format-tools
+
+dev-release-preflight:
+	./conductor release preflight
+
+dev-release-artifact:
+	./conductor release artifact
 
 dev-stop-app:
 	./conductor app stop

@@ -10,12 +10,13 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      APPROVED_CONTRIBUTORS: ${{ secrets.APPROVED_CONTRIBUTORS }}
     steps:
       - name: Check issue author
         uses: actions/github-script@v7
         with:
           script: |
-            const APPROVED_FILE = '.github/APPROVED_CONTRIBUTORS';
             const VALID_CAPABILITIES = new Set(['issue', 'pr']);
             const issueAuthor = context.payload.issue.user.login;
             const defaultBranch = context.payload.repository.default_branch;
@@ -36,21 +37,6 @@ jobs:
               } catch {
                 return null;
               }
-            }
-
-            async function getTextFile(path) {
-              const { data: fileContent } = await github.rest.repos.getContent({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                path,
-                ref: defaultBranch,
-              });
-
-              if (!('content' in fileContent) || typeof fileContent.content !== 'string') {
-                throw new Error(`Expected file content for ${path}`);
-              }
-
-              return Buffer.from(fileContent.content, 'base64').toString('utf8');
             }
 
             function parseApprovedUsers(content) {
@@ -85,7 +71,10 @@ jobs:
               return;
             }
 
-            const approvedContent = await getTextFile(APPROVED_FILE);
+            const approvedContent = process.env.APPROVED_CONTRIBUTORS ?? '';
+            if (!approvedContent.trim()) {
+              throw new Error('APPROVED_CONTRIBUTORS repository secret is not configured');
+            }
             const approvedUsers = parseApprovedUsers(approvedContent);
             const capability = approvedUsers.get(issueAuthor.toLowerCase());
 

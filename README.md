@@ -1,7 +1,7 @@
 # RepoPrompt CE
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Platform: macOS 26](https://img.shields.io/badge/platform-macOS%2026-black)
+![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-black)
 
 **The open-source macOS Context IDE for AI coding agents.**
 
@@ -37,7 +37,7 @@ third-party notices in [`docs/open-source-readiness.md`](docs/open-source-readin
 
 ## Requirements
 
-- macOS 26
+- macOS 14 or later to run the app
 - Xcode 26 or matching Command Line Tools with the macOS 26 SDK
 - `python3` for the coordinated developer daemon
 - Homebrew only when installing SwiftFormat and SwiftLint
@@ -161,18 +161,10 @@ make dev-smoke-launch # builds, launches, and runs the smoke flow
 
 ## Contributing
 
-The initial approved-contributor list is made up of RepoPrompt customers who
-submitted a GitHub username through the claim form and matched an eligible
-customer record.
-
-New issues and pull requests from accounts outside that list are closed
-automatically. Approved contributors may propose additions or removals through
-pull requests; core contributors decide whether to merge them.
-
-The checked-in policy file is
-[`.github/APPROVED_CONTRIBUTORS`](.github/APPROVED_CONTRIBUTORS). It does not
-grant private-repository access or organization membership. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the full contribution policy.
+New issues and pull requests from accounts outside the maintainer-managed
+contributor gate are closed automatically. The private allowlist does not grant
+repository access or organization membership. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for the full contribution policy.
 
 Before opening a pull request, run:
 
@@ -196,11 +188,15 @@ for the ownership map and documented exceptions.
 
 ## Release Packaging
 
-Production release packaging is maintainer-owned:
+Contributors can exercise release packaging without credentials:
 
 ```bash
-SIGN_IDENTITY="Developer ID Application: ..." ./Scripts/package_app.sh release
+make dev-release-preflight
+make dev-release-artifact
 ```
 
-See [`docs/open-source-readiness.md`](docs/open-source-readiness.md) for release
-metadata, Sparkle, dependency-pin, third-party notice, and distribution status.
+The generated archive is ad-hoc signed and is not distributable. Maintainers
+publish Developer ID signed, notarized GitHub Releases through the protected
+workflow documented in [`docs/releasing.md`](docs/releasing.md). See
+[`docs/open-source-readiness.md`](docs/open-source-readiness.md) for the
+remaining public-readiness inventory.

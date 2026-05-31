@@ -1,0 +1,3 @@
+# The production allowlist is stored in the APPROVED_CONTRIBUTORS repository
+# secret. Keep this fixture sorted and use it to validate the file format.
+example issue

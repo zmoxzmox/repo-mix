@@ -25,3 +25,36 @@ jobs:
 
       - name: Run conductor tests
         run: make conductor-selftest
+
+  build-and-test:
+    name: Build and Test
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build app product
+        run: swift build --product RepoPrompt
+
+      - name: Build MCP product
+        run: swift build --product repoprompt-mcp
+
+      - name: Run app tests
+        run: swift test
+
+      - name: Run provider package tests
+        working-directory: Packages/RepoPromptAgentProviders
+        run: swift test
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install gitleaks
+        run: brew install gitleaks
+
+      - name: Scan checked-in source tree
+        run: gitleaks dir --redact .

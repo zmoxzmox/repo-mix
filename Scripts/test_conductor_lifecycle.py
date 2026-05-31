@@ -101,6 +101,22 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "release", ["artifact"])
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        argv, lanes, _cwd, _env, timeout = registry.prepare({"operation": "release", "args": {"subcommand": "artifact"}})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"subcommand": "artifact"})
+        self.assertEqual(Path(argv[0]).name, "release.sh")
+        self.assertEqual(argv[1], "artifact")
+        self.assertEqual(lanes, ["build", "debugArtifact", "release"])
+        self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
+
     def test_app_stop_supersedes_queued_live_app_but_not_build_only_work(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)

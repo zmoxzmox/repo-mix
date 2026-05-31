@@ -18,6 +18,7 @@ build/
 *.xcarchive
 *.pkg
 *.dmg
+dist/
 
 # Logs and transient diagnostics
 *.log
@@ -51,3 +52,4 @@ Icon
 !.env.example
 .vscode/
 .idea/
+.claude/settings.local.json
