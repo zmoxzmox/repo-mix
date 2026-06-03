@@ -22,6 +22,11 @@ PR, merges it, creates the immutable release tag, dispatches the protected
 workflow, tests the resulting draft assets, and promotes the already-reviewed
 draft without rebuilding it.
 
+Write-access collaborators may request a signed, notarized test build through
+the manual **Signed Test Build** workflow, but that request does not grant
+access to Apple signing credentials. The build can stage without secrets; the
+Developer ID signing job waits on the protected `release` environment.
+
 The intended process is:
 
 1. A contributor opens a release PR that updates `version.env`, release notes,
@@ -104,7 +109,8 @@ notarization, and stapling.
 Create a protected GitHub Actions environment named `release`. Require
 maintainer approval before jobs can access its secrets, and restrict deployment
 branches to protected `main`. Do not run production publication until both
-controls are enabled.
+controls are enabled. Enable the environment setting that prevents self-review
+so the person requesting a signed build cannot approve their own run.
 
 Add an immutable release-tag ruleset for `v*` tags. Allow maintainers to create
 new release tags, but prevent updates and deletion after creation. The release
@@ -156,6 +162,48 @@ API** shows **Request Access**, complete that approval step before creating the
 three `NOTARYTOOL_*` secrets. A team key with the least-privilege `Developer`
 role is sufficient for the documented `notarytool` flow. After storing the
 secrets, remove the one-time `.p8` download from the local machine.
+
+## Signed test build
+
+Use **Signed Test Build** when a write-access collaborator needs a real
+Developer ID signed and notarized build before the code is ready for a public
+release tag.
+
+Dispatch the workflow from protected `main` and enter an exact upstream branch,
+exact upstream tag, or full 40-character commit SHA in `source_ref`. Short
+branch/tag names and explicit `refs/heads/<branch>` or `refs/tags/<tag>` inputs
+are accepted. Raw SHAs are allowed only when the resolved commit is already
+reachable from a branch or tag in the canonical upstream repository. Do not use
+fork or pull-request refs for this lane; have the collaborator push an
+inspectable branch to the upstream repository first. The workflow rejects fork
+shorthand, `refs/pull/*` inputs, remote refs, short SHAs, revspecs such as
+`main~1` or `main^`, ambiguous branch/tag names, and unreachable SHA-only
+commits before staging.
+
+The unprotected job checks out trusted release tooling from `main`, checks out
+the requested source ref separately, verifies that the literal requested ref
+resolves exactly to the checked-out source commit and that the commit is
+reachable from canonical upstream branch or tag refs, strips GitHub tokens
+before SwiftPM-driven commands, builds an ad-hoc release-mode app, and uploads a
+short-lived staged artifact. The protected `sign` job uses the `release`
+environment, so it pauses for required reviewer approval before importing the
+Developer ID certificate, provisioning profile, and notarization key. After
+approval, trusted tooling revalidates the same requested ref against the
+approved-source checkout before importing signing material. If the branch or tag
+was deleted, force-pushed, or no longer reaches the validated commit, signing
+fails. The signing path then verifies the staged payload against a data-only
+checkout of the requested commit, replaces the staged Sparkle framework with the
+trusted closed-world copy, signs, notarizes, staples, and uploads ZIP, DMG,
+checksum, and provenance workflow artifacts.
+
+Signed test builds do not create GitHub Releases, do not publish updater
+assets, and do not use the Sparkle private key. Each final artifact set includes
+a `signed-test-provenance.json` file that records the requested ref, resolved
+source commit, trusted tooling commit, workflow run URL, signing mode,
+sign-time reachable upstream refs, and ZIP, DMG, checksum manifest, and staged
+source archive hashes. A fresh secret-free smoke job downloads the signed ZIP,
+validates the provenance hash bindings and embedded MCP helper layout, and runs
+the helper `--version` smoke under a minimal environment.
 
 ## Build a draft release
 
