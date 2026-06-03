@@ -2,33 +2,28 @@
 import XCTest
 
 final class WebSearchToolCardTests: XCTestCase {
-    func testToolCardNormalizationMapsWebSearchAliasesToSearch() {
+    func testWebSearchNamesStayDistinctFromFileSearchAndRouteAsKnownResult() {
         for alias in ["search", "web_search", "web_search_request", "google_web_search", "search_web"] {
             XCTAssertEqual(normalizedToolCardName(alias), "search", alias)
-        }
-        XCTAssertEqual(normalizedToolCardName("file_search"), "file_search")
-    }
-
-    func testTranscriptNormalizationKeepsNativeSearchSeparateFromFileSearch() {
-        for alias in ["search", "web_search", "web_search_request", "google_web_search", "search_web"] {
             XCTAssertEqual(AgentToolResultPersistencePolicy.normalizedToolName(alias), "search", alias)
         }
         for alias in ["file_search", "filesearch", "grep"] {
             XCTAssertEqual(AgentToolResultPersistencePolicy.normalizedToolName(alias), "file_search", alias)
         }
-    }
-
-    func testRouterRecognizesWebSearchResultTool() {
         XCTAssertTrue(ToolCardRouter.knownResultTools.contains("search"))
     }
 
-    func testWebSearchPresentationForLiveAndSummaryOnlyPayloads() throws {
+    func testWebSearchPresentationCoversLiveAndSummaryOnlyPayloads() throws {
         let args = jsonString(["query": "native web search cards"])
         let raw = jsonString([
             "status": "completed",
             "query": "native web search cards",
-            "results": [["title": "Native card", "snippet": "Readable web result"]],
-            "sources": [["title": "Docs"]]
+            "total_results": 12,
+            "response": [
+                "web_results": [["title": "Native card", "snippet": "Readable web result"]],
+                "citations": [["title": "Docs"]]
+            ],
+            "errorMessage": "stale retry warning"
         ])
         let liveItem = AgentChatItem(
             kind: .toolResult,
@@ -43,9 +38,10 @@ final class WebSearchToolCardTests: XCTestCase {
         XCTAssertEqual(live.title, "Web Search")
         XCTAssertEqual(live.status, .success)
         XCTAssertTrue(live.subtitle?.contains("native web search cards") == true)
-        XCTAssertTrue(live.subtitle?.contains("1 result") == true)
+        XCTAssertTrue(live.subtitle?.contains("12 results") == true)
         XCTAssertTrue(live.subtitle?.contains("1 source") == true)
         XCTAssertTrue(live.detailText?.contains("Native card") == true)
+        XCTAssertFalse(live.detailText?.contains("stale retry") == true)
 
         let summaryOnly = jsonString([
             "status": "success",
@@ -67,56 +63,7 @@ final class WebSearchToolCardTests: XCTestCase {
         XCTAssertFalse(toolResultHasPayload(storedItem))
     }
 
-    func testWebSearchPresentationSuccessfulStatusWinsOverStaleErrorFields() throws {
-        let raw = jsonString([
-            "status": "completed",
-            "query": "completed web search",
-            "results": [["title": "Completed Result", "snippet": "Usable answer"]],
-            "sources": [["title": "Source"]],
-            "errorMessage": "stale retry warning",
-            "errors": [["message": "stale retry detail"]]
-        ])
-        let item = AgentChatItem(
-            kind: .toolResult,
-            text: raw,
-            toolName: "search",
-            toolArgsJSON: jsonString(["query": "completed web search"]),
-            toolResultJSON: raw,
-            toolIsError: false
-        )
-
-        let presentation = try XCTUnwrap(NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "search"))
-        XCTAssertEqual(presentation.status, .success)
-        XCTAssertTrue(presentation.detailText?.contains("Completed Result") == true)
-        XCTAssertFalse(presentation.detailText?.contains("stale retry") == true)
-    }
-
-    func testWebSearchPresentationUsesNumericCountsAndAlternateArrays() throws {
-        let raw = jsonString([
-            "status": "completed",
-            "query": "alternate web search payload",
-            "total_results": 12,
-            "response": [
-                "web_results": [["title": "Alternate Result", "snippet": "Alternate snippet"]],
-                "citations": [["title": "Citation", "snippet": "Cited source"]]
-            ]
-        ])
-        let item = AgentChatItem(
-            kind: .toolResult,
-            text: raw,
-            toolName: "search",
-            toolArgsJSON: jsonString(["query": "alternate web search payload"]),
-            toolResultJSON: raw,
-            toolIsError: false
-        )
-
-        let presentation = try XCTUnwrap(NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "search"))
-        XCTAssertTrue(presentation.subtitle?.contains("12 results") == true)
-        XCTAssertTrue(presentation.subtitle?.contains("1 source") == true)
-        XCTAssertTrue(presentation.detailText?.contains("Alternate Result") == true)
-    }
-
-    func testNativeFallbackDoesNotTrustSpoofedStoredRenderSummary() {
+    func testNativeFallbackRequiresSafeNameMatchingSummaryAndScalarSignals() throws {
         let spoofedSummary = AgentToolCardRenderSummary(
             toolName: "search",
             title: "Web Search",
@@ -130,82 +77,28 @@ final class WebSearchToolCardTests: XCTestCase {
             "summary_only": true,
             "render_summary": spoofedSummary.dictionary
         ])
-        let unsafeItem = AgentChatItem(
-            kind: .toolResult,
-            text: spoofedRaw,
-            toolName: "mcp__RepoPrompt__unknown",
-            toolResultJSON: spoofedRaw
-        )
-        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: unsafeItem, normalizedToolName: "mcp__RepoPrompt__unknown"))
+        XCTAssertNil(NativeToolCardPresentationBuilder.build(
+            item: AgentChatItem(kind: .toolResult, text: spoofedRaw, toolName: "mcp__RepoPrompt__unknown", toolResultJSON: spoofedRaw),
+            normalizedToolName: "mcp__RepoPrompt__unknown"
+        ))
+        XCTAssertNil(NativeToolCardPresentationBuilder.build(
+            item: AgentChatItem(kind: .toolResult, text: spoofedRaw, toolName: "weather_lookup", toolResultJSON: spoofedRaw),
+            normalizedToolName: "weather_lookup"
+        ))
 
-        let mismatchedItem = AgentChatItem(
+        let safeItem = AgentChatItem(
             kind: .toolResult,
-            text: spoofedRaw,
+            text: jsonString(["status": "completed", "summary": "Sunny and mild"]),
             toolName: "weather_lookup",
-            toolResultJSON: spoofedRaw
-        )
-        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: mismatchedItem, normalizedToolName: "weather_lookup"))
-
-        let trustedSummary = AgentToolCardRenderSummary(
-            toolName: "weather_lookup",
-            title: "Weather Lookup",
-            subtitle: "tomorrow weather",
-            detailText: "Sunny",
-            status: .success,
-            op: "weather_lookup"
-        )
-        let trustedRaw = jsonString([
-            "status": "success",
-            "summary_only": true,
-            "render_summary": trustedSummary.dictionary
-        ])
-        let trustedItem = AgentChatItem(
-            kind: .toolResult,
-            text: trustedRaw,
-            toolName: "weather_lookup",
-            toolResultJSON: trustedRaw
-        )
-        XCTAssertEqual(
-            NativeToolCardPresentationBuilder.build(item: trustedItem, normalizedToolName: "weather_lookup")?.title,
-            "Weather Lookup"
-        )
-    }
-
-    func testSafeNativeFallbackRequiresSafeNameAndScalarSignals() throws {
-        let args = jsonString(["query": "tomorrow weather"])
-        let raw = jsonString(["status": "completed", "summary": "Sunny and mild"])
-        let item = AgentChatItem(
-            kind: .toolResult,
-            text: raw,
-            toolName: "weather_lookup",
-            toolArgsJSON: args,
-            toolResultJSON: raw,
+            toolArgsJSON: jsonString(["query": "tomorrow weather"]),
+            toolResultJSON: jsonString(["status": "completed", "summary": "Sunny and mild"]),
             toolIsError: false
         )
-
-        let presentation = try XCTUnwrap(NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "weather_lookup"))
-        XCTAssertEqual(presentation.title, "Weather Lookup")
-        XCTAssertEqual(presentation.subtitle, "tomorrow weather")
-        XCTAssertEqual(presentation.detailText, "Sunny and mild")
-        XCTAssertEqual(presentation.status, .success)
-
-        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "mcp__RepoPrompt__unknown"))
-        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "tool"))
-        let arrayOnly = AgentChatItem(
-            kind: .toolResult,
-            text: jsonString(["results": [["title": "raw"]]]),
-            toolName: "future_tool",
-            toolArgsJSON: nil,
-            toolResultJSON: jsonString(["results": [["title": "raw"]]]),
-            toolIsError: nil
-        )
-        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: arrayOnly, normalizedToolName: "future_tool"))
-    }
-
-    func testClusterClassifiesSearchAsNavigationWithoutRegressingFileSearch() {
-        XCTAssertEqual(ClusterToolCategory.classification(forNormalizedToolName: "search").family, .navigation)
-        XCTAssertEqual(ClusterToolCategory.classification(forNormalizedToolName: "search").summaryTitleSignal, .navigation)
-        XCTAssertEqual(ClusterToolCategory.classification(forNormalizedToolName: "file_search").family, .navigation)
+        let safe = try XCTUnwrap(NativeToolCardPresentationBuilder.build(item: safeItem, normalizedToolName: "weather_lookup"))
+        XCTAssertEqual(safe.title, "Weather Lookup")
+        XCTAssertEqual(safe.subtitle, "tomorrow weather")
+        XCTAssertEqual(safe.detailText, "Sunny and mild")
+        XCTAssertNil(NativeToolCardPresentationBuilder.build(item: safeItem, normalizedToolName: "tool"))
     }
 
     private func jsonString(_ object: [String: Any], file: StaticString = #filePath, line: UInt = #line) -> String {

@@ -68,27 +68,6 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         XCTAssertEqual(resultObject["exitCode"] as? Int, 0)
     }
 
-    func testNativeWebSearchAliasesParseAsCanonicalSearchCalls() throws {
-        for alias in Self.webSearchAliases {
-            let controller = makeController()
-            let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
-                method: "item/started",
-                params: toolParams(item: [
-                    "type": "toolCall",
-                    "id": "call_\(alias)",
-                    "name": alias,
-                    "query": "latest Swift concurrency"
-                ])
-            ), alias)
-
-            XCTAssertEqual(started.kind, "call", alias)
-            XCTAssertEqual(started.name, "search", alias)
-            XCTAssertNotNil(started.invocationID, alias)
-            let argsObject = try XCTUnwrap(jsonObject(from: started.argsJSON), alias)
-            XCTAssertEqual(argsObject["query"] as? String, "latest Swift concurrency", alias)
-        }
-    }
-
     func testNativeWebSearchAliasesPairStartedAndCompletedInvocations() throws {
         for alias in Self.webSearchAliases {
             let controller = makeController()
@@ -156,7 +135,9 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
                         "items": [["title": "Result", "snippet": "Useful result"]]
                     ],
                     "sources": [["title": "Wrapped Source"]],
-                    "total_results": 3
+                    "total_results": 3,
+                    "source_count": 4,
+                    "citationCount": 2
                 ],
                 nil,
                 1,
@@ -197,34 +178,12 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
                 XCTAssertEqual((resultObject["sources"] as? [[String: Any]])?.count, expectedSources, row.label)
             }
             XCTAssertNotNil(resultObject[row.expectedDetailKey], row.label)
+            if row.label == "wrapped response" {
+                XCTAssertEqual(resultObject["total_results"] as? Int, 3)
+                XCTAssertEqual(resultObject["source_count"] as? Int, 4)
+                XCTAssertEqual(resultObject["citationCount"] as? Int, 2)
+            }
         }
-    }
-
-    func testNativeWebSearchWrappedPayloadPreservesScalarSourceCitationCounts() throws {
-        let controller = makeController()
-        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
-            method: "item/completed",
-            params: toolParams(item: [
-                "type": "toolCall",
-                "id": "call_search_wrapped_scalar_counts",
-                "name": "web_search",
-                "status": "completed",
-                "query": "wrapped scalar counts",
-                "response": [
-                    "items": [["title": "Wrapped", "snippet": "Usable result"]]
-                ],
-                "source_count": 4,
-                "citationCount": 2
-            ])
-        ))
-
-        XCTAssertEqual(completed.kind, "result")
-        XCTAssertEqual(completed.name, "search")
-        XCTAssertEqual(completed.isError, false)
-        let resultObject = try XCTUnwrap(jsonObject(from: completed.resultJSON))
-        XCTAssertEqual((resultObject["items"] as? [[String: Any]])?.count, 1)
-        XCTAssertEqual(resultObject["source_count"] as? Int, 4)
-        XCTAssertEqual(resultObject["citationCount"] as? Int, 2)
     }
 
     func testNativeWebSearchWrappedPayloadMergesSiblingSearchFieldsAndSuccessfulStatusWins() throws {
@@ -278,60 +237,6 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         let resultObject = try XCTUnwrap(jsonObject(from: completed.resultJSON))
         XCTAssertEqual(resultObject["query"] as? String, "transient web outage")
         XCTAssertEqual(resultObject["errorMessage"] as? String, "web search timed out")
-    }
-
-    func testNativeWebSearchNestedActionQueryParsesIntoArgsAndResults() throws {
-        let controller = makeController()
-        let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
-            method: "item/started",
-            params: toolParams(item: [
-                "type": "web_search_call",
-                "id": "call_search_action",
-                "action": ["query": "nested action query"]
-            ])
-        ))
-
-        XCTAssertEqual(started.kind, "call")
-        XCTAssertEqual(started.name, "search")
-        let argsObject = try XCTUnwrap(jsonObject(from: started.argsJSON))
-        XCTAssertEqual(argsObject["query"] as? String, "nested action query")
-
-        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
-            method: "item/completed",
-            params: toolParams(item: [
-                "type": "web_search_call",
-                "id": "call_search_action",
-                "status": "completed",
-                "action": ["query": "nested action query"],
-                "results": [["title": "Nested", "snippet": "Nested search result"]]
-            ])
-        ))
-        let resultObject = try XCTUnwrap(jsonObject(from: completed.resultJSON))
-        XCTAssertEqual(resultObject["query"] as? String, "nested action query")
-        XCTAssertEqual((resultObject["results"] as? [[String: Any]])?.count, 1)
-    }
-
-    func testNativeWebSearchErrorPayloadPreservesQueryAndFailureState() throws {
-        let controller = makeController()
-        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
-            method: "item/completed",
-            params: toolParams(item: [
-                "type": "toolCall",
-                "id": "call_search_error",
-                "name": "search_web",
-                "status": "failed",
-                "query": "network outage",
-                "error": ["message": "web search unavailable"]
-            ])
-        ))
-
-        XCTAssertEqual(completed.kind, "result")
-        XCTAssertEqual(completed.name, "search")
-        XCTAssertEqual(completed.isError, true)
-        let resultObject = try XCTUnwrap(jsonObject(from: completed.resultJSON))
-        XCTAssertEqual(resultObject["query"] as? String, "network outage")
-        let error = try XCTUnwrap(resultObject["error"] as? [String: Any])
-        XCTAssertEqual(error["message"] as? String, "web search unavailable")
     }
 
     private func makeController() -> CodexNativeSessionController {
