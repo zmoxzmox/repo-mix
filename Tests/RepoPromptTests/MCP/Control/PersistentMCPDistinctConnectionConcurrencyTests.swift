@@ -867,7 +867,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw MultiplexedSocketPairJSONRPCClient.ClientError.posix(operation: "setsockopt(SO_NOSIGPIPE)", code: code)
             }
             let client = MultiplexedSocketPairJSONRPCClient(fd: socketFDs[0])
-            let manager = BootstrapSocketConnectionManager(
+            let manager = try BootstrapSocketConnectionManager(
                 connectionID: connectionID,
                 sessionToken: sessionToken,
                 clientPid: Int(getpid()),

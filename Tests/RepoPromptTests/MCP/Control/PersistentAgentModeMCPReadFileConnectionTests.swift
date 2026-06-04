@@ -357,7 +357,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 let resolvedSocketClient = SocketPairJSONRPCClient(fd: socketFDs[0])
                 socketClient = resolvedSocketClient
-                let resolvedConnectionManager = BootstrapSocketConnectionManager(
+                let resolvedConnectionManager = try BootstrapSocketConnectionManager(
                     connectionID: connectionID,
                     sessionToken: sessionToken,
                     clientPid: Int(getpid()),
