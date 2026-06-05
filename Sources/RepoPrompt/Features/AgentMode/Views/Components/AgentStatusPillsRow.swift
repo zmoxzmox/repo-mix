@@ -321,6 +321,21 @@ private struct AgentExecutionLocationPill: View {
         fontPreset.scaledClamped(170, max: 220)
     }
 
+    private var existingWorktreeRowEstimatedHeight: CGFloat {
+        fontPreset.scaledClamped(48, min: 42, max: 62)
+    }
+
+    private var existingWorktreeRowsMaxHeight: CGFloat {
+        fontPreset.scaledClamped(288, min: 220, max: 360)
+    }
+
+    private func existingWorktreeRowsViewportHeight(rowCount: Int) -> CGFloat {
+        let visibleRowCount = min(CGFloat(rowCount), 6)
+        let interRowSpacing = max(0, visibleRowCount - 1) * 2
+        let estimatedHeight = visibleRowCount * existingWorktreeRowEstimatedHeight + interRowSpacing
+        return min(existingWorktreeRowsMaxHeight, estimatedHeight)
+    }
+
     private var accentColor: Color {
         if let indicator = props.indicator {
             return indicator.isAvailable ? indicator.color : .orange
@@ -431,9 +446,15 @@ private struct AgentExecutionLocationPill: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                 } else {
-                    ForEach(existingWorktrees) { selection in
-                        existingWorktreeOption(selection)
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(existingWorktrees) { selection in
+                                existingWorktreeOption(ExistingWorktreePickerRow(selection: selection))
+                            }
+                        }
                     }
+                    .frame(height: existingWorktreeRowsViewportHeight(rowCount: existingWorktrees.count))
+                    .scrollIndicators(.automatic)
                 }
 
                 if props.isInitialSelection {
@@ -487,70 +508,191 @@ private struct AgentExecutionLocationPill: View {
         }
     }
 
-    private func locationOption(_ selection: AgentModeViewModel.InitialStartLocation, icon: String) -> some View {
-        optionButton(selection: selection, icon: icon, subtitle: nil, isDisabled: false)
+    private struct ExistingWorktreePickerRow: Identifiable {
+        let selection: AgentModeViewModel.AgentExecutionWorktreeSelection
+        let title: String
+        let subtitle: String
+        let tooltip: String
+        let iconName: String
+        let isDisabled: Bool
+
+        var id: String {
+            selection.presentationID
+        }
+
+        init(selection: AgentModeViewModel.AgentExecutionWorktreeSelection) {
+            self.selection = selection
+            let worktreeName = Self.worktreeName(for: selection)
+            let branchOrHead = Self.branchOrHeadLabel(for: selection)
+            title = "\(branchOrHead) — \(worktreeName)"
+
+            var subtitleParts = [Self.compactPath(selection.path)]
+            if selection.isLocked {
+                subtitleParts.append("locked")
+            }
+            if selection.isPrunable {
+                subtitleParts.append("prunable")
+            }
+            subtitle = subtitleParts.joined(separator: " · ")
+
+            var tooltipParts = [
+                "Branch: \(branchOrHead)",
+                "Worktree: \(worktreeName)",
+                "Path: \(selection.path)"
+            ]
+            if selection.isLocked {
+                tooltipParts.append("Locked: \(selection.lockReason ?? "no reason provided")")
+            }
+            if selection.isPrunable {
+                tooltipParts.append("Prunable: \(selection.prunableReason ?? "Git reports this worktree as prunable")")
+            }
+            tooltip = tooltipParts.joined(separator: "\n")
+            iconName = selection.isPrunable ? "exclamationmark.triangle" : "arrow.triangle.branch"
+            isDisabled = selection.isPrunable
+        }
+
+        private static func branchOrHeadLabel(for selection: AgentModeViewModel.AgentExecutionWorktreeSelection) -> String {
+            if let branch = selection.branch, !branch.isEmpty {
+                return branch
+            }
+            if let head = selection.head, !head.isEmpty {
+                return "Detached \(GitShortRef.shortHead(head))"
+            }
+            return selection.isDetached ? "Detached HEAD" : selection.label
+        }
+
+        private static func worktreeName(for selection: AgentModeViewModel.AgentExecutionWorktreeSelection) -> String {
+            if let name = selection.name, !name.isEmpty {
+                return name
+            }
+            let pathTail = URL(fileURLWithPath: selection.path).lastPathComponent
+            return pathTail.isEmpty ? selection.label : pathTail
+        }
+
+        private static func compactPath(_ path: String) -> String {
+            let url = URL(fileURLWithPath: path)
+            let folder = url.lastPathComponent
+            let parent = url.deletingLastPathComponent().lastPathComponent
+            guard !folder.isEmpty else { return path }
+            guard !parent.isEmpty else { return "…/\(folder)" }
+            return "…/\(parent)/\(folder)"
+        }
     }
 
-    private func existingWorktreeOption(_ selection: AgentModeViewModel.AgentExecutionWorktreeSelection) -> some View {
-        let pathTail = URL(fileURLWithPath: selection.path).lastPathComponent
-        let compactPath = pathTail.isEmpty ? selection.path : "…/\(pathTail)"
-        let subtitle = [selection.branch, compactPath].compactMap(\.self).joined(separator: " · ")
-        let fullDetails = [selection.branch, selection.path].compactMap(\.self).joined(separator: " · ")
-        return optionButton(
-            selection: .existingWorktree(selection),
-            icon: "arrow.triangle.branch",
-            subtitle: subtitle,
-            tooltip: fullDetails,
-            isDisabled: selection.isPrunable
+    private func locationOption(_ selection: AgentModeViewModel.InitialStartLocation, icon: String) -> some View {
+        let title: String?
+        let subtitle: String?
+        if case .local = selection {
+            title = "Workspace checkout"
+            subtitle = "Work locally in the open workspace"
+        } else {
+            title = nil
+            subtitle = nil
+        }
+        return optionButton(selection: selection, icon: icon, title: title, subtitle: subtitle, isDisabled: false)
+    }
+
+    private func existingWorktreeOption(_ row: ExistingWorktreePickerRow) -> some View {
+        optionButton(
+            selection: .existingWorktree(row.selection),
+            icon: row.iconName,
+            title: row.title,
+            subtitle: row.subtitle,
+            tooltip: row.tooltip,
+            isDisabled: row.isDisabled
         )
     }
 
     private func optionButton(
         selection: AgentModeViewModel.InitialStartLocation,
         icon: String,
+        title: String? = nil,
         subtitle: String?,
         tooltip: String? = nil,
         isDisabled: Bool
     ) -> some View {
-        Button {
-            applySelection(selection)
-        } label: {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "checkmark")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                    .opacity(isSelected(selection) ? 1 : 0)
-                    .frame(width: 12)
-                Image(systemName: icon)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .frame(width: 14)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(selection.label)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .layoutPriority(1)
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                            .foregroundStyle(.secondary)
+        ExecutionLocationOptionButton(
+            selection: selection,
+            icon: icon,
+            title: title ?? selection.label,
+            subtitle: subtitle,
+            tooltip: tooltip ?? selection.label,
+            isSelected: isSelected(selection),
+            isDisabled: isDisabled,
+            fontPreset: fontPreset,
+            applySelection: { selection in
+                applySelection(selection)
+            }
+        )
+    }
+
+    private struct ExecutionLocationOptionButton: View {
+        let selection: AgentModeViewModel.InitialStartLocation
+        let icon: String
+        let title: String
+        let subtitle: String?
+        let tooltip: String
+        let isSelected: Bool
+        let isDisabled: Bool
+        let fontPreset: FontScalePreset
+        let applySelection: (AgentModeViewModel.InitialStartLocation) -> Void
+
+        @State private var isHovered = false
+
+        var body: some View {
+            Button {
+                guard !isDisabled else { return }
+                applySelection(selection)
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "checkmark")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                        .opacity(isSelected ? 1 : 0)
+                        .frame(width: 12)
+                    Image(systemName: icon)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .frame(width: 14)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                             .lineLimit(1)
-                            .truncationMode(.middle)
+                            .truncationMode(.tail)
+                            .layoutPriority(1)
+                        if let subtitle {
+                            Text(subtitle)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                Spacer(minLength: 0)
+                .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(backgroundColor)
+                )
             }
-            .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isSelected(selection) ? Color.accentColor.opacity(0.12) : .clear)
-            )
+            .buttonStyle(.plain)
+            .onHover { hovered in
+                isHovered = hovered
+            }
+            .help(tooltip)
+            .accessibilityHint(isDisabled ? "Unavailable" : tooltip)
         }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .help(tooltip ?? selection.label)
+
+        private var backgroundColor: Color {
+            if isSelected {
+                return Color.accentColor.opacity(isHovered ? 0.16 : 0.12)
+            }
+            return isHovered ? Color.secondary.opacity(0.12) : .clear
+        }
     }
 
     private func isSelected(_ selection: AgentModeViewModel.InitialStartLocation) -> Bool {

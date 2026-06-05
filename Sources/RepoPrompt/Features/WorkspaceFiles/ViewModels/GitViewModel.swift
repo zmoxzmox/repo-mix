@@ -45,7 +45,8 @@ final class GitViewModel: ObservableObject {
     }
 
     func gitWorktreeContext(forStandardizedRootPath path: String) -> GitWorktreeContextSummary? {
-        gitWorktreeContextsByRootPath[path]
+        let key = CheckoutPathIdentity.canonicalPathOrOriginal(path)
+        return gitWorktreeContextsByRootPath[key] ?? gitWorktreeContextsByRootPath[path]
     }
 
     private func setGitWorktreeContextsByRootPath(_ contexts: [String: GitWorktreeContextSummary]) {
@@ -54,15 +55,16 @@ final class GitViewModel: ObservableObject {
     }
 
     private func setGitWorktreeContext(_ context: GitWorktreeContextSummary?, forStandardizedRootPath path: String) {
+        let key = CheckoutPathIdentity.canonicalPathOrOriginal(path)
         if let context {
-            guard gitWorktreeContextsByRootPath[path] != context else { return }
+            guard gitWorktreeContextsByRootPath[key] != context else { return }
             var next = gitWorktreeContextsByRootPath
-            next[path] = context
+            next[key] = context
             gitWorktreeContextsByRootPath = next
         } else {
-            guard gitWorktreeContextsByRootPath[path] != nil else { return }
+            guard gitWorktreeContextsByRootPath[key] != nil else { return }
             var next = gitWorktreeContextsByRootPath
-            next.removeValue(forKey: path)
+            next.removeValue(forKey: key)
             gitWorktreeContextsByRootPath = next
         }
     }
@@ -162,12 +164,12 @@ final class GitViewModel: ObservableObject {
         availableTags = snapshot.availableTags
         currentGitRootPath = snapshot.gitRootPath
         if !snapshot.rootPath.isEmpty {
-            let standardizedRootPath = if selectedRootFolder?.fullPath == snapshot.rootPath {
-                selectedRootFolder?.standardizedFullPath ?? Self.normalizeForComparison(snapshot.rootPath)
+            let contextKey = if selectedRootFolder?.fullPath == snapshot.rootPath {
+                selectedRootFolder?.standardizedFullPath ?? snapshot.rootPath
             } else {
-                Self.normalizeForComparison(snapshot.rootPath)
+                snapshot.rootPath
             }
-            setGitWorktreeContext(snapshot.gitWorktreeContext, forStandardizedRootPath: standardizedRootPath)
+            setGitWorktreeContext(snapshot.gitWorktreeContext, forStandardizedRootPath: contextKey)
         }
         latestStatusGeneration = snapshot.generation
         latestStatusRootPath = snapshot.rootPath
@@ -339,14 +341,16 @@ final class GitViewModel: ObservableObject {
         gitEnabledStatus = gitEnabledStatus.filter { key, _ in
             rootFolders.contains { $0.fullPath == key }
         }
-        let visibleStandardizedPaths = Set(rootFolders.map(\.standardizedFullPath))
+        let visibleStandardizedPaths = Set(rootFolders.map { CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath) })
         setGitWorktreeContextsByRootPath(gitWorktreeContextsByRootPath.filter { key, _ in
             visibleStandardizedPaths.contains(key)
         })
 
         let rootPaths = rootFolders.map(\.fullPath)
-        let standardizedRootPaths = rootFolders.map(\.standardizedFullPath)
-        let standardizedPathByRootPath = Dictionary(uniqueKeysWithValues: rootFolders.map { ($0.fullPath, $0.standardizedFullPath) })
+        let standardizedRootPaths = rootFolders.map { CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath) }
+        let standardizedPathByRootPath = Dictionary(uniqueKeysWithValues: rootFolders.map {
+            ($0.fullPath, CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath))
+        })
         lastVisibleRootPaths = standardizedRootPaths
         rootUpdateGeneration &+= 1
         let generation = rootUpdateGeneration
@@ -376,7 +380,7 @@ final class GitViewModel: ObservableObject {
                     map[detection.rootPath] = detection.isGitRepo
                     if let context = detection.gitWorktreeContext {
                         let standardizedPath = standardizedPathByRootPath[detection.rootPath]
-                            ?? StandardizedPath.absolute(detection.rootPath)
+                            ?? CheckoutPathIdentity.canonicalPathOrOriginal(detection.rootPath)
                         contexts[standardizedPath] = context
                     }
                 }
@@ -434,6 +438,28 @@ final class GitViewModel: ObservableObject {
 
     func refresh() async {
         await fetchUnstagedFiles(trigger: .explicitRefresh)
+    }
+
+    func loadGitBranchSwitchOptions(forRootPath rootPath: String) async throws -> GitBranchSwitchOptions {
+        try await statusActor.loadGitBranchSwitchOptions(forRootPath: rootPath)
+    }
+
+    func preflightGitBranchSwitch(
+        branchName: String,
+        forRootPath rootPath: String
+    ) async throws -> GitBranchSwitchPreflight {
+        try await statusActor.preflightGitBranchSwitch(branchName: branchName, forRootPath: rootPath)
+    }
+
+    func switchGitBranch(
+        _ request: GitBranchSwitchRequest,
+        forRootPath rootPath: String,
+        standardizedRootPath: String? = nil
+    ) async throws -> GitBranchSwitchResult {
+        let (result, context) = try await statusActor.switchGitBranch(request, forRootPath: rootPath)
+        let contextKey = CheckoutPathIdentity.canonicalPathOrOriginal(standardizedRootPath ?? rootPath)
+        setGitWorktreeContext(context, forStandardizedRootPath: contextKey)
+        return result
     }
 
     var hasValidRepository: Bool {

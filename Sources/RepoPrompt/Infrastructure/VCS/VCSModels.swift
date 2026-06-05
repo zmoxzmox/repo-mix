@@ -97,7 +97,7 @@ public struct VCSUncommittedFile: Equatable, Sendable {
 // MARK: - VCS Branch/Tag Types
 
 /// Represents a branch (git) or bookmark (jujutsu).
-public struct VCSBranch: Sendable {
+public struct VCSBranch: Identifiable, Sendable, Equatable {
     /// The name of the branch/bookmark.
     public let name: String
 
@@ -107,10 +107,65 @@ public struct VCSBranch: Sendable {
     /// The date of the last commit on this branch (if available).
     public let lastCommitDate: Date?
 
+    public var id: String {
+        name
+    }
+
     public init(name: String, isCurrent: Bool, lastCommitDate: Date? = nil) {
         self.name = name
         self.isCurrent = isCurrent
         self.lastCommitDate = lastCommitDate
+    }
+}
+
+public enum VCSBranchSortOrder: String, CaseIterable, Identifiable, Sendable, Equatable {
+    case recent
+    case name
+
+    public var id: String {
+        rawValue
+    }
+
+    public var displayName: String {
+        switch self {
+        case .recent:
+            "Recent"
+        case .name:
+            "Name"
+        }
+    }
+}
+
+public extension [VCSBranch] {
+    func sortedForDisplay(by order: VCSBranchSortOrder) -> [VCSBranch] {
+        switch order {
+        case .recent:
+            sortedByRecentBranchActivity()
+        case .name:
+            sortedByBranchName()
+        }
+    }
+
+    private func sortedByRecentBranchActivity() -> [VCSBranch] {
+        sorted { lhs, rhs in
+            if lhs.isCurrent != rhs.isCurrent { return lhs.isCurrent }
+            switch (lhs.lastCommitDate, rhs.lastCommitDate) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (.some, nil):
+                return true
+            case (nil, .some):
+                return false
+            default:
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+        }
+    }
+
+    private func sortedByBranchName() -> [VCSBranch] {
+        sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
     }
 }
 

@@ -4216,28 +4216,11 @@ final class AgentModeViewModel: ObservableObject {
             throw ExecutionLocationTransitionError.unavailable("Execution location is unavailable for this tab.")
         }
         let context = try await executionLocationContext()
-        let localPath = Self.standardizedWorkspacePath(context.logicalRoot.standardizedFullPath)
-        return try await VCSService.shared.listGitWorktrees(at: context.repo.rootURL)
-            .filter { Self.standardizedWorkspacePath($0.path) != localPath }
-            .map { worktree in
-                let fallbackLabel = worktree.name ?? worktree.branch ?? (worktree.isMain ? "main" : nil)
-                let identity = GlobalSettingsStore.shared.resolvedWorktreeVisualIdentity(
-                    repositoryID: worktree.repository.repositoryID,
-                    worktreeID: worktree.worktreeID,
-                    fallbackLabel: fallbackLabel
-                )
-                return AgentExecutionWorktreeSelection(
-                    repositoryID: worktree.repository.repositoryID,
-                    repoKey: worktree.repository.repoKey,
-                    worktreeID: worktree.worktreeID,
-                    path: worktree.path,
-                    name: worktree.name,
-                    branch: worktree.branch,
-                    label: identity.label ?? fallbackLabel ?? URL(fileURLWithPath: worktree.path).lastPathComponent,
-                    colorHex: identity.colorHex,
-                    isPrunable: worktree.isPrunable
-                )
-            }
+        let localPath = CheckoutPathIdentity(context.logicalRoot.standardizedFullPath)
+        let selections = try await VCSService.shared.listGitWorktrees(at: context.repo.rootURL)
+            .filter { CheckoutPathIdentity($0.path) != localPath }
+            .map(Self.executionWorktreeSelection(from:))
+        return Self.dedupedExecutionWorktreeSelections(selections)
             .sorted { lhs, rhs in
                 if lhs.isPrunable != rhs.isPrunable { return !lhs.isPrunable }
                 let labelOrder = lhs.label.localizedCaseInsensitiveCompare(rhs.label)
@@ -4516,7 +4499,7 @@ final class AgentModeViewModel: ObservableObject {
         session.isDirty = true
     }
 
-    private func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
+    func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
         guard let sessionID = session.activeAgentSessionID,
               var entry = sessionIndex[sessionID]
         else {
