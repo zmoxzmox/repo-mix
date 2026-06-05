@@ -435,6 +435,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     let fileManager: WorkspaceFilesViewModel
     let promptViewModel: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
+    private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
+        store: fileManager.workspaceFileContextStore,
+        searchService: workspaceSearchService
+    )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
 
     @Published var isChatBusy: Bool = false
@@ -4654,6 +4658,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 task.cancel()
             }
         }
+    }
+
+    func refreshAfterCheckoutMutation(rootPath: String) async -> WorkspaceCheckoutRefreshResult {
+        await checkoutRefreshService.refreshAfterCheckoutMutation(rootPath: rootPath)
     }
 
     private func schedulePostCatalogRootWork(

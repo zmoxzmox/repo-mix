@@ -26,6 +26,7 @@ extension AgentModeViewModel {
             standardizedRootPath: row.standardizedFullPath
         )
         guard result.didSwitch else { return result }
+        _ = await workspaceManager?.refreshAfterCheckoutMutation(rootPath: result.rootPath)
         recordSuccessfulInAppGitBranchSwitch(
             row: row,
             result: result,
@@ -50,7 +51,13 @@ extension AgentModeViewModel {
             row: row,
             result: result
         )
-        let shouldAppendNote = session.deservesProviderVisibleBranchSwitchNote || activeRunAtSwitchStart
+        let switchedCheckoutIsRelevant = Self.branchSwitchIsProviderContextRelevant(
+            worktreeBindings: session.worktreeBindings,
+            switchedCheckoutCandidatePaths: branchSwitchCandidatePaths(row: row, result: result),
+            isPrimaryRoot: row.isPrimary,
+            didUpdateMatchingWorktreeBinding: didUpdateBinding
+        )
+        let shouldAppendNote = switchedCheckoutIsRelevant && (session.deservesProviderVisibleBranchSwitchNote || activeRunAtSwitchStart)
         if shouldAppendNote {
             session.appendItem(.system(branchSwitchSystemNote(
                 row: row,
@@ -69,6 +76,34 @@ extension AgentModeViewModel {
             scheduleSave(for: session.tabID)
             requestUIRefresh(tabID: session.tabID, urgent: true)
         }
+    }
+
+    private func branchSwitchCandidatePaths(row: AgentWorkspaceRootRow, result: GitBranchSwitchResult) -> [String] {
+        [
+            row.gitContext?.worktreePath,
+            result.rootPath,
+            row.fullPath
+        ].compactMap(\.self)
+    }
+
+    static func branchSwitchIsProviderContextRelevant(
+        worktreeBindings: [AgentSessionWorktreeBinding],
+        switchedCheckoutCandidatePaths: [String],
+        isPrimaryRoot: Bool,
+        didUpdateMatchingWorktreeBinding: Bool
+    ) -> Bool {
+        if didUpdateMatchingWorktreeBinding { return true }
+        let candidateIdentities = Set(switchedCheckoutCandidatePaths.compactMap(CheckoutPathIdentity.init))
+        guard !candidateIdentities.isEmpty else { return false }
+        guard !worktreeBindings.isEmpty else { return isPrimaryRoot }
+
+        let boundWorktreeIdentities = Set(worktreeBindings.compactMap { CheckoutPathIdentity($0.worktreeRootPath) })
+        if !candidateIdentities.isDisjoint(with: boundWorktreeIdentities) { return true }
+
+        let boundLogicalIdentities = Set(worktreeBindings.compactMap { CheckoutPathIdentity($0.logicalRootPath) })
+        if !candidateIdentities.isDisjoint(with: boundLogicalIdentities) { return false }
+
+        return isPrimaryRoot
     }
 
     private func branchSwitchSystemNote(
@@ -91,11 +126,7 @@ extension AgentModeViewModel {
         result: GitBranchSwitchResult
     ) -> Bool {
         guard !session.worktreeBindings.isEmpty else { return false }
-        let candidateIdentities = Set([
-            row.gitContext?.worktreePath,
-            result.rootPath,
-            row.fullPath
-        ].compactMap(CheckoutPathIdentity.init))
+        let candidateIdentities = Set(branchSwitchCandidatePaths(row: row, result: result).compactMap(CheckoutPathIdentity.init))
         guard !candidateIdentities.isEmpty else { return false }
 
         var didUpdate = false

@@ -231,6 +231,115 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertTrue(model.rows.allSatisfy { !$0.canRemove })
     }
 
+    @MainActor
+    func testSourceBuilderUsesRequestedInactiveTabInsteadOfActiveSnapshot() {
+        let requestedTabID = UUID()
+        let activeTabID = UUID()
+        let requestedSessionID = UUID()
+        let activeSessionID = UUID()
+        let requestedSelection = StoredSelection(selectedPaths: ["Sources/Requested.swift"], codemapAutoEnabled: false)
+        let activeSelection = StoredSelection(selectedPaths: ["Sources/Active.swift"], codemapAutoEnabled: false)
+        let requestedBinding = makeBinding(logicalRoot: URL(fileURLWithPath: "/repo/base"), worktreeRoot: URL(fileURLWithPath: "/repo/worktree"))
+        let tabs = [
+            ComposeTabState(
+                id: requestedTabID,
+                name: "Requested",
+                activeAgentSessionID: requestedSessionID,
+                selection: requestedSelection,
+                promptText: "requested prompt"
+            ),
+            ComposeTabState(
+                id: activeTabID,
+                name: "Active",
+                activeAgentSessionID: activeSessionID,
+                selection: activeSelection,
+                promptText: "active stored prompt"
+            )
+        ]
+        let activeSnapshot = WorkspaceSelectionCoordinator.Snapshot(
+            tabID: activeTabID,
+            selection: activeSelection,
+            isVirtual: false
+        )
+
+        let source = AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: activeTabID,
+                activePromptText: "active live prompt",
+                activeSelectionSnapshot: activeSnapshot,
+                composeTabs: tabs,
+                explicitActiveAgentSessionID: nil,
+                worktreeBindingsProvider: { sessionID, tabID in
+                    sessionID == requestedSessionID && tabID == requestedTabID ? [requestedBinding] : []
+                }
+            )
+        )
+
+        XCTAssertEqual(source.tabID, requestedTabID)
+        XCTAssertEqual(source.selection, requestedSelection)
+        XCTAssertEqual(source.promptText, "requested prompt")
+        XCTAssertEqual(source.activeAgentSessionID, requestedSessionID)
+        XCTAssertEqual(source.worktreeBindings, [requestedBinding])
+    }
+
+    @MainActor
+    func testSourceBuilderUsesActiveSnapshotOnlyForRequestedActiveTab() {
+        let activeTabID = UUID()
+        let activeSessionID = UUID()
+        let storedSelection = StoredSelection(selectedPaths: ["Sources/Stored.swift"], codemapAutoEnabled: false)
+        let flushedSelection = StoredSelection(selectedPaths: ["Sources/Flushed.swift"], codemapAutoEnabled: false)
+        let tabs = [
+            ComposeTabState(
+                id: activeTabID,
+                name: "Active",
+                activeAgentSessionID: activeSessionID,
+                selection: storedSelection,
+                promptText: "active stored prompt"
+            )
+        ]
+        let activeSnapshot = WorkspaceSelectionCoordinator.Snapshot(
+            tabID: activeTabID,
+            selection: flushedSelection,
+            isVirtual: false
+        )
+
+        let source = AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: activeTabID,
+                activeComposeTabID: activeTabID,
+                activePromptText: "active live prompt",
+                activeSelectionSnapshot: activeSnapshot,
+                composeTabs: tabs,
+                explicitActiveAgentSessionID: nil,
+                worktreeBindingsProvider: { _, _ in [] }
+            )
+        )
+
+        XCTAssertEqual(source.selection, flushedSelection)
+        XCTAssertEqual(source.promptText, "active live prompt")
+    }
+
+    func testSelectedGitDiffPathsUseBoundWorktreeScope() async throws {
+        let fixture = try await makeBoundFixture()
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: false)
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: fixture.store)
+        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
+
+        let paths = await AgentContextExportResolver.selectedGitDiffPaths(
+            for: physicalSelection,
+            store: fixture.store,
+            rootScope: lookupContext.rootScope
+        )
+
+        XCTAssertEqual(paths, [fixture.worktreeRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path])
+        XCTAssertFalse(paths.contains(fixture.logicalRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path))
+    }
+
     func testCompleteGitDiffIsGuardedForWorktreeBoundExport() async throws {
         let fixture = try await makeBoundFixture()
         let source = makeSource(

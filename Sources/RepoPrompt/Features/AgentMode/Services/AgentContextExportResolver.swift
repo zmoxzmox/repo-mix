@@ -32,6 +32,46 @@ struct AgentContextExportIdentity: Equatable {
     let worktreeBindingFingerprint: String
 }
 
+struct AgentContextExportSourceBuildRequest {
+    let requestedTabID: UUID?
+    let activeComposeTabID: UUID?
+    let activePromptText: String
+    let activeSelectionSnapshot: WorkspaceSelectionCoordinator.Snapshot?
+    let composeTabs: [ComposeTabState]
+    let explicitActiveAgentSessionID: UUID?
+    let worktreeBindingsProvider: (UUID, UUID?) -> [AgentSessionWorktreeBinding]
+}
+
+enum AgentContextExportSourceBuilder {
+    static func makeSource(_ request: AgentContextExportSourceBuildRequest) -> AgentContextExportSource {
+        let resolvedTabID = request.requestedTabID
+            ?? request.activeSelectionSnapshot?.tabID
+            ?? request.activeComposeTabID
+        let tab = resolvedTabID.flatMap { tabID in
+            request.composeTabs.first { $0.id == tabID }
+        }
+        let activeSnapshotApplies = request.activeSelectionSnapshot?.tabID == resolvedTabID
+        let selection = activeSnapshotApplies
+            ? request.activeSelectionSnapshot?.selection ?? StoredSelection()
+            : tab?.selection ?? StoredSelection()
+        let promptText = resolvedTabID == request.activeComposeTabID
+            ? request.activePromptText
+            : tab?.promptText ?? request.activePromptText
+        let sessionID = request.explicitActiveAgentSessionID ?? tab?.activeAgentSessionID
+        let bindings = sessionID.map { request.worktreeBindingsProvider($0, resolvedTabID) } ?? []
+
+        return AgentContextExportSource(
+            tabID: resolvedTabID,
+            promptText: promptText,
+            selection: selection,
+            selectedMetaPromptIDs: tab?.selectedMetaPromptIDs ?? [],
+            tabName: tab?.name,
+            activeAgentSessionID: sessionID,
+            worktreeBindings: bindings
+        )
+    }
+}
+
 struct AgentContextExportModel: Equatable {
     let source: AgentContextExportSource
     let lookupContext: WorkspaceLookupContext

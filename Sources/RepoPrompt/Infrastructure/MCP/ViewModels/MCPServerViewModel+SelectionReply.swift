@@ -246,12 +246,15 @@ extension MCPServerViewModel {
         extraInvalid: [String] = [],
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
-        virtualContext: TabScopedContext? = nil
+        virtualContext: TabScopedContext? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
         // Always use .auto mode for manage_selection (normalized view)
         let effectiveOverride = effectiveMCPCodeMapUsage(codeMapUsageOverride ?? .auto)
         let lookupContext = if let virtualContext {
             await lookupContext(for: virtualContext)
+        } else if let lookupContextOverride {
+            lookupContextOverride
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }

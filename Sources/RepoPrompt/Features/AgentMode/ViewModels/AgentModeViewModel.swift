@@ -12368,7 +12368,7 @@ final class AgentModeViewModel: ObservableObject {
         guard shouldIncludeInitialThreadContext(for: session) else {
             return initialMessage
         }
-        let context = await initialThreadContext(tabID: tabID)
+        let context = await initialThreadContext(tabID: tabID, session: session)
         return Self.composeInitialThreadMessage(
             initialMessage: initialMessage,
             fileTree: context.fileTree,
@@ -12377,7 +12377,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func buildInitialThreadContextBlock(tabID: UUID) async -> String? {
-        let context = await initialThreadContext(tabID: tabID)
+        let context = await initialThreadContext(tabID: tabID, session: sessions[tabID])
         let block = Self.composeInitialThreadMessage(
             initialMessage: "",
             fileTree: context.fileTree,
@@ -12421,7 +12421,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func initialThreadContext(tabID: UUID) async -> (fileTree: String, promptText: String?) {
+    private func initialThreadContext(tabID: UUID, session: TabSession?) async -> (fileTree: String, promptText: String?) {
         guard let promptManager else {
             return ("", nil)
         }
@@ -12433,19 +12433,12 @@ final class AgentModeViewModel: ObservableObject {
         let tabState = workspaceManager?.composeTab(with: tabID)
         let promptText = isActiveTab ? promptManager.promptText : tabState?.promptText
         let selection = tabState?.selection ?? StoredSelection()
-        let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+        let lookupContext = await agentWorkspaceLookupContext(tabID: tabID, session: session)
+        let fileTree = await AgentProviderContextBuilder.initialFileTree(
             selection: selection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: .auto,
-                filePathDisplay: .relative,
-                onlyIncludeRootsWithSelectedFiles: false,
-                includeLegend: true,
-                showCodeMapMarkers: true,
-                rootScope: .allLoaded
-            ),
-            profile: .uiAssisted
+            store: store,
+            lookupContext: lookupContext
         )
-        let fileTree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
         return (fileTree, promptText)
     }
 
@@ -13142,9 +13135,11 @@ final class AgentModeViewModel: ObservableObject {
             agentKind: sourceSession.selectedAgent
         )
         let transcriptXML = buildForkTranscriptXML(from: sourceTranscript, upToItemID: upToItemID)
+        let lookupContext = await agentWorkspaceLookupContext(tabID: sourceTabID, session: sourceSession)
         let fileContentsBlock = await buildForkFileContentsBlock(
             selection: sourceSelection,
-            tokenCap: 60000
+            tokenCap: 60000,
+            lookupContext: lookupContext
         )
         // delivery_id makes crash/restart retries best-effort idempotent at the prompt level.
         let deliveryID = UUID().uuidString
@@ -13167,9 +13162,11 @@ final class AgentModeViewModel: ObservableObject {
               let sourceTabID = currentTabID else { return "" }
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true)
         let sourceSelection = workspaceManager.composeTab(with: sourceTabID)?.selection ?? StoredSelection()
+        let lookupContext = await agentWorkspaceLookupContext(tabID: sourceTabID, session: sessions[sourceTabID])
         return await buildForkFileContentsBlock(
             selection: sourceSelection,
-            tokenCap: tokenCap
+            tokenCap: tokenCap,
+            lookupContext: lookupContext
         )
     }
 
@@ -13382,31 +13379,23 @@ final class AgentModeViewModel: ObservableObject {
     @MainActor
     private func buildForkFileContentsBlock(
         selection: StoredSelection,
-        tokenCap: Int
+        tokenCap: Int,
+        lookupContext: WorkspaceLookupContext
     ) async -> String {
         guard let promptManager else { return "" }
 
-        let store = promptManager.workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let request = PromptContextAccountingRequest(
+        return await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
-            codeMapUsage: .auto,
-            filePathDisplay: .relative,
-            rootScope: .allLoaded,
-            pathLocateProfile: .uiAssisted
-        )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
-        let entries = accounting.resolvedEntries
-        let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-
-        if selectionTokens > tokenCap {
-            // Over cap: use the same formatted summary as manage_selection tool responses
-            if let mcp = mcpServer {
+            tokenCap: tokenCap,
+            store: promptManager.workspaceFileContextStore,
+            lookupContext: lookupContext,
+            overTokenCapSummaryProvider: { [weak self] selection, lookupContext in
+                guard let self, let mcp = mcpServer else { return nil }
                 let reply = await mcp.buildTabSelectionReply(
                     from: selection,
                     includeBlocks: false,
-                    display: .relative
+                    display: .relative,
+                    lookupContextOverride: lookupContext
                 )
                 let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
                 return """
@@ -13415,16 +13404,6 @@ final class AgentModeViewModel: ObservableObject {
                 </selection_summary>
                 """
             }
-            // Fallback if MCP server unavailable
-            return "<selection_summary>\(entries.count) files, ~\(selectionTokens) tokens (contents omitted, exceeds \(tokenCap) token cap)</selection_summary>"
-        }
-
-        let blocks = PromptPackagingService.generateFileContents(entries, filePathDisplay: .relative, codemapSnapshots: codemapSnapshots)
-        guard !blocks.isEmpty else { return "" }
-        return """
-        <file_contents>
-        \(blocks.joined(separator: "\n\n"))
-        </file_contents>
-        """
+        )
     }
 }

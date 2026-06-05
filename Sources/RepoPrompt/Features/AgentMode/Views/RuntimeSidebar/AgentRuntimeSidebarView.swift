@@ -445,7 +445,10 @@ struct AgentExportCard: View {
         if let currentExportModel {
             return currentExportModel.fileCount
         }
-        return fileCount ?? 0
+        if let fileCount {
+            return fileCount
+        }
+        return AgentContextExportResolver.selectionFileCount(makeExportSource().selection)
     }
 
     private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
@@ -571,22 +574,23 @@ struct AgentExportCard: View {
     }
 
     private func makeExportSource() -> AgentContextExportSource {
-        let activeSelectionSnapshot = selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: true)
-        let resolvedTabID = activeSelectionSnapshot?.tabID ?? currentTabID ?? promptManager.activeComposeTabID
-        let tab = resolvedTabID.flatMap { tabID in
-            promptManager.currentComposeTabs.first { $0.id == tabID }
-        }
-        let selection = activeSelectionSnapshot?.selection ?? tab?.selection ?? StoredSelection()
-        let sessionID = activeAgentSessionID ?? tab?.activeAgentSessionID
-        let bindings = sessionID.flatMap { worktreeBindingsProvider?($0, resolvedTabID) } ?? []
-        return AgentContextExportSource(
-            tabID: resolvedTabID,
-            promptText: tab?.promptText ?? promptManager.promptText,
-            selection: selection,
-            selectedMetaPromptIDs: tab?.selectedMetaPromptIDs ?? [],
-            tabName: tab?.name,
-            activeAgentSessionID: sessionID,
-            worktreeBindings: bindings
+        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
+        let activeTabID = selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
+        let activeSelectionSnapshot = requestedTabID == activeTabID
+            ? selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: true)
+            : nil
+        return AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: promptManager.activeComposeTabID,
+                activePromptText: promptManager.promptText,
+                activeSelectionSnapshot: activeSelectionSnapshot,
+                composeTabs: promptManager.currentComposeTabs,
+                explicitActiveAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: { sessionID, tabID in
+                    worktreeBindingsProvider?(sessionID, tabID) ?? []
+                }
+            )
         )
     }
 

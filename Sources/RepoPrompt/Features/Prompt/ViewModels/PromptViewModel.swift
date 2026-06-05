@@ -4798,7 +4798,8 @@ class PromptViewModel: ObservableObject {
         overrideMode: PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
-        selectionOverride: StoredSelection? = nil
+        selectionOverride: StoredSelection? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
@@ -4815,7 +4816,10 @@ class PromptViewModel: ObservableObject {
             resolvedConfig.gitInclusion = gitInclusionOverride
         }
         let activeConfig = applyingGlobalCodeMapOverride(resolvedConfig)
-        let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
+        let logicalSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
+        let effectiveSelection = lookupContextOverride?.physicalizeSelection(logicalSelection) ?? logicalSelection
+        let lookupRootScope = lookupContextOverride?.rootScope ?? WorkspaceLookupRootScope.allLoaded
+        let bindingProjection = lookupContextOverride?.bindingProjection
 
         // Determine effective read-only mode. Legacy/manual edit settings are treated as Chat.
         let effectiveMode: PlanActMode = {
@@ -4842,7 +4846,7 @@ class PromptViewModel: ObservableObject {
         let resolution = await accountingService.resolveEntries(
             selection: effectiveSelection,
             store: store,
-            rootScope: .allLoaded,
+            rootScope: lookupRootScope,
             profile: .uiAssisted,
             codeMapUsage: effectiveCodeMapUsage
         )
@@ -4888,13 +4892,19 @@ class PromptViewModel: ObservableObject {
         let fileBlocks = PromptPackagingService.generateFileContents(
             codeEntries,
             filePathDisplay: filePathDisplay,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: codemapSnapshots,
+            displayPathResolver: { entry in
+                bindingProjection?.projectedLogicalDisplayPath(
+                    forPhysicalPath: entry.file.standardizedFullPath,
+                    display: filePathDisplay
+                )
+            }
         )
 
         // Build file tree + code-map according to override (non-mutating)
         let fileTreeString: String
         if includeFileTree {
-            let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+            let rawFileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
                 selection: effectiveSelection,
                 request: WorkspaceFileTreeSnapshotRequest(
                     mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: effectiveFileTreeMode),
@@ -4902,10 +4912,11 @@ class PromptViewModel: ObservableObject {
                     onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
                     includeLegend: true,
                     showCodeMapMarkers: !codeMapsGloballyDisabled,
-                    rootScope: .allLoaded
+                    rootScope: lookupRootScope
                 ),
                 profile: .uiAssisted
             )
+            let fileTreeSnapshot = bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
             let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
 
             // Only treat as having codemap entries if they actually have fileAPI available
@@ -4942,9 +4953,12 @@ class PromptViewModel: ObservableObject {
             case .none:
                 return nil
             case .selected:
-                let selectedPaths = await resolvedSelectedGitDiffPaths(for: effectiveSelection)
+                let selectedPaths = await resolvedSelectedGitDiffPaths(for: effectiveSelection, rootScope: lookupRootScope)
                 return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
             case .complete:
+                if bindingProjection != nil {
+                    return AgentContextExportResolver.deferredCompleteWorktreeGitDiffMessage
+                }
                 return await gitViewModel.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
             }
         }

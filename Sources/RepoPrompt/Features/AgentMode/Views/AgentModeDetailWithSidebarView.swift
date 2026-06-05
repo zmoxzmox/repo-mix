@@ -238,9 +238,18 @@ struct AgentModeDetailWithSidebarView: View {
     }
 
     private func syncRuntimeMetricsSelectionCount() {
-        let snapshot = selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true)
+        let activeTabID = selectionCoordinator.activeTabID() ?? promptManager.activeComposeTabID
+        let selection: StoredSelection = if currentTabID == activeTabID {
+            selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true).selection
+        } else if let currentTabID,
+                  let tab = promptManager.currentComposeTabs.first(where: { $0.id == currentTabID })
+        {
+            tab.selection
+        } else {
+            StoredSelection()
+        }
         agentModeVM.syncRuntimeMetricsUIState(
-            liveSelectedFileCount: AgentContextExportResolver.selectionFileCount(snapshot.selection)
+            liveSelectedFileCount: AgentContextExportResolver.selectionFileCount(selection)
         )
     }
 }

@@ -405,10 +405,14 @@ extension MCPServerViewModel {
         case .none:
             gitDiff = nil
         case .selected:
-            let selectedPaths = await gitDiffPaths(for: selection)
+            let selectedPaths = await gitDiffPaths(for: context.selection, lookupContext: lookupContext)
             gitDiff = await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
         case .complete:
-            gitDiff = await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            if lookupContext.bindingProjection != nil {
+                gitDiff = AgentContextExportResolver.deferredCompleteWorktreeGitDiffMessage
+            } else {
+                gitDiff = await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            }
         }
 
         let combinedMeta = promptVM.metaInstructions(
@@ -440,16 +444,19 @@ extension MCPServerViewModel {
     }
 
     func gitDiffPaths(for selection: StoredSelection) async -> [String] {
-        let candidates = Self.gitDiffCandidates(from: selection)
-        guard !candidates.isEmpty else { return [] }
+        await AgentContextExportResolver.selectedGitDiffPaths(
+            for: selection,
+            store: promptVM.workspaceFileContextStore,
+            rootScope: .allLoaded
+        )
+    }
 
-        let resolvedFiles = await promptVM.workspaceFileContextStore.lookupFiles(atPaths: candidates, profile: .mcpSelection, rootScope: .allLoaded)
-        let resolvedMap = resolvedFiles.mapValues { $0.standardizedFullPath }
-        return Self.resolveGitDiffPaths(
-            candidates: candidates,
-            resolvedMap: resolvedMap,
-            normalizeUserInput: { ($0 as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines) },
-            fileExists: { FileManager.default.fileExists(atPath: $0) }
+    func gitDiffPaths(for selection: StoredSelection, lookupContext: WorkspaceLookupContext) async -> [String] {
+        let physicalSelection = lookupContext.physicalizeSelection(selection)
+        return await AgentContextExportResolver.selectedGitDiffPaths(
+            for: physicalSelection,
+            store: promptVM.workspaceFileContextStore,
+            rootScope: lookupContext.rootScope
         )
     }
 }

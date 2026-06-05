@@ -136,13 +136,16 @@ extension PromptViewModel {
     }
 
     @MainActor
-    func resolvedSelectedGitDiffPaths(for selection: StoredSelection) async -> [String] {
+    func resolvedSelectedGitDiffPaths(
+        for selection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope = .allLoaded
+    ) async -> [String] {
         let candidates = MCPServerViewModel.gitDiffCandidates(from: selection)
         guard !candidates.isEmpty else { return [] }
 
         let store = workspaceFileContextStore
         let requests = candidates.map {
-            WorkspacePathLookupRequest(userPath: $0, profile: .uiAssisted, rootScope: .allLoaded)
+            WorkspacePathLookupRequest(userPath: $0, profile: .uiAssisted, rootScope: rootScope)
         }
         let resolved = await store.lookupPaths(requests)
 
