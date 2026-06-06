@@ -69,6 +69,43 @@ for packaging inspection only; it is not notarized or suitable for public
 distribution. For runnable release-mode local testing, use the self-signed local
 production installer below.
 
+## KeyboardShortcuts resource lookup workaround
+
+RepoPrompt currently patches the pinned `KeyboardShortcuts` SwiftPM checkout
+during app packaging so the package's localized resources are found inside the
+packaged app bundle. The patch targets:
+
+```text
+.build/checkouts/KeyboardShortcuts/Sources/KeyboardShortcuts/Utilities.swift
+```
+
+The patch is applied **before** Swift compilation, not after the app is built or
+signed:
+
+1. `package_app.sh` runs `patch_keyboard_shortcuts_resource_lookup.sh`.
+2. `swift build` compiles `RepoPrompt` with the patched dependency source.
+3. SwiftPM resource bundles are copied into `RepoPrompt.app/Contents/Resources`.
+4. The packaged resource layout is validated.
+5. The app is signed.
+
+This workaround exists because RepoPrompt's manual app packaging copies the
+SwiftPM resource bundle to:
+
+```text
+RepoPrompt.app/Contents/Resources/KeyboardShortcuts_KeyboardShortcuts.bundle
+```
+
+The package patch makes KeyboardShortcuts look there before falling back to its
+normal `Bundle.module` lookup. Keep the patch, bundle copy, and validator in
+sync; do not remove the workaround without validating that **Settings → Keyboard
+Shortcuts** opens successfully in a packaged app build.
+
+This is an intentional short-term release workaround, not the preferred
+long-term dependency strategy. A cleaner long-term fix should make the adjusted
+KeyboardShortcuts source part of normal dependency resolution by upstreaming the
+resource lookup fix, depending on a pinned RepoPrompt fork, or vendoring a local
+patched package.
+
 ## Install a local self-signed production build
 
 Users who want a release-mode build without maintainer credentials can install

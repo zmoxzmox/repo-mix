@@ -152,6 +152,9 @@ printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
 SWIFT_BUILD_ARGS=(-c "$CONF")
 
+# KeyboardShortcuts' default Bundle.module lookup does not match RepoPrompt's
+# packaged resource layout. Patch the pinned SwiftPM checkout before compiling;
+# this is intentionally not a post-build or post-signing mutation.
 phase "Patching KeyboardShortcuts resource lookup"
 run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 

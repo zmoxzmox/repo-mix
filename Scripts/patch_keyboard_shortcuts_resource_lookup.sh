@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Temporary release workaround for KeyboardShortcuts 2.3.0 resource lookup in
+# RepoPrompt's packaged app layout. Prefer an upstream fix, pinned fork, or
+# vendored package over long-term mutation of SwiftPM's .build/checkouts state.
+
 ROOT_DIR="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_WITHOUT_GITHUB_TOKENS="$SCRIPT_DIR/run_without_github_tokens.sh"
