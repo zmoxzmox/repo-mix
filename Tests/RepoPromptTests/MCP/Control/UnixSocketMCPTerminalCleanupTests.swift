@@ -312,7 +312,7 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                 let pending = await Self.waitUntil {
                     let snapshot = await transport.debugCleanupSnapshot()
                     return snapshot.pendingReaderCancellationCount == 1
-                        && snapshot.terminalCallbackCount == 1
+                        && snapshot.terminalCallbackCount == 1 + snapshot.staleTerminalCount
                         && snapshot.descriptorCloseCount == 0
                 }
                 XCTAssertTrue(pending)
