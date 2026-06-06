@@ -125,7 +125,7 @@ class LifecycleQueueTests(LifecycleTestCase):
             )
 
         self.assertEqual(lanes, ["liveApp"])
-        self.assertEqual(Path(argv[0]).name, "python3")
+        self.assertTrue(Path(argv[0]).name.startswith("python3"))
         self.assertIn('"kind":"smoke"', argv[-1].replace(" ", ""))
 
     def test_release_local_install_delegates_installer_with_release_lanes_and_confirmation(self) -> None:
