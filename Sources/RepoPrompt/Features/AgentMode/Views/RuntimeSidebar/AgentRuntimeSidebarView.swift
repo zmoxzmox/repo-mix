@@ -438,17 +438,14 @@ struct AgentExportCard: View {
     }
 
     private var currentExportContextIdentity: AgentContextExportIdentity {
-        makeExportSource().exportContextIdentity
+        makeExportSource(flushPendingUI: false).exportContextIdentity
     }
 
     private var displayFileCount: Int {
-        if let currentExportModel {
-            return currentExportModel.fileCount
-        }
-        if let fileCount {
-            return fileCount
-        }
-        return AgentContextExportResolver.selectionFileCount(makeExportSource().selection)
+        AgentContextExportResolver.displayFileCount(
+            resolvedModel: currentExportModel,
+            sourceSelection: makeExportSource(flushPendingUI: false).selection
+        )
     }
 
     private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
@@ -573,11 +570,11 @@ struct AgentExportCard: View {
         .onChange(of: currentExportContextIdentity) { _, _ in resetOrRefreshExportModelForContextChange() }
     }
 
-    private func makeExportSource() -> AgentContextExportSource {
+    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
         let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
         let activeTabID = selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
         let activeSelectionSnapshot = requestedTabID == activeTabID
-            ? selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: true)
+            ? selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: flushPendingUI)
             : nil
         return AgentContextExportSourceBuilder.makeSource(
             AgentContextExportSourceBuildRequest(

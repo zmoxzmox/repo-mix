@@ -166,6 +166,16 @@ enum AgentContextExportResolver {
         return seen.count
     }
 
+    static func displayFileCount(
+        resolvedModel: AgentContextExportModel?,
+        sourceSelection: StoredSelection
+    ) -> Int {
+        if let resolvedModel {
+            return resolvedModel.fileCount
+        }
+        return selectionFileCount(sourceSelection)
+    }
+
     static func lookupContext(
         source: AgentContextExportSource,
         store: WorkspaceFileContextStore

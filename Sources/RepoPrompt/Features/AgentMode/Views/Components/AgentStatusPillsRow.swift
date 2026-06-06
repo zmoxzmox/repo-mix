@@ -904,7 +904,29 @@ struct AgentContextPill: View {
     }
 
     private var fileCount: Int {
-        runtimeVM.snapshot.selectionFileCount ?? 0
+        AgentContextExportResolver.displayFileCount(
+            resolvedModel: nil,
+            sourceSelection: currentExportSourceSelection
+        )
+    }
+
+    private var currentExportSourceSelection: StoredSelection {
+        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
+        let activeTabID = selectionCoordinator.activeTabID() ?? promptManager.activeComposeTabID
+        let activeSelectionSnapshot = requestedTabID == activeTabID
+            ? selectionCoordinator.activeSelectionSnapshot(flushPendingUI: false)
+            : nil
+        return AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: promptManager.activeComposeTabID,
+                activePromptText: promptManager.promptText,
+                activeSelectionSnapshot: activeSelectionSnapshot,
+                composeTabs: promptManager.currentComposeTabs,
+                explicitActiveAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: worktreeBindingsProvider
+            )
+        ).selection
     }
 
     private var selectionTokens: Int? {

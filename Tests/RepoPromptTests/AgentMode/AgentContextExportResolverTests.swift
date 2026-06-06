@@ -12,6 +12,20 @@ final class AgentContextExportResolverTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testDisplayFileCountUsesSourceSelectionBeforeModelLoads() {
+        let selection = StoredSelection(
+            selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
+            autoCodemapPaths: ["G.swift"],
+            slices: ["F.swift": [LineRange(start: 1, end: 2)]],
+            codemapAutoEnabled: false
+        )
+
+        XCTAssertEqual(
+            AgentContextExportResolver.displayFileCount(resolvedModel: nil, sourceSelection: selection),
+            7
+        )
+    }
+
     func testWorktreeExportUsesPhysicalContentWhileDisplayingLogicalPath() async throws {
         let fixture = try await makeBoundFixture()
         let source = makeSource(
