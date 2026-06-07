@@ -538,6 +538,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         private struct SleepingProcessTree {
             let parent: Process
             let childPID: pid_t
+            let parentExited: DispatchSemaphore
 
             var parentPID: pid_t {
                 parent.processIdentifier
@@ -545,10 +546,17 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
 
             func terminate() {
                 _ = Darwin.kill(childPID, SIGTERM)
-                if parent.isRunning {
-                    parent.terminate()
+                _ = Darwin.kill(parentPID, SIGTERM)
+                guard parentExited.wait(timeout: .now() + 0.25) == .timedOut else {
+                    parent.waitUntilExit()
+                    return
                 }
-                parent.waitUntilExit()
+
+                _ = Darwin.kill(childPID, SIGKILL)
+                _ = Darwin.kill(parentPID, SIGKILL)
+                if parentExited.wait(timeout: .now() + 1.0) == .success {
+                    parent.waitUntilExit()
+                }
             }
         }
 
@@ -562,6 +570,8 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 "import subprocess; child=subprocess.Popen(['/bin/sleep','30']); print(child.pid, flush=True); child.wait()"
             ]
             process.standardOutput = stdout
+            let parentExited = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in parentExited.signal() }
             try process.run()
             var data = Data()
             while data.count < 32 {
@@ -580,7 +590,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                     userInfo: [NSLocalizedDescriptionKey: "Failed to read child PID from process-tree fixture."]
                 )
             }
-            return SleepingProcessTree(parent: process, childPID: childPID)
+            return SleepingProcessTree(parent: process, childPID: childPID, parentExited: parentExited)
         }
     #endif
 }
