@@ -141,6 +141,7 @@ struct ResizableTextFieldFeatures {
     var fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?
     var fileTagLookupContextIdentity: AnyHashable?
     var fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)?
+    var fileTagPickerConfiguration: FileMentionPickerConfiguration = .compact
     var onFileTagCommitted: ((MentionSuggestion) -> Void)?
     var enableSlashSkillOverlay: Bool = false
     var slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
@@ -153,6 +154,7 @@ struct ResizableTextFieldFeatures {
         fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?,
         fileTagLookupContextIdentity: AnyHashable? = nil,
         fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)? = nil,
+        fileMentionPickerConfiguration: FileMentionPickerConfiguration = .compact,
         onFileTagCommitted: ((MentionSuggestion) -> Void)?,
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
     ) -> ResizableTextFieldFeatures {
@@ -163,6 +165,7 @@ struct ResizableTextFieldFeatures {
             fileTagSelectionCoordinator: fileTagSelectionCoordinator,
             fileTagLookupContextIdentity: fileTagLookupContextIdentity,
             fileTagLookupContextProvider: fileTagLookupContextProvider,
+            fileTagPickerConfiguration: fileMentionPickerConfiguration,
             onFileTagCommitted: onFileTagCommitted,
             enableSlashSkillOverlay: true,
             slashSkillSuggestionsProvider: slashSkillSuggestionsProvider
@@ -339,7 +342,8 @@ struct CustomTextField: NSViewRepresentable {
             searchService: features.fileTagSearchService,
             selectionCoordinator: features.fileTagSelectionCoordinator,
             lookupContextIdentity: features.fileTagLookupContextIdentity,
-            lookupContextProvider: features.fileTagLookupContextProvider
+            lookupContextProvider: features.fileTagLookupContextProvider,
+            configuration: features.fileTagPickerConfiguration
         )
         context.coordinator.configureSlashSkillSupport(
             textView: textView,
@@ -375,7 +379,8 @@ struct CustomTextField: NSViewRepresentable {
             searchService: features.fileTagSearchService,
             selectionCoordinator: features.fileTagSelectionCoordinator,
             lookupContextIdentity: features.fileTagLookupContextIdentity,
-            lookupContextProvider: features.fileTagLookupContextProvider
+            lookupContextProvider: features.fileTagLookupContextProvider,
+            configuration: features.fileTagPickerConfiguration
         )
         context.coordinator.configureSlashSkillSupport(
             textView: textView,
@@ -544,7 +549,8 @@ struct CustomTextField: NSViewRepresentable {
             searchService: WorkspaceSearchService?,
             selectionCoordinator: WorkspaceSelectionCoordinator?,
             lookupContextIdentity: AnyHashable?,
-            lookupContextProvider: (() async -> WorkspaceLookupContext)?
+            lookupContextProvider: (() async -> WorkspaceLookupContext)?,
+            configuration: FileMentionPickerConfiguration
         ) {
             fileTagHelper.configure(
                 textView: textView,
@@ -553,7 +559,8 @@ struct CustomTextField: NSViewRepresentable {
                 searchService: searchService,
                 selectionCoordinator: selectionCoordinator,
                 lookupContextIdentity: lookupContextIdentity,
-                lookupContextProvider: lookupContextProvider
+                lookupContextProvider: lookupContextProvider,
+                configuration: configuration
             )
         }
 

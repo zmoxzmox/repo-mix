@@ -12,6 +12,7 @@ final class AgentFileTagSuggestionService {
         let nameLower: String
         let scorePathLower: String
         let standardizedFullPath: String
+        let expandedSubtitle: String?
     }
 
     private nonisolated static let excludedPathComponent = "_git_data"
@@ -24,6 +25,7 @@ final class AgentFileTagSuggestionService {
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
     private let lookupContextProvider: (() async -> WorkspaceLookupContext)?
     private let maxResults: Int
+    private let showsFileSubtitles: Bool
 
     private var cachedCandidates: [FileCandidate] = []
     private var cachedLookupContext: WorkspaceLookupContext = .visibleWorkspace
@@ -34,13 +36,15 @@ final class AgentFileTagSuggestionService {
         searchService: WorkspaceSearchService?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
         lookupContextProvider: (() async -> WorkspaceLookupContext)? = nil,
-        maxResults: Int = 5
+        maxResults: Int = 5,
+        showsFileSubtitles: Bool = false
     ) {
         self.store = store
         self.searchService = searchService
         self.selectionCoordinator = selectionCoordinator
         self.lookupContextProvider = lookupContextProvider
         self.maxResults = maxResults
+        self.showsFileSubtitles = showsFileSubtitles
     }
 
     func suggestions(for rawQuery: String) async -> [MentionSuggestion] {
@@ -62,7 +66,7 @@ final class AgentFileTagSuggestionService {
             if !cachedCandidates.isEmpty,
                cachedGenerationSignature == currentGeneration
             {
-                return Array(cachedCandidates.prefix(maxResults)).map(Self.makeSuggestion(from:))
+                return Array(cachedCandidates.prefix(maxResults)).map { makeSuggestion(from: $0) }
             }
             cachedCandidates.removeAll()
             cachedGenerationSignature = nil
@@ -189,7 +193,11 @@ final class AgentFileTagSuggestionService {
                 scoreRelativePath: scoreRelativePath,
                 nameLower: entry.name.lowercased(),
                 scorePathLower: scoreRelativePath.lowercased(),
-                standardizedFullPath: entry.standardizedFullPath
+                standardizedFullPath: entry.standardizedFullPath,
+                expandedSubtitle: Self.expandedSubtitleLabel(
+                    for: tokenRelativePath,
+                    fallbackRootLabel: rootLabel
+                )
             )
         }
         candidates.sort { lhs, rhs in
@@ -280,7 +288,7 @@ final class AgentFileTagSuggestionService {
 
         return scored
             .prefix(maxResults)
-            .map { Self.makeSuggestion(from: $0.candidate) }
+            .map { makeSuggestion(from: $0.candidate) }
     }
 
     /// Build the suggestion list for a bare `@` from the active stored selection.
@@ -313,12 +321,16 @@ final class AgentFileTagSuggestionService {
                 lookupContext: lookupContext
             )
             if let candidate = candidateByPath[tokenRelativePath] {
-                suggestions.append(Self.makeSuggestion(from: candidate))
+                suggestions.append(makeSuggestion(from: candidate))
             } else {
+                let rootLabel = visibleRoots
+                    .first(where: { $0.id == file.rootID })?
+                    .name
                 suggestions.append(MentionSuggestion(
                     displayName: file.name,
                     relativePath: tokenRelativePath,
                     kind: .file,
+                    subtitle: expandedSubtitleLabel(for: tokenRelativePath, fallbackRootLabel: rootLabel),
                     commitDisplayText: file.name
                 ))
             }
@@ -337,14 +349,19 @@ final class AgentFileTagSuggestionService {
         )
     }
 
-    private static func makeSuggestion(from candidate: FileCandidate) -> MentionSuggestion {
+    private func makeSuggestion(from candidate: FileCandidate) -> MentionSuggestion {
         MentionSuggestion(
             displayName: candidate.displayName,
             relativePath: candidate.tokenRelativePath,
             kind: .file,
-            subtitle: candidate.disambiguationLabel,
+            subtitle: showsFileSubtitles ? candidate.expandedSubtitle : candidate.disambiguationLabel,
             commitDisplayText: candidate.commitDisplayText
         )
+    }
+
+    private func expandedSubtitleLabel(for tokenRelativePath: String, fallbackRootLabel: String?) -> String? {
+        guard showsFileSubtitles else { return nil }
+        return Self.expandedSubtitleLabel(for: tokenRelativePath, fallbackRootLabel: fallbackRootLabel)
     }
 
     nonisolated static func commitDisplayText(
@@ -374,6 +391,17 @@ final class AgentFileTagSuggestionService {
         return parentComponents.joined(separator: "/")
     }
 
+    private nonisolated static func expandedSubtitleLabel(
+        for tokenRelativePath: String,
+        fallbackRootLabel: String?
+    ) -> String? {
+        if let parentLabel = parentDirectoryLabel(for: tokenRelativePath), !parentLabel.isEmpty {
+            return parentLabel
+        }
+        let rootLabel = fallbackRootLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return rootLabel.isEmpty ? nil : rootLabel
+    }
+
     #if DEBUG
 
         // MARK: - Testing support
@@ -390,7 +418,11 @@ final class AgentFileTagSuggestionService {
                     scoreRelativePath: tokenPath,
                     nameLower: basename.lowercased(),
                     scorePathLower: tokenPath.lowercased(),
-                    standardizedFullPath: tokenPath
+                    standardizedFullPath: tokenPath,
+                    expandedSubtitle: Self.expandedSubtitleLabel(
+                        for: tokenPath,
+                        fallbackRootLabel: nil
+                    )
                 )
             }
         }

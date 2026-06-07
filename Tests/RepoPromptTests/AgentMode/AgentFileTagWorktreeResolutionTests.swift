@@ -94,6 +94,65 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testExpandedAgentFileTagsReturnMoreThanCompactCapWithParentSubtitles() async throws {
+        let root = try makeTemporaryRoot(name: "AgentFileTagExpanded")
+        let matchingFileCount = 80
+        for index in 0 ..< matchingFileCount {
+            let name = String(format: "Match%02d.swift", index)
+            try write("let match\(index) = true\n", to: root.appendingPathComponent("Sources/\(name)"))
+        }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let config = FileMentionPickerConfiguration.expanded
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: nil,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: config.maxResults,
+            showsFileSubtitles: config.showsFileSubtitles
+        )
+
+        let suggestions = await service.suggestions(for: "Match")
+
+        XCTAssertEqual(suggestions.count, matchingFileCount, String(describing: suggestions))
+        XCTAssertTrue(suggestions.count > FileMentionPickerConfiguration.compact.maxResults)
+        XCTAssertTrue(suggestions.count > 64)
+        XCTAssertTrue(suggestions.allSatisfy { $0.kind == .file })
+        XCTAssertEqual(Set(suggestions.compactMap(\.subtitle)), ["Sources"])
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasPrefix("Match") == true })
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.contains("Sources/") == false })
+    }
+
+    @MainActor
+    func testCompactAgentFileTagsPreserveDuplicateDisambiguationSubtitles() async throws {
+        let firstRoot = try makeTemporaryRoot(name: "AgentFileTagDuplicateA")
+        let secondRoot = try makeTemporaryRoot(name: "AgentFileTagDuplicateB")
+        try write("let duplicate = \"a\"\n", to: firstRoot.appendingPathComponent("Sources/Shared.swift"))
+        try write("let duplicate = \"b\"\n", to: secondRoot.appendingPathComponent("Sources/Shared.swift"))
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: firstRoot.path)
+        _ = try await store.loadRoot(path: secondRoot.path)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: nil,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: FileMentionPickerConfiguration.compact.maxResults,
+            showsFileSubtitles: FileMentionPickerConfiguration.compact.showsFileSubtitles
+        )
+
+        let suggestions = await service.suggestions(for: "Shared")
+
+        XCTAssertEqual(suggestions.count, 2, String(describing: suggestions))
+        XCTAssertEqual(
+            Set(suggestions.compactMap(\.subtitle)),
+            [firstRoot.lastPathComponent, secondRoot.lastPathComponent]
+        )
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasSuffix("Sources/Shared.swift") == true })
+    }
+
+    @MainActor
     func testPartiallyBoundWorkspaceKeepsUnboundRootSuggestionDisplayRelative() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: false)
         let unboundRoot = try makeTemporaryRoot(name: "AgentFileTagUnbound")

@@ -280,6 +280,7 @@ struct AgentComposerView: View, Equatable {
     @State private var modelMenuSnapshotReleaseTask: Task<Void, Never>? = nil
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -570,6 +571,7 @@ struct AgentComposerView: View, Equatable {
                     fileTagLookupContextProvider: { [tabID = props.currentTabID] in
                         await actions.agentWorkspaceLookupContext(tabID)
                     },
+                    fileMentionPickerConfiguration: globalSettings.fileMentionPickerConfiguration(),
                     onFileTagCommitted: handleFileTagCommitted(_:),
                     slashSkillSuggestionsProvider: { query in
                         await actions.slashSkillSuggestions(query)

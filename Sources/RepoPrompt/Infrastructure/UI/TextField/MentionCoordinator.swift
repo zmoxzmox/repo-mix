@@ -9,19 +9,23 @@ final class MentionCoordinator: MentionTextViewDelegate {
     private unowned let textView: MentionTextView
     private let suggestionService: MentionSuggestionService
     private let overlay = MentionOverlayController()
+    private var configuration: FileMentionPickerConfiguration
     private let commitHandler: (MentionSuggestion) -> Void
     private let tokenRemovedHandler: (MentionTokenPayload) -> Void
 
     init(
         textView: MentionTextView,
         suggestionService: MentionSuggestionService,
+        configuration: FileMentionPickerConfiguration = .compact,
         commitHandler: @escaping (MentionSuggestion) -> Void,
         tokenRemovedHandler: @escaping (MentionTokenPayload) -> Void
     ) {
         self.textView = textView
         self.suggestionService = suggestionService
+        self.configuration = configuration
         self.commitHandler = commitHandler
         self.tokenRemovedHandler = tokenRemovedHandler
+        applyConfiguration(configuration)
 
         // ------------------------------------------------------------------
         // Debounce search queries (80 ms) so the UI remains responsive while
@@ -35,6 +39,22 @@ final class MentionCoordinator: MentionTextViewDelegate {
                 self?.runQuery(q, parent: parent, preserveIndex: preserve)
             }
             .store(in: &cancellables)
+    }
+
+    func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+        suggestionService.updateFileManager(manager)
+    }
+
+    func updateConfiguration(_ configuration: FileMentionPickerConfiguration) {
+        guard self.configuration != configuration else { return }
+        self.configuration = configuration
+        applyConfiguration(configuration)
+    }
+
+    private func applyConfiguration(_ configuration: FileMentionPickerConfiguration) {
+        suggestionService.updateConfiguration(configuration)
+        overlay.suggestedWidth = configuration.overlayWidth
+        overlay.visibleRowLimit = configuration.visibleRows
     }
 
     // MARK: – Internal state

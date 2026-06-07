@@ -27,6 +27,7 @@ struct AttributedTextKitView: NSViewRepresentable {
     weak var fileManager: WorkspaceFilesViewModel?
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
 
     private var resolvedFontSize: CGFloat {
         if let fontSize {
@@ -244,13 +245,15 @@ struct AttributedTextKitView: NSViewRepresentable {
         // ------------------------------------------------------------------
         // Mention system wiring
         // ------------------------------------------------------------------
+        let fileMentionPickerConfiguration = globalSettings.fileMentionPickerConfiguration()
         let svc = MentionSuggestionService(
             fileManager: fileManager,
-            maxResults: 5
+            configuration: fileMentionPickerConfiguration
         )
         let mc = MentionCoordinator(
             textView: textView,
             suggestionService: svc,
+            configuration: fileMentionPickerConfiguration,
             commitHandler: { [weak c = context.coordinator] sugg in
                 c?.commit(sugg)
             },
@@ -309,6 +312,10 @@ struct AttributedTextKitView: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let textView = nsView.documentView as? NSTextView else { return }
+
+        let fileMentionPickerConfiguration = globalSettings.fileMentionPickerConfiguration()
+        context.coordinator.mentionCoord?.updateFileManager(fileManager)
+        context.coordinator.mentionCoord?.updateConfiguration(fileMentionPickerConfiguration)
 
         // Ensure non-contiguous layout stays disabled (fixes Intel Mac issues)
         if let layoutManager = textView.layoutManager,

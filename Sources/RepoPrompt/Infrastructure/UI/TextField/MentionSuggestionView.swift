@@ -17,6 +17,7 @@ import SwiftUI
 final class MentionSuggestionListModel: ObservableObject {
     @Published var suggestions: [MentionSuggestion] = []
     @Published var highlightedIndex: Int = 0
+    @Published var visibleRowLimit: Int = 5
 
     /// Called when the user clicks a row. The overlay controller wires this up
     /// to update the highlight and optionally commit the selection.
@@ -131,7 +132,7 @@ struct MentionSuggestionListView: View {
 
     private var suggestionList: some View {
         ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: model.suggestions.count > 5) {
+            ScrollView(.vertical, showsIndicators: model.suggestions.count > model.visibleRowLimit) {
                 VStack(spacing: 2) {
                     ForEach(
                         Array(model.suggestions.enumerated()),

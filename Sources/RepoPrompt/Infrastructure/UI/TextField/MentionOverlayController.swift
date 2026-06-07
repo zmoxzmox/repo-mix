@@ -12,6 +12,17 @@ final class MentionOverlayController {
 
     var placement: Placement = .below
     var suggestedWidth: CGFloat = 240
+    var visibleRowLimit: Int = 5 {
+        didSet {
+            let normalizedLimit = Self.normalizedVisibleRowLimit(visibleRowLimit)
+            if visibleRowLimit != normalizedLimit {
+                visibleRowLimit = normalizedLimit
+            }
+            for window in windows {
+                window.setVisibleRowLimit(normalizedLimit)
+            }
+        }
+    }
 
     /// Remember latest caret anchor so we can re-anchor after every resize
     private var caretAnchor: NSPoint?
@@ -95,7 +106,12 @@ final class MentionOverlayController {
     /// Push a new level (drill-down into folder). Automatically positioned.
     func pushLevel() {
         guard let previous = windows.last else { return }
-        let w = SuggestionWindow(parent: previous.parentTextView, placement: placement, width: suggestedWidth)
+        let w = SuggestionWindow(
+            parent: previous.parentTextView,
+            placement: placement,
+            width: suggestedWidth,
+            visibleRowLimit: Self.normalizedVisibleRowLimit(visibleRowLimit)
+        )
         windows.append(w)
         chainWindow(w, after: previous)
     }
@@ -126,9 +142,18 @@ final class MentionOverlayController {
     private func prepareRootWindowIfNeeded(owner: NSWindow) {
         guard windows.isEmpty else { return }
         ownerWindow = owner
-        let root = SuggestionWindow(parent: nil, placement: placement, width: suggestedWidth)
+        let root = SuggestionWindow(
+            parent: nil,
+            placement: placement,
+            width: suggestedWidth,
+            visibleRowLimit: Self.normalizedVisibleRowLimit(visibleRowLimit)
+        )
         owner.addChildWindow(root, ordered: .above)
         windows.append(root)
+    }
+
+    private static func normalizedVisibleRowLimit(_ limit: Int) -> Int {
+        max(limit, 1)
     }
 
     private func chainWindow(_ w: SuggestionWindow, after prev: NSWindow) {
@@ -167,13 +192,17 @@ extension MentionOverlayController {
 
         // MARK: – Init
 
+        private var visibleRowLimit: Int
+
         init(
             parent: MentionTextView?,
             placement: MentionOverlayController.Placement,
-            width: CGFloat = 240
+            width: CGFloat = 240,
+            visibleRowLimit: Int = 5
         ) {
             parentTextView = parent
             self.placement = placement
+            self.visibleRowLimit = MentionOverlayController.normalizedVisibleRowLimit(visibleRowLimit)
             let rect = NSRect(x: 0, y: 0, width: width, height: 1)
             super.init(
                 contentRect: rect,
@@ -199,6 +228,7 @@ extension MentionOverlayController {
             visualEffect.layer?.borderColor = NSColor.separatorColor.cgColor
 
             // SwiftUI content ---------------------------------------------------
+            model.visibleRowLimit = self.visibleRowLimit
             let listView = MentionSuggestionListView(model: model)
             let hosting = NSHostingView(rootView: listView)
             hosting.frame = visualEffect.bounds
@@ -243,10 +273,16 @@ extension MentionOverlayController {
                 % model.suggestions.count
         }
 
+        func setVisibleRowLimit(_ limit: Int) {
+            visibleRowLimit = MentionOverlayController.normalizedVisibleRowLimit(limit)
+            model.visibleRowLimit = visibleRowLimit
+            resizeWindow(for: max(model.suggestions.count, 1))
+        }
+
         // MARK: – Layout
 
         private func resizeWindow(for itemCount: Int) {
-            let visibleRows = min(itemCount, 5)
+            let visibleRows = min(itemCount, visibleRowLimit)
             let rowH = FontScalePreset.current.rowHeight + 4
             // 4pt padding top/bottom inside the VStack, plus 2pt spacing per gap
             let spacing = max(CGFloat(visibleRows - 1), 0) * 2

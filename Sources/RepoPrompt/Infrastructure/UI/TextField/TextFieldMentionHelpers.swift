@@ -18,6 +18,7 @@ final class FileTagMentionHelper {
     private weak var fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?
     private var fileTagLookupContextIdentity: AnyHashable?
     private var fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)?
+    private var configuration: FileMentionPickerConfiguration = .compact
     private var refreshTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
     private var commitFinalizationTask: Task<Void, Never>?
@@ -32,7 +33,8 @@ final class FileTagMentionHelper {
         searchService: WorkspaceSearchService?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
         lookupContextIdentity: AnyHashable?,
-        lookupContextProvider: (() async -> WorkspaceLookupContext)?
+        lookupContextProvider: (() async -> WorkspaceLookupContext)?,
+        configuration: FileMentionPickerConfiguration
     ) {
         guard enabled else {
             let hadState = (service != nil || fileTagStore != nil || triggerRange != nil || refreshTask != nil || suggestionTask != nil)
@@ -42,6 +44,7 @@ final class FileTagMentionHelper {
             fileTagSelectionCoordinator = nil
             fileTagLookupContextIdentity = nil
             fileTagLookupContextProvider = nil
+            self.configuration = .compact
             if hadState {
                 dismiss()
             }
@@ -50,7 +53,10 @@ final class FileTagMentionHelper {
 
         var shouldRefreshNow = false
         let lookupContextChanged = lookupContextIdentity != fileTagLookupContextIdentity
-        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator || lookupContextChanged {
+        let configurationChanged = configuration != self.configuration
+        overlay.suggestedWidth = configuration.overlayWidth
+        overlay.visibleRowLimit = configuration.visibleRows
+        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator || lookupContextChanged || configurationChanged {
             if lookupContextChanged {
                 dismiss()
             }
@@ -59,13 +65,15 @@ final class FileTagMentionHelper {
                 searchService: searchService,
                 selectionCoordinator: selectionCoordinator,
                 lookupContextProvider: lookupContextProvider,
-                maxResults: 5
+                maxResults: configuration.maxResults,
+                showsFileSubtitles: configuration.showsFileSubtitles
             )
             fileTagStore = store
             fileTagSearchService = searchService
             fileTagSelectionCoordinator = selectionCoordinator
             fileTagLookupContextIdentity = lookupContextIdentity
             fileTagLookupContextProvider = lookupContextProvider
+            self.configuration = configuration
             shouldRefreshNow = true
         }
         if shouldRefreshNow {
