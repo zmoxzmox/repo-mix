@@ -947,12 +947,15 @@ actor ServerNetworkManager {
         private var debugShouldSuspendNextPendingPolicyCommit = false
         private var debugPendingPolicyCommitIsSuspended = false
         private var debugPendingPolicyCommitResumeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var debugPendingPolicyReplacementSchedules: [(existing: UUID, replacement: UUID, runID: UUID)] = []
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
     private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:]
     private var admittedPolicyRunIDs: Set<UUID> = []
     private var windowIDByRunID: [UUID: Int] = [:]
+    private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:]
+    private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:]
 
     // 🆕 Per-connection → windowID routing map
     private var connectionWindowMap: [UUID: Int] = [:]
@@ -1774,6 +1777,47 @@ actor ServerNetworkManager {
         return true
     }
 
+    private func mapConnectionToRunIDForPendingPolicy(
+        _ connectionID: UUID,
+        runID: UUID,
+        windowID: Int
+    ) async -> MCPServerViewModel.PendingPolicyRunIDMappingToken? {
+        let token = await MainActor.run { () -> MCPServerViewModel.PendingPolicyRunIDMappingToken? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+                log.warning("mapConnectionToRunIDForPendingPolicy: window \(windowID) not found for connection \(connectionID)")
+                return nil
+            }
+            return window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: runID,
+                windowID: windowID
+            )
+        }
+        guard let token else {
+            log.warning("mapConnectionToRunIDForPendingPolicy: registration refused connection \(connectionID) run \(runID) window \(windowID)")
+            return nil
+        }
+
+        if connectionWindowMap[connectionID] != windowID {
+            setConnectionWindowMapping(connectionID, windowID: windowID)
+        }
+        runIDByConnectionID[connectionID] = runID
+        windowIDByRunID[runID] = windowID
+        updateLiveRunAffinity(
+            clientName: clientIdentifier(forConnection: connectionID) ?? "",
+            sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
+            runID: runID,
+            windowID: windowID,
+            purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
+        )
+        await applyRunPolicyStateIfAvailable(
+            runID: runID,
+            connectionID: connectionID,
+            persistWindowBinding: true
+        )
+        return token
+    }
+
     private func seedRunPolicyState(
         runID: UUID,
         windowID: Int,
@@ -2154,6 +2198,7 @@ actor ServerNetworkManager {
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
         windowIDByRunID.removeValue(forKey: runID)
+        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
         clearLiveRunAffinity(for: runID)
         let connectionIDsForRun = runIDByConnectionID.compactMap { connectionID, mappedRunID in
             mappedRunID == runID ? connectionID : nil
@@ -3631,6 +3676,8 @@ actor ServerNetworkManager {
         runPolicyStateByRunID.removeAll()
         admittedPolicyRunIDs.removeAll()
         windowIDByRunID.removeAll()
+        pendingPolicyApplicationIDByConnectionID.removeAll()
+        pendingPolicyApplicationIDByRunID.removeAll()
         activeConnectionsByClient.removeAll()
         clientIDByConnection.removeAll()
         callLimiters.removeAll()
@@ -3939,6 +3986,48 @@ actor ServerNetworkManager {
         await terminateConnection(oldID, reason: .connectionReplaced, message: message, semanticsOverride: hardSemantics)
     }
 
+    private func schedulePendingPolicyConnectionReplacement(
+        _ token: MCPServerViewModel.PendingPolicyRunIDMappingToken,
+        windowID: Int
+    ) {
+        guard let displacedConnectionID = token.displacedConnectionID else { return }
+        #if DEBUG
+            debugPendingPolicyReplacementSchedules.append((
+                existing: displacedConnectionID,
+                replacement: token.connectionID,
+                runID: token.runID
+            ))
+        #endif
+        Task {
+            await ServerNetworkManager.shared.handlePendingPolicyConnectionReplacement(
+                token,
+                windowID: windowID
+            )
+        }
+    }
+
+    private func handlePendingPolicyConnectionReplacement(
+        _ token: MCPServerViewModel.PendingPolicyRunIDMappingToken,
+        windowID: Int
+    ) async {
+        guard let displacedConnectionID = token.displacedConnectionID else { return }
+        let replacementStillOwnsRun = await MainActor.run {
+            guard let window = WindowStatesManager.shared.window(withID: windowID) else { return false }
+            return window.mcpServer.isCurrentPendingPolicyRunIDMapping(token)
+                && window.mcpServer.connectionIDToRunID[displacedConnectionID] == nil
+        }
+        guard replacementStillOwnsRun else {
+            connectionLog("Skipping stale pending-policy replacement old=\(displacedConnectionID) new=\(token.connectionID) runID=\(token.runID)")
+            return
+        }
+        await handleConnectionReplaced(
+            existing: displacedConnectionID,
+            by: token.connectionID,
+            runID: token.runID,
+            message: "Connection replaced by new connection for same runID"
+        )
+    }
+
     func recordTransportIngressTerminal(
         connectionID: UUID,
         clientName: String?,
@@ -4051,6 +4140,7 @@ actor ServerNetworkManager {
         additionalToolsByConnection.removeValue(forKey: id)
         runPurposeByConnection.removeValue(forKey: id)
         runIDByConnectionID.removeValue(forKey: id)
+        pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
         windowAssignmentByConnection.removeValue(forKey: id)
         preassignedConnections.remove(id)
         windowCountAtConnectionTime.removeValue(forKey: id)
@@ -4840,6 +4930,12 @@ actor ServerNetworkManager {
             pendingConnections.removeValue(forKey: connectionID)
         }
 
+        func debugSupersedePendingPolicyApplicationOwnership(connectionID: UUID, runID: UUID) {
+            let applicationID = UUID()
+            pendingPolicyApplicationIDByConnectionID[connectionID] = applicationID
+            pendingPolicyApplicationIDByRunID[runID] = applicationID
+        }
+
         func debugSuspendNextPendingPolicyCommit() {
             debugShouldSuspendNextPendingPolicyCommit = true
         }
@@ -4874,6 +4970,20 @@ actor ServerNetworkManager {
                 debugPendingPolicyCommitResumeWaiters.append(continuation)
             }
             debugPendingPolicyCommitIsSuspended = false
+        }
+
+        func debugPendingPolicyReplacementScheduleCount(
+            existing: UUID,
+            replacement: UUID,
+            runID: UUID
+        ) -> Int {
+            debugPendingPolicyReplacementSchedules.count {
+                $0.existing == existing && $0.replacement == replacement && $0.runID == runID
+            }
+        }
+
+        func debugClearPendingPolicyReplacementSchedules() {
+            debugPendingPolicyReplacementSchedules.removeAll()
         }
 
         func debugPendingPolicySnapshot(for clientName: String) -> [(windowID: Int, tabID: UUID?, runID: UUID?, oneShot: Bool, purpose: MCPRunPurpose)] {
@@ -5028,6 +5138,10 @@ actor ServerNetworkManager {
                 purpose: runPurposeByConnection[connectionID] ?? .unknown,
                 windowID: connectionWindowMap[connectionID]
             )
+        }
+
+        func debugCachedRunID(for connectionID: UUID) -> UUID? {
+            runIDByConnectionID[connectionID]
         }
 
         func debugSeedConnectionRunRouting(
@@ -7043,6 +7157,11 @@ actor ServerNetworkManager {
             runPolicyState: policy.runID.flatMap { runPolicyStateByRunID[$0] },
             runWindowID: policy.runID.flatMap { windowIDByRunID[$0] }
         )
+        let pendingPolicyApplicationID = UUID()
+        pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
+        if let runID = policy.runID {
+            pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
+        }
 
         // Stage the complete policy before registering the run mapping. The mapping
         // signals MCPRoutingWaiter, so restrictions and run identity must already be
@@ -7067,11 +7186,17 @@ actor ServerNetworkManager {
             await debugSuspendPendingPolicyRouteInstallationIfNeeded()
         #endif
 
-        guard isPendingPolicyApplicationCurrent(
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
             connectionID: connectionID,
-            clientName: clientName,
-            expectedLifecycleGeneration: expectedLifecycleGeneration
-        ) else {
+            runID: policy.runID
+        ),
+            isPendingPolicyApplicationCurrent(
+                connectionID: connectionID,
+                clientName: clientName,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
+            )
+        else {
             if policy.oneShot {
                 _ = rollbackOneShotPendingPolicyReservation(
                     id: policy.id,
@@ -7084,16 +7209,18 @@ actor ServerNetworkManager {
                 clientName: clientName,
                 connectionID: connectionID,
                 restorePoint: restorePoint,
+                applicationID: pendingPolicyApplicationID,
                 signalRoutingFailure: false
             )
             return .rejected(runID: policy.runID, reason: "stale_connection")
         }
 
+        var pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken?
         if requireRunRouting, let runID = policy.runID {
             let routed: Bool
             if let tabID = policy.tabID {
                 mcpRoutingLog("Policy includes tab context - installing for tab=\(tabID) run=\(runID)")
-                routed = await installTabContextFromPolicy(
+                let installation = await installTabContextFromPolicy(
                     clientID: connectionID.uuidString,
                     clientName: clientName,
                     windowID: policy.windowID,
@@ -7101,13 +7228,15 @@ actor ServerNetworkManager {
                     runID: runID,
                     signalRouting: false
                 )
+                routed = installation.routed
+                pendingPolicyRunIDMappingToken = installation.replacementToken
             } else {
-                routed = await mapConnectionToRunID(
+                pendingPolicyRunIDMappingToken = await mapConnectionToRunIDForPendingPolicy(
                     connectionID,
                     runID: runID,
-                    windowID: policy.windowID,
-                    signalRouting: false
+                    windowID: policy.windowID
                 )
+                routed = pendingPolicyRunIDMappingToken != nil
             }
             #if DEBUG
                 debugRecordRunRoutingEvent(
@@ -7131,7 +7260,9 @@ actor ServerNetworkManager {
                     policy,
                     clientName: clientName,
                     connectionID: connectionID,
-                    restorePoint: restorePoint
+                    restorePoint: restorePoint,
+                    applicationID: pendingPolicyApplicationID,
+                    pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
                 )
                 return .rejected(
                     runID: runID,
@@ -7143,11 +7274,27 @@ actor ServerNetworkManager {
                 await debugSuspendPendingPolicyCommitIfNeeded()
             #endif
 
-            guard isPendingPolicyApplicationCurrent(
-                connectionID: connectionID,
-                clientName: clientName,
-                expectedLifecycleGeneration: expectedLifecycleGeneration
-            ) else {
+            let routeMappingToken = pendingPolicyRunIDMappingToken
+            let routeMappingIsCurrent = await MainActor.run {
+                routeMappingToken.map { token in
+                    guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else {
+                        return false
+                    }
+                    return window.mcpServer.isCurrentPendingPolicyRunIDMapping(token)
+                } ?? true
+            }
+            guard routeMappingIsCurrent,
+                  isPendingPolicyApplicationOwner(
+                      pendingPolicyApplicationID,
+                      connectionID: connectionID,
+                      runID: policy.runID
+                  ),
+                  isPendingPolicyApplicationCurrent(
+                      connectionID: connectionID,
+                      clientName: clientName,
+                      expectedLifecycleGeneration: expectedLifecycleGeneration
+                  )
+            else {
                 if policy.oneShot {
                     _ = rollbackOneShotPendingPolicyReservation(
                         id: policy.id,
@@ -7160,6 +7307,8 @@ actor ServerNetworkManager {
                     clientName: clientName,
                     connectionID: connectionID,
                     restorePoint: restorePoint,
+                    applicationID: pendingPolicyApplicationID,
+                    pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                     signalRoutingFailure: false
                 )
                 return .rejected(runID: runID, reason: "stale_connection")
@@ -7177,11 +7326,24 @@ actor ServerNetworkManager {
                 policy,
                 clientName: clientName,
                 connectionID: connectionID,
-                restorePoint: restorePoint
+                restorePoint: restorePoint,
+                applicationID: pendingPolicyApplicationID,
+                pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
             )
             return .rejected(runID: policy.runID, reason: "policy_removed")
         }
 
+        finishPendingPolicyApplication(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID
+        )
+        if let pendingPolicyRunIDMappingToken {
+            schedulePendingPolicyConnectionReplacement(
+                pendingPolicyRunIDMappingToken,
+                windowID: policy.windowID
+            )
+        }
         if requireRunRouting, let runID = policy.runID {
             await MCPRoutingWaiter.notifyRouted(runID: runID)
         }
@@ -7249,6 +7411,15 @@ actor ServerNetworkManager {
         return .applied(runID: policy.runID)
     }
 
+    private func isPendingPolicyApplicationOwner(
+        _ applicationID: UUID,
+        connectionID: UUID,
+        runID: UUID?
+    ) -> Bool {
+        guard pendingPolicyApplicationIDByConnectionID[connectionID] == applicationID else { return false }
+        return runID.map { pendingPolicyApplicationIDByRunID[$0] == applicationID } ?? true
+    }
+
     private func isPendingPolicyApplicationCurrent(
         connectionID: UUID,
         clientName: String,
@@ -7265,11 +7436,22 @@ actor ServerNetworkManager {
         clientName: String,
         connectionID: UUID,
         restorePoint: PendingPolicyRestorePoint,
+        applicationID: UUID,
+        pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken? = nil,
         signalRoutingFailure: Bool = true
     ) async {
+        var mappingRollbackResult: MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult?
         if let runID = policy.runID {
-            await MainActor.run {
-                guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else { return }
+            mappingRollbackResult = await MainActor.run {
+                guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else { return nil }
+                if let pendingPolicyRunIDMappingToken {
+                    return window.mcpServer.rollbackPendingPolicyRunIDMapping(
+                        pendingPolicyRunIDMappingToken,
+                        clientName: clientName,
+                        windowID: policy.windowID,
+                        signalRoutingFailure: signalRoutingFailure
+                    )
+                }
                 window.mcpServer.removeTabContext(
                     forConnectionID: connectionID,
                     clientName: clientName,
@@ -7281,55 +7463,94 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     signalRoutingFailure: signalRoutingFailure
                 )
+                return .restored
             }
-            restorePendingPolicyState(
-                restorePoint,
-                connectionID: connectionID,
-                policyRunID: runID
-            )
+        }
+
+        var ownsConnectionState = pendingPolicyApplicationIDByConnectionID[connectionID] == applicationID
+        var ownsRunState = policy.runID.map { pendingPolicyApplicationIDByRunID[$0] == applicationID } ?? false
+        switch mappingRollbackResult {
+        case .supersededBySameConnection:
+            ownsConnectionState = false
+            ownsRunState = false
+        case .supersededByOtherConnection:
+            ownsRunState = false
+        case .restored, nil:
+            break
+        }
+        restorePendingPolicyState(
+            restorePoint,
+            connectionID: connectionID,
+            policyRunID: policy.runID,
+            restoreConnectionScopedState: ownsConnectionState,
+            restoreRunScopedState: ownsRunState
+        )
+        finishPendingPolicyApplication(
+            applicationID,
+            connectionID: connectionID,
+            runID: policy.runID
+        )
+    }
+
+    private func finishPendingPolicyApplication(
+        _ applicationID: UUID,
+        connectionID: UUID,
+        runID: UUID?
+    ) {
+        if pendingPolicyApplicationIDByConnectionID[connectionID] == applicationID {
+            pendingPolicyApplicationIDByConnectionID.removeValue(forKey: connectionID)
+        }
+        if let runID, pendingPolicyApplicationIDByRunID[runID] == applicationID {
+            pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
         }
     }
 
     private func restorePendingPolicyState(
         _ restorePoint: PendingPolicyRestorePoint,
         connectionID: UUID,
-        policyRunID: UUID
+        policyRunID: UUID?,
+        restoreConnectionScopedState: Bool,
+        restoreRunScopedState: Bool
     ) {
-        if let restrictedTools = restorePoint.restrictedTools {
-            restrictedToolsByConnection[connectionID] = restrictedTools
-        } else {
-            restrictedToolsByConnection.removeValue(forKey: connectionID)
+        if restoreConnectionScopedState {
+            if let restrictedTools = restorePoint.restrictedTools {
+                restrictedToolsByConnection[connectionID] = restrictedTools
+            } else {
+                restrictedToolsByConnection.removeValue(forKey: connectionID)
+            }
+            if let additionalTools = restorePoint.additionalTools {
+                additionalToolsByConnection[connectionID] = additionalTools
+            } else {
+                additionalToolsByConnection.removeValue(forKey: connectionID)
+            }
+            if let runPurpose = restorePoint.runPurpose {
+                runPurposeByConnection[connectionID] = runPurpose
+            } else {
+                runPurposeByConnection.removeValue(forKey: connectionID)
+            }
+            if let windowID = restorePoint.windowID {
+                connectionWindowMap[connectionID] = windowID
+            } else {
+                connectionWindowMap.removeValue(forKey: connectionID)
+            }
+            if let windowAssignment = restorePoint.windowAssignment {
+                windowAssignmentByConnection[connectionID] = windowAssignment
+            } else {
+                windowAssignmentByConnection.removeValue(forKey: connectionID)
+            }
+            if let runID = restorePoint.runID {
+                runIDByConnectionID[connectionID] = runID
+            } else {
+                runIDByConnectionID.removeValue(forKey: connectionID)
+            }
+            if restorePoint.wasPreassigned {
+                preassignedConnections.insert(connectionID)
+            } else {
+                preassignedConnections.remove(connectionID)
+            }
         }
-        if let additionalTools = restorePoint.additionalTools {
-            additionalToolsByConnection[connectionID] = additionalTools
-        } else {
-            additionalToolsByConnection.removeValue(forKey: connectionID)
-        }
-        if let runPurpose = restorePoint.runPurpose {
-            runPurposeByConnection[connectionID] = runPurpose
-        } else {
-            runPurposeByConnection.removeValue(forKey: connectionID)
-        }
-        if let windowID = restorePoint.windowID {
-            connectionWindowMap[connectionID] = windowID
-        } else {
-            connectionWindowMap.removeValue(forKey: connectionID)
-        }
-        if let windowAssignment = restorePoint.windowAssignment {
-            windowAssignmentByConnection[connectionID] = windowAssignment
-        } else {
-            windowAssignmentByConnection.removeValue(forKey: connectionID)
-        }
-        if let runID = restorePoint.runID {
-            runIDByConnectionID[connectionID] = runID
-        } else {
-            runIDByConnectionID.removeValue(forKey: connectionID)
-        }
-        if restorePoint.wasPreassigned {
-            preassignedConnections.insert(connectionID)
-        } else {
-            preassignedConnections.remove(connectionID)
-        }
+
+        guard restoreRunScopedState, let policyRunID else { return }
         if restorePoint.wasRunAdmitted {
             admittedPolicyRunIDs.insert(policyRunID)
         } else {
@@ -7355,32 +7576,37 @@ actor ServerNetworkManager {
         tabID: UUID,
         runID: UUID,
         signalRouting: Bool = true
-    ) async -> Bool {
-        let resolved = await MainActor.run { () -> (workspaceID: UUID, snapshot: ComposeTabState, routed: Bool)? in
+    ) async -> (routed: Bool, replacementToken: MCPServerViewModel.PendingPolicyRunIDMappingToken?) {
+        let resolved = await MainActor.run {
+            () -> (
+                workspaceID: UUID,
+                snapshot: ComposeTabState,
+                routed: Bool,
+                replacementToken: MCPServerViewModel.PendingPolicyRunIDMappingToken?
+            )? in
             guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
                 return nil
             }
             guard let resolved = windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID) else {
                 return nil
             }
-            windowState.mcpServer.installTabContext(
+            let replacementToken = windowState.mcpServer.installTabContext(
                 clientID: clientID,
                 clientName: clientName,
                 windowID: windowID,
                 workspaceID: resolved.workspaceID,
                 snapshot: resolved.snapshot,
                 runID: runID,
-                signalRouting: signalRouting
+                signalRouting: signalRouting,
+                deferRunIDReplacementForPendingPolicy: true
             )
-            let routed = UUID(uuidString: clientID).map { connectionID in
-                windowState.mcpServer.connectionID(forRunID: runID) == connectionID
-            } ?? false
-            return (resolved.workspaceID, resolved.snapshot, routed)
+            let routed = replacementToken != nil
+            return (resolved.workspaceID, resolved.snapshot, routed, replacementToken)
         }
 
         guard let resolved else {
             log.warning("installTabContextFromPolicy: tab \(tabID) could not resolve routing snapshot in window \(windowID)")
-            return false
+            return (false, nil)
         }
 
         if resolved.routed, let cached = runPolicyStateByRunID[runID] {
@@ -7398,7 +7624,7 @@ actor ServerNetworkManager {
             )
         }
         connectionLog("Installed tab context from policy: tab=\(tabID) run=\(runID) window=\(windowID) workspace=\(resolved.workspaceID) client=\(clientName)")
-        return resolved.routed
+        return (resolved.routed, resolved.replacementToken)
     }
 
     @discardableResult

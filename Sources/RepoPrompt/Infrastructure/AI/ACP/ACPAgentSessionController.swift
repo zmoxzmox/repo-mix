@@ -653,6 +653,12 @@ actor ACPAgentSessionController {
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
+            if provider.providerID == .cursor,
+               normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
+               sessionModelConfigOptionID == nil
+            {
+                return
+            }
             guard let sessionModelConfigOptionID else {
                 throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
             }

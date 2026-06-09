@@ -389,6 +389,34 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertEqual(mutation.params["value"] as? String, "model-b")
     }
 
+    func testCursorAutoWithoutModernModelSelectorUsesProviderDefault() async throws {
+        let fixture = try makeFixture(shape: "none", providerID: .cursor)
+
+        try await withBootstrappedController(fixture.controller) { controller in
+            try await controller.setSessionModel(AgentModel.cursorAuto.rawValue)
+        }
+
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+    }
+
+    func testCursorAutoWithMalformedModernModelSelectorFailsWithoutMutation() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_MALFORMED_MODEL": "1"
+            ],
+            providerID: .cursor
+        )
+        _ = try await fixture.controller.bootstrap()
+        await assertThrows(containing: "malformed modern model config option") {
+            try await fixture.controller.setSessionModel(AgentModel.cursorAuto.rawValue)
+        }
+        await fixture.controller.shutdown()
+
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+    }
+
     func testLegacyOnlyModelAdvertisementIsIgnored() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
         addTeardownBlock {
@@ -854,7 +882,8 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         launchArguments: [String] = [],
         mcpServers: [RepoPromptMCPServerConfiguration] = [],
         diagnostics: LockedStrings? = nil,
-        normalizedUpdates: LockedStrings? = nil
+        normalizedUpdates: LockedStrings? = nil,
+        providerID: ACPProviderID = .openCode
     ) throws -> Fixture {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -863,7 +892,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         environment["ACP_RECORD_PATH"] = recordURL.path
         environment["ACP_SHAPE"] = shape
         let request = ACPRunRequest(
-            agentKind: .openCode,
+            agentKind: providerID == .cursor ? .cursor : .openCode,
             modelString: modelString,
             workspacePath: workspace.path,
             resumeSessionID: resumeSessionID,
@@ -875,6 +904,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             launchArguments: launchArguments,
             environment: environment,
             mcpServers: mcpServers,
+            providerID: providerID,
             normalizedUpdates: normalizedUpdates
         )
         let controller = try ACPAgentSessionController(

@@ -507,26 +507,24 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
     }
 
     @MainActor
-    func testStaleConnectionAfterRouteInstallRollsBackWithoutConsumingOrFailingRun() async throws {
+    func testStaleReplacementAdmissionRestoresDisplacedConnectionWithoutSchedulingReplacement() async throws {
         #if DEBUG
             let window = makeWindow()
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
             let runID = UUID()
+            let displacedConnectionID = UUID()
             let staleConnectionID = UUID()
-            let retryConnectionID = UUID()
             let windowID = window.windowID
+            await manager.debugClearPendingPolicyReplacementSchedules()
+            let didRegisterDisplacedConnection = window.mcpServer.registerRunIDMapping(
+                connectionID: displacedConnectionID,
+                runID: runID,
+                windowID: windowID,
+                signalRouting: false
+            )
+            XCTAssertTrue(didRegisterDisplacedConnection)
             await installPolicy(runID: runID, windowID: windowID)
             await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
-            await MCPRoutingWaiter.cleanup(runID: runID)
-            await MCPRoutingWaiter.register(runID: runID)
-
-            let routeWaiter = Task {
-                await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: 5)
-            }
-            let didRegisterRouteWaiter = await waitUntil {
-                await MCPRoutingWaiter.debugContinuationCount(runID: runID) == 1
-            }
-            XCTAssertTrue(didRegisterRouteWaiter)
 
             await manager.debugSuspendNextPendingPolicyCommit()
             let staleApplication = Task {
@@ -543,10 +541,15 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 await self.manager.debugIsPendingPolicyCommitSuspended()
             }
             XCTAssertTrue(didSuspendCommit)
-            let mappedBeforeInvalidation = await MainActor.run {
-                window.mcpServer.connectionID(forRunID: runID)
-            }
+            let mappedBeforeInvalidation = window.mcpServer.connectionID(forRunID: runID)
+            let replacementSchedulesBeforeInvalidation = await manager
+                .debugPendingPolicyReplacementScheduleCount(
+                    existing: displacedConnectionID,
+                    replacement: staleConnectionID,
+                    runID: runID
+                )
             XCTAssertEqual(mappedBeforeInvalidation, staleConnectionID)
+            XCTAssertEqual(replacementSchedulesBeforeInvalidation, 0)
 
             await manager.debugInvalidatePendingPolicyApplication(connectionID: staleConnectionID)
             await manager.debugResumePendingPolicyCommit()
@@ -554,36 +557,412 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertEqual(staleResult.outcome, "rejected:stale_connection")
 
             let pendingAfterRollback = await manager.debugPendingPolicySnapshot(for: clientName)
-            let mappedAfterRollback = await MainActor.run {
-                window.mcpServer.connectionID(forRunID: runID)
-            }
-            let waiterCountAfterRollback = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            let mappedAfterRollback = window.mcpServer.connectionID(forRunID: runID)
+            let replacementSchedulesAfterRollback = await manager
+                .debugPendingPolicyReplacementScheduleCount(
+                    existing: displacedConnectionID,
+                    replacement: staleConnectionID,
+                    runID: runID
+                )
             XCTAssertTrue(pendingAfterRollback.contains { $0.runID == runID })
-            XCTAssertNil(mappedAfterRollback)
-            XCTAssertEqual(waiterCountAfterRollback, 1)
+            XCTAssertEqual(mappedAfterRollback, displacedConnectionID)
+            XCTAssertEqual(window.mcpServer.connectionIDToRunID[displacedConnectionID], runID)
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[staleConnectionID])
+            XCTAssertEqual(replacementSchedulesAfterRollback, 0)
 
-            let retryResult = await manager.debugApplyPendingPolicy(
+            await cleanup(
+                runID: runID,
+                connectionID: staleConnectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await manager.debugClearPendingPolicyReplacementSchedules()
+        #else
+            throw XCTSkip("Pending policy commit diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testSuccessfulReplacementAdmissionSchedulesDisplacedConnectionExactlyOnce() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let displacedConnectionID = UUID()
+            let replacementConnectionID = UUID()
+            let windowID = window.windowID
+            await manager.debugClearPendingPolicyReplacementSchedules()
+            let didRegisterDisplacedConnection = window.mcpServer.registerRunIDMapping(
+                connectionID: displacedConnectionID,
+                runID: runID,
+                windowID: windowID,
+                signalRouting: false
+            )
+            XCTAssertTrue(didRegisterDisplacedConnection)
+            await installPolicy(runID: runID, windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+
+            let result = await manager.debugApplyPendingPolicy(
                 clientName: clientName,
-                connectionID: retryConnectionID,
+                connectionID: replacementConnectionID,
                 clientPid: Int(getpid()),
                 bootstrapClientName: "repoprompt_ce_cli_debug",
                 pidGateTimeout: 0.25,
                 requireRunRouting: true
             )
-            let didRoute = await routeWaiter.value
-            XCTAssertEqual(retryResult.outcome, "applied")
-            XCTAssertTrue(didRoute)
 
-            await manager.removeConnection(staleConnectionID)
+            let replacementScheduleCount = await manager.debugPendingPolicyReplacementScheduleCount(
+                existing: displacedConnectionID,
+                replacement: replacementConnectionID,
+                runID: runID
+            )
+            let pendingAfterCommit = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertEqual(result.outcome, "applied")
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), replacementConnectionID)
+            XCTAssertEqual(window.mcpServer.connectionIDToRunID[replacementConnectionID], runID)
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[displacedConnectionID])
+            XCTAssertEqual(replacementScheduleCount, 1)
+            XCTAssertFalse(pendingAfterCommit.contains { $0.runID == runID })
+
             await cleanup(
                 runID: runID,
-                connectionID: retryConnectionID,
+                connectionID: replacementConnectionID,
                 windowID: windowID,
                 expectedPID: getpid()
             )
-            await MCPRoutingWaiter.cleanup(runID: runID)
+            await manager.debugClearPendingPolicyReplacementSchedules()
         #else
-            throw XCTSkip("Pending policy commit diagnostics require DEBUG helpers.")
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testSupersededStaleReplacementRollbackDoesNotOverwriteNewerOwner() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let displacedConnectionID = UUID()
+            let staleConnectionID = UUID()
+            let newerConnectionID = UUID()
+            let windowID = window.windowID
+            await manager.debugClearPendingPolicyReplacementSchedules()
+            XCTAssertTrue(window.mcpServer.registerRunIDMapping(
+                connectionID: displacedConnectionID,
+                runID: runID,
+                windowID: windowID,
+                signalRouting: false
+            ))
+            await installPolicy(runID: runID, windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await manager.debugSuspendNextPendingPolicyCommit()
+
+            let staleApplication = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: staleConnectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+            }
+            let didSuspendCommit = await waitUntil {
+                await self.manager.debugIsPendingPolicyCommitSuspended()
+            }
+            XCTAssertTrue(didSuspendCommit)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), staleConnectionID)
+            XCTAssertTrue(window.mcpServer.registerRunIDMapping(
+                connectionID: newerConnectionID,
+                runID: runID,
+                windowID: windowID,
+                signalRouting: false
+            ))
+
+            await manager.debugInvalidatePendingPolicyApplication(connectionID: staleConnectionID)
+            await manager.debugResumePendingPolicyCommit()
+            let staleResult = await staleApplication.value
+            let pendingAfterRollback = await manager.debugPendingPolicySnapshot(for: clientName)
+            let staleCachedRunID = await manager.debugCachedRunID(for: staleConnectionID)
+            let retainedRunPolicy = await manager.debugRunPolicyState(for: runID)
+            let deferredReplacementScheduleCount = await manager
+                .debugPendingPolicyReplacementScheduleCount(
+                    existing: displacedConnectionID,
+                    replacement: staleConnectionID,
+                    runID: runID
+                )
+
+            XCTAssertEqual(staleResult.outcome, "rejected:stale_connection")
+            XCTAssertTrue(pendingAfterRollback.contains { $0.runID == runID })
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), newerConnectionID)
+            XCTAssertEqual(window.mcpServer.connectionIDToRunID[newerConnectionID], runID)
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[displacedConnectionID])
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[staleConnectionID])
+            XCTAssertNil(staleCachedRunID)
+            XCTAssertNotNil(retainedRunPolicy)
+            XCTAssertEqual(deferredReplacementScheduleCount, 0)
+
+            await cleanup(
+                runID: runID,
+                connectionID: staleConnectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await manager.debugClearPendingPolicyReplacementSchedules()
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testStaleReplacementRollbackDoesNotUndoNewerSameConnectionGeneration() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let displacedConnectionID = UUID()
+            let replacementConnectionID = UUID()
+            let windowID = window.windowID
+            await manager.debugClearPendingPolicyReplacementSchedules()
+            XCTAssertTrue(window.mcpServer.registerRunIDMapping(
+                connectionID: displacedConnectionID,
+                runID: runID,
+                windowID: windowID,
+                signalRouting: false
+            ))
+            await installPolicy(runID: runID, windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await manager.debugSuspendNextPendingPolicyCommit()
+
+            let staleApplication = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: replacementConnectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+            }
+            let didSuspendCommit = await waitUntil {
+                await self.manager.debugIsPendingPolicyCommitSuspended()
+            }
+            XCTAssertTrue(didSuspendCommit)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), replacementConnectionID)
+
+            let newerToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: replacementConnectionID,
+                runID: runID,
+                windowID: windowID
+            ))
+            XCTAssertTrue(window.mcpServer.isCurrentPendingPolicyRunIDMapping(newerToken))
+
+            await manager.debugInvalidatePendingPolicyApplication(connectionID: replacementConnectionID)
+            await manager.debugResumePendingPolicyCommit()
+            let staleResult = await staleApplication.value
+            let cachedRunID = await manager.debugCachedRunID(for: replacementConnectionID)
+            let retainedRunPolicy = await manager.debugRunPolicyState(for: runID)
+
+            XCTAssertEqual(staleResult.outcome, "rejected:stale_connection")
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), replacementConnectionID)
+            XCTAssertEqual(window.mcpServer.connectionIDToRunID[replacementConnectionID], runID)
+            XCTAssertTrue(window.mcpServer.isCurrentPendingPolicyRunIDMapping(newerToken))
+            XCTAssertEqual(cachedRunID, runID)
+            XCTAssertNotNil(retainedRunPolicy)
+
+            await cleanup(
+                runID: runID,
+                connectionID: replacementConnectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await manager.debugClearPendingPolicyReplacementSchedules()
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testSupersededPendingPolicyApplicationOwnershipCannotCommitCurrentRouteToken() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = window.windowID
+            await installPolicy(runID: runID, windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await manager.debugSuspendNextPendingPolicyCommit()
+
+            let application = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+            }
+            let didSuspendCommit = await waitUntil {
+                await self.manager.debugIsPendingPolicyCommitSuspended()
+            }
+            XCTAssertTrue(didSuspendCommit)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connectionID)
+
+            await manager.debugSupersedePendingPolicyApplicationOwnership(
+                connectionID: connectionID,
+                runID: runID
+            )
+            await manager.debugResumePendingPolicyCommit()
+            let result = await application.value
+            let pendingAfterRollback = await manager.debugPendingPolicySnapshot(for: clientName)
+
+            XCTAssertEqual(result.outcome, "rejected:stale_connection")
+            XCTAssertTrue(pendingAfterRollback.contains { $0.runID == runID })
+            XCTAssertNil(window.mcpServer.connectionID(forRunID: runID))
+
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testSupersededPendingTokenDoesNotBecomeCurrentAgainAfterNestedRollback() throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let firstRunID = UUID()
+            let secondRunID = UUID()
+            let connectionID = UUID()
+            let windowID = window.windowID
+            let firstToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: firstRunID,
+                windowID: windowID
+            ))
+            let secondToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: secondRunID,
+                windowID: windowID
+            ))
+            XCTAssertFalse(window.mcpServer.isCurrentPendingPolicyRunIDMapping(firstToken))
+            XCTAssertTrue(window.mcpServer.isCurrentPendingPolicyRunIDMapping(secondToken))
+
+            let rollbackResult = window.mcpServer.rollbackPendingPolicyRunIDMapping(
+                secondToken,
+                clientName: clientName,
+                windowID: windowID,
+                signalRoutingFailure: false
+            )
+
+            XCTAssertEqual(rollbackResult, .restored)
+            XCTAssertNil(window.mcpServer.connectionID(forRunID: firstRunID))
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[connectionID])
+            XCTAssertFalse(window.mcpServer.isCurrentPendingPolicyRunIDMapping(firstToken))
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testPendingPolicyRollbackPreservesNewerQueuedContext() throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = window.windowID
+            let token = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: runID,
+                windowID: windowID
+            ))
+
+            window.mcpServer.installTabContext(
+                clientID: nil,
+                clientName: clientName,
+                windowID: windowID,
+                workspaceID: nil,
+                snapshot: ComposeTabState(),
+                runID: runID,
+                signalRouting: false
+            )
+            XCTAssertEqual(window.mcpServer.pendingContextQueueLength(clientName: clientName, windowID: windowID), 1)
+
+            let rollbackResult = window.mcpServer.rollbackPendingPolicyRunIDMapping(
+                token,
+                clientName: clientName,
+                windowID: windowID,
+                signalRoutingFailure: false
+            )
+
+            XCTAssertEqual(rollbackResult, .restored)
+            XCTAssertEqual(window.mcpServer.pendingContextQueueLength(clientName: clientName, windowID: windowID), 1)
+            window.mcpServer.removeTabContext(
+                forConnectionID: nil,
+                clientName: clientName,
+                windowID: windowID,
+                runID: runID
+            )
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testPendingPolicyRollbackDoesNotRestorePreviousRunAfterPrimaryGenerationChanges() throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let previousRunID = UUID()
+            let pendingRunID = UUID()
+            let connectionID = UUID()
+            let newerPrimaryConnectionID = UUID()
+            let windowID = window.windowID
+            XCTAssertTrue(window.mcpServer.registerRunIDMapping(
+                connectionID: connectionID,
+                runID: previousRunID,
+                windowID: windowID,
+                signalRouting: false
+            ))
+            let token = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+                connectionID: connectionID,
+                runID: pendingRunID,
+                windowID: windowID
+            ))
+            XCTAssertTrue(window.mcpServer.registerRunIDMapping(
+                connectionID: newerPrimaryConnectionID,
+                runID: previousRunID,
+                windowID: windowID,
+                signalRouting: false
+            ))
+
+            let rollbackResult = window.mcpServer.rollbackPendingPolicyRunIDMapping(
+                token,
+                clientName: clientName,
+                windowID: windowID,
+                signalRoutingFailure: false
+            )
+
+            XCTAssertEqual(rollbackResult, .restored)
+            XCTAssertNil(window.mcpServer.connectionID(forRunID: pendingRunID))
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: previousRunID), newerPrimaryConnectionID)
+            XCTAssertEqual(window.mcpServer.connectionIDToRunID[newerPrimaryConnectionID], previousRunID)
+            XCTAssertNil(window.mcpServer.connectionIDToRunID[connectionID])
+            window.mcpServer.cleanupRunIDMapping(
+                runID: previousRunID,
+                connectionID: newerPrimaryConnectionID,
+                signalRoutingFailure: false
+            )
+        #else
+            throw XCTSkip("Pending policy replacement diagnostics require DEBUG helpers.")
         #endif
     }
 
