@@ -1,4 +1,5 @@
 import Foundation
+import JSONSchema
 import MCP
 @testable import RepoPrompt
 import RepoPromptShared
@@ -309,53 +310,209 @@ import XCTest
             }
         }
 
-        func testCooperativeDeadlineReturnsOneTimeoutAndKeepsConnectionUsable() async throws {
+        func testBoundedWindowAndGlobalDispatchBranchesReturnOneTimeoutAndKeepConnectionUsable() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
-                let clock = ExecutionWatchdogManualClock()
-                let cooperativeGate = MCPExecutionCooperativeCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
                 let manager = fixture.networkManager
-                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
-                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
-                    try await cooperativeGate.enterAndWait()
-                    return .null
-                }
+                let cases: [(
+                    label: String,
+                    toolName: String,
+                    arguments: [String: Any]
+                )] = [
+                    (
+                        label: "window-scoped read_file",
+                        toolName: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ]
+                    ),
+                    (
+                        label: "global app_settings",
+                        toolName: MCPGlobalToolName.appSettings,
+                        arguments: [
+                            "op": "get",
+                            "key": "ui.appearance_mode"
+                        ]
+                    )
+                ]
+                var appSettingsScope: MCPAppSettingsServiceScope?
+                var activeToolName: String?
+                var activeGate: MCPExecutionCooperativeCancellationGate?
+                var activeResponseTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
                 do {
+                    let installedAppSettingsScope = try await MCPAppSettingsServiceScope.install()
+                    appSettingsScope = installedAppSettingsScope
                     let endpoint = try fixture.endpointA()
-                    let responseTask = Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.readFile,
-                            arguments: [
-                                "path": fixture.contextA.fileURL.path,
-                                "context_id": fixture.contextA.tabID.uuidString
-                            ]
+                    for testCase in cases {
+                        let clock = ExecutionWatchdogManualClock()
+                        let cooperativeGate = MCPExecutionCooperativeCancellationGate()
+                        activeToolName = testCase.toolName
+                        activeGate = cooperativeGate
+                        await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                        await manager.debugSetResolvedToolOperationOverride(toolName: testCase.toolName) {
+                            try await cooperativeGate.enterAndWait()
+                            return .null
+                        }
+
+                        let responseTask = Task {
+                            try await endpoint.callTool(
+                                name: testCase.toolName,
+                                arguments: testCase.arguments
+                            )
+                        }
+                        activeResponseTask = responseTask
+                        try await clock.waitForSleeperCount(1)
+                        let sleeperCount = await clock.sleeperCount()
+                        XCTAssertEqual(sleeperCount, 1, testCase.label)
+                        try await cooperativeGate.waitUntilEntered()
+                        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+
+                        let response = try await responseTask.value
+                        activeResponseTask = nil
+                        let cancellationCount = await cooperativeGate.observedCancellationCount()
+                        XCTAssertEqual(cancellationCount, 1, testCase.label)
+                        let text = try Self.toolResultText(response)
+                        XCTAssertEqual(
+                            text.components(separatedBy: "tool_execution_timeout").count - 1,
+                            1,
+                            "\(testCase.label): \(text)"
                         )
+                        let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
+                        XCTAssertFalse(isTerminal, testCase.label)
+
+                        let events = recorder.snapshot().filter {
+                            $0.connectionID == endpoint.connectionID && $0.toolName == testCase.toolName
+                        }
+                        XCTAssertEqual(events.count(where: { $0.phase == .contractSelected }), 1, testCase.label)
+                        XCTAssertEqual(events.count(where: { $0.phase == .deadlineExpired }), 1, testCase.label)
+                        let selected = try XCTUnwrap(
+                            events.first { $0.phase == .contractSelected },
+                            testCase.label
+                        )
+                        XCTAssertEqual(selected.contractKind, .bounded, testCase.label)
+                        XCTAssertEqual(
+                            selected.executionDeadlineSeconds,
+                            Double(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds),
+                            testCase.label
+                        )
+
+                        await manager.debugSetResolvedToolOperationOverride(toolName: testCase.toolName, operation: nil)
+                        await manager.debugResetToolExecutionWatchdogEnvironment()
+                        activeToolName = nil
+                        activeGate = nil
                     }
-                    try await clock.waitForSleeperCount(1)
-                    try await cooperativeGate.waitUntilEntered()
-                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
 
-                    let response = try await responseTask.value
-                    let text = try Self.toolResultText(response)
-                    XCTAssertTrue(text.contains("tool_execution_timeout"), text)
-                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
-                    XCTAssertFalse(isTerminal)
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    let appSettingsResponse = try await endpoint.callTool(
+                        name: MCPGlobalToolName.appSettings,
+                        arguments: [
+                            "op": "get",
+                            "key": "ui.appearance_mode",
+                            "_rawJSON": true
+                        ]
+                    )
+                    let appSettingsPayload = try Self.toolResultObject(appSettingsResponse)
+                    XCTAssertEqual(appSettingsPayload["op"] as? String, "get")
+                    XCTAssertEqual(appSettingsPayload["status"] as? String, "ok")
+                    XCTAssertEqual((appSettingsPayload["count"] as? NSNumber)?.intValue, 1)
+                    let appSettingsValues = try XCTUnwrap(appSettingsPayload["values"] as? [String: Any])
+                    XCTAssertNotNil(appSettingsValues["ui.appearance_mode"])
 
-                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
-                    await manager.debugResetToolExecutionWatchdogEnvironment()
-                    _ = try await endpoint.callTool(
+                    _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                    let readFileResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.readFile,
                         arguments: [
                             "path": fixture.contextA.fileURL.path,
                             "context_id": fixture.contextA.tabID.uuidString
                         ]
                     )
+                    let readFileText = try Self.toolResultText(readFileResponse)
+                    XCTAssertTrue(readFileText.contains(fixture.contextA.sentinel), readFileText)
+                    let finalInFlight = await manager.hasInFlightCalls(for: endpoint.connectionID)
+                    XCTAssertFalse(finalInFlight)
+                    let limiter = await manager.connectionLimiterSnapshotForTesting(connectionID: endpoint.connectionID)
+                    XCTAssertEqual(limiter?.permits, 1)
+                    XCTAssertEqual(limiter?.waiterCount, 0)
+                    XCTAssertEqual(limiter?.inFlight, 0)
 
+                    await installedAppSettingsScope.restore()
+                    installedAppSettingsScope.assertRestored()
+                    appSettingsScope = nil
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
                 } catch {
-                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await activeGate?.cancelForCleanup()
+                    activeResponseTask?.cancel()
+                    if let activeResponseTask {
+                        _ = try? await activeResponseTask.value
+                    }
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    if let activeToolName {
+                        await manager.debugSetResolvedToolOperationOverride(toolName: activeToolName, operation: nil)
+                    }
+                    for testCase in cases {
+                        await manager.debugSetResolvedToolOperationOverride(toolName: testCase.toolName, operation: nil)
+                    }
                     await manager.debugResetToolExecutionWatchdogEnvironment()
+                    if let appSettingsScope {
+                        await appSettingsScope.restore()
+                        appSettingsScope.assertRestored()
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testWindowIDInjectionAndExplicitValueReachResolvedProviderArguments() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let probe = MCPWindowIDEffectiveArgumentsService(windowID: fixture.contextA.window.windowID)
+                ServiceRegistry.unregister(fixture.contextA.catalogService)
+                ServiceRegistry.register(probe)
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let cases: [(label: String, arguments: [String: Any], expectedWindowID: Int)] = [
+                        (
+                            label: "routing window is injected when omitted",
+                            arguments: [
+                                "marker": "injected",
+                                "context_id": fixture.contextA.tabID.uuidString,
+                                "_rawJSON": true
+                            ],
+                            expectedWindowID: fixture.contextA.window.windowID
+                        ),
+                        (
+                            label: "explicit public window_id is preserved",
+                            arguments: [
+                                "marker": "explicit",
+                                "context_id": fixture.contextA.tabID.uuidString,
+                                "window_id": fixture.contextB.window.windowID,
+                                "_rawJSON": true
+                            ],
+                            expectedWindowID: fixture.contextB.window.windowID
+                        )
+                    ]
+
+                    for testCase in cases {
+                        let response = try await endpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: testCase.arguments
+                        )
+                        let payload = try Self.toolResultObject(response)
+                        XCTAssertEqual(payload["marker"] as? String, testCase.arguments["marker"] as? String, testCase.label)
+                        XCTAssertEqual((payload["window_id"] as? NSNumber)?.intValue, testCase.expectedWindowID, testCase.label)
+                    }
+
+                    ServiceRegistry.unregister(probe)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    ServiceRegistry.unregister(probe)
                     await fixture.cleanup()
                     throw error
                 }
@@ -450,6 +607,12 @@ import XCTest
             return content.compactMap { $0["text"] as? String }.joined()
         }
 
+        private static func toolResultObject(_ response: PersistentMCPTestRPCResponse) throws -> [String: Any] {
+            let text = try toolResultText(response)
+            let data = try XCTUnwrap(text.data(using: .utf8))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
         private static func assertSocketClosed(_ task: Task<PersistentMCPTestRPCResponse, Error>) async {
             do {
                 _ = try await task.value
@@ -458,6 +621,130 @@ import XCTest
                 // Expected.
             } catch {
                 XCTFail("Expected socket closure, got \(error)")
+            }
+        }
+    }
+
+    @MainActor
+    private final class MCPAppSettingsServiceScope {
+        private let service: AppSettingsMCPService
+        private let ownsService: Bool
+        private let baselineServiceIDs: [ObjectIdentifier]
+        private let baselineAvailable: Bool
+        private let baselineDisabled: Bool
+        private var restored = false
+
+        private init() {
+            let existingServices = ServiceRegistry.services.compactMap { $0 as? AppSettingsMCPService }
+            service = existingServices.first ?? AppSettingsMCPService()
+            ownsService = existingServices.isEmpty
+            baselineServiceIDs = existingServices.map { ObjectIdentifier($0) }
+            baselineAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
+                $0.name == MCPGlobalToolName.appSettings
+            }
+            baselineDisabled = ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings)
+        }
+
+        static func install() async throws -> MCPAppSettingsServiceScope {
+            let scope = MCPAppSettingsServiceScope()
+            do {
+                if scope.baselineDisabled {
+                    await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
+                }
+                if scope.ownsService {
+                    ServiceRegistry.register(scope.service)
+                }
+                try await scope.waitUntilReady()
+                XCTAssertTrue(ToolAvailabilityStore.shared.isEnabled(MCPGlobalToolName.appSettings))
+                return scope
+            } catch {
+                await scope.restore()
+                throw error
+            }
+        }
+
+        func restore() async {
+            guard !restored else { return }
+            restored = true
+
+            if ownsService {
+                ServiceRegistry.unregister(service)
+            }
+            if !baselineAvailable {
+                ToolAvailabilityStore.shared.unregisterTools([MCPGlobalToolName.appSettings])
+            }
+            let isDisabled = ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings)
+            if isDisabled != baselineDisabled {
+                await ToolAvailabilityStore.shared.toggle(
+                    MCPGlobalToolName.appSettings,
+                    enabled: !baselineDisabled
+                )
+            }
+        }
+
+        func assertRestored(file: StaticString = #filePath, line: UInt = #line) {
+            let serviceIDs = ServiceRegistry.services
+                .compactMap { $0 as? AppSettingsMCPService }
+                .map { ObjectIdentifier($0) }
+            XCTAssertEqual(serviceIDs, baselineServiceIDs, file: file, line: line)
+            XCTAssertEqual(
+                ToolAvailabilityStore.shared.toolSummaries.contains {
+                    $0.name == MCPGlobalToolName.appSettings
+                },
+                baselineAvailable,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings),
+                baselineDisabled,
+                file: file,
+                line: line
+            )
+        }
+
+        private func waitUntilReady() async throws {
+            for _ in 0 ..< 1000 {
+                let isRegistered = ServiceRegistry.services.contains {
+                    ($0 as AnyObject) === (service as AnyObject)
+                }
+                let isAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
+                    $0.name == MCPGlobalToolName.appSettings
+                }
+                if isRegistered, isAvailable {
+                    return
+                }
+                await Task.yield()
+            }
+            throw MCPExecutionWatchdogIntegrationFixtureError.toolAvailabilityDidNotPublish(
+                MCPGlobalToolName.appSettings
+            )
+        }
+    }
+
+    private final class MCPWindowIDEffectiveArgumentsService: WindowScopedService {
+        let windowID: Int
+
+        init(windowID: Int) {
+            self.windowID = windowID
+        }
+
+        var tools: [RepoPrompt.Tool] {
+            get async {
+                [
+                    RepoPrompt.Tool(
+                        name: MCPWindowToolName.readFile,
+                        description: "Test probe for resolved provider arguments.",
+                        inputSchema: .object(
+                            properties: [
+                                "marker": .string(description: "Scenario marker."),
+                                "window_id": .integer(description: "Effective public window identifier.")
+                            ],
+                            required: ["marker"]
+                        ),
+                        returnsValue: { args in .object(args) }
+                    )
+                ]
             }
         }
     }
@@ -586,6 +873,7 @@ import XCTest
         case cooperativeGateCancellationNotObserved
         case cooperativeGateDidNotEnter
         case gateDidNotEnter(expected: Int, actual: Int)
+        case toolAvailabilityDidNotPublish(String)
     }
 
 #endif

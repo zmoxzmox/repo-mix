@@ -557,81 +557,206 @@
             XCTAssertTrue(snapshot.stages.allSatisfy { $0.sampleCount == 1 })
         }
 
-        func testServiceToolLookupInnerAttributionHooksRemainCompileGatedOwnedAndReleaseEquivalent() throws {
-            let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
-            let lookupBegin = try XCTUnwrap(manager.range(of: "let serviceToolLookupState = EditFlowPerf.begin("))
-            let directInvocation = try XCTUnwrap(manager.range(of: "try await toolDef.callAsFunction(effectiveArgs)", range: lookupBegin.upperBound ..< manager.endIndex))
-            let lookup = String(manager[lookupBegin.lowerBound ..< directInvocation.lowerBound])
-
-            var searchStart = lookup.startIndex
-            for hook in [
-                "let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)",
-                "let serviceTools = await service.tools",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)",
-                "let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)",
-                "guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)",
-                "let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)",
-                "let routingWindowID: Int? = {",
-                "let selectedSchemaDeclaresWindowID =",
-                "routingWindowID != nil",
-                "capturedArguments[\"window_id\"] == nil",
-                "capturedArgsForFormatter[\"window_id\"] == nil",
-                "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)",
-                "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID",
-                "args: capturedArguments",
-                "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID",
-                "args: capturedArgsForFormatter",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection, publicWindowIDInjectionState)",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)"
-            ] {
-                let match = try XCTUnwrap(lookup.range(of: hook, range: searchStart ..< lookup.endIndex), "Missing or out-of-order ServiceToolLookup attribution hook: \(hook)")
-                searchStart = match.upperBound
+        func testServiceToolLookupInnerAttributionHooksRemainCompileGatedAndOwnMeasuredOperations() throws {
+            func assertCompileGated(
+                _ marker: Range<String.Index>,
+                in source: String,
+                context: String
+            ) throws {
+                let opening = try XCTUnwrap(
+                    source.range(
+                        of: "#if DEBUG || EDIT_FLOW_PERF",
+                        options: .backwards,
+                        range: source.startIndex ..< marker.lowerBound
+                    ),
+                    "Missing DEBUG gate before \(context)"
+                )
+                if let precedingClose = source.range(
+                    of: "#endif",
+                    options: .backwards,
+                    range: source.startIndex ..< marker.lowerBound
+                ) {
+                    XCTAssertLessThan(precedingClose.lowerBound, opening.lowerBound, context)
+                }
+                _ = try XCTUnwrap(
+                    source.range(of: "#endif", range: marker.upperBound ..< source.endIndex),
+                    "Missing DEBUG gate close after \(context)"
+                )
             }
 
-            XCTAssertEqual(manager.components(separatedBy: "let serviceTools = await service.tools").count - 1, 1)
-            XCTAssertEqual(manager.components(separatedBy: "guard let toolDef = serviceTools.first(where: { $0.name == toolName })").count - 1, 1)
-            XCTAssertEqual(lookup.components(separatedBy: "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)").count - 1, 1)
-            XCTAssertEqual(lookup.components(separatedBy: "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID").count - 1, 2)
-            XCTAssertEqual(lookup.components(separatedBy: "args: capturedArguments").count - 1, 1)
-            XCTAssertEqual(lookup.components(separatedBy: "args: capturedArgsForFormatter").count - 1, 1)
-            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 1)
-            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupServiceToolsAwait").count - 1, 2)
-            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupToolDefinitionScan").count - 1, 3)
-            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupPublicWindowIDInjection").count - 1, 2)
-            XCTAssertGreaterThanOrEqual(lookup.components(separatedBy: "#if DEBUG || EDIT_FLOW_PERF").count - 1, 7)
-            XCTAssertFalse(manager.contains("service.call("))
+            func scopedSource(
+                from startMarker: String,
+                to endMarker: String,
+                in source: String,
+                context: String
+            ) throws -> String {
+                let start = try XCTUnwrap(source.range(of: startMarker), "Missing scope start for \(context)")
+                let end = try XCTUnwrap(
+                    source.range(of: endMarker, range: start.upperBound ..< source.endIndex),
+                    "Missing scope end for \(context)"
+                )
+                return String(source[start.lowerBound ..< end.lowerBound])
+            }
 
-            let injectionHelperBegin = try XCTUnwrap(manager.range(of: "    private nonisolated func injectWindowIDIfNeeded("))
-            let injectionHelperEnd = try XCTUnwrap(manager.range(of: "\n    func registerExpectedAgentPID", range: injectionHelperBegin.upperBound ..< manager.endIndex))
-            let injectionHelper = String(manager[injectionHelperBegin.lowerBound ..< injectionHelperEnd.lowerBound])
-            XCTAssertTrue(injectionHelper.contains("schemaDeclaresWindowID: Bool"))
-            XCTAssertTrue(injectionHelper.contains("if args[\"window_id\"] != nil { return args }"))
-            XCTAssertFalse(injectionHelper.contains("schema: JSONSchema"))
+            func measuredRegion(
+                stage: String,
+                in source: String,
+                context: String
+            ) throws -> String {
+                let begin = try XCTUnwrap(
+                    source.range(of: "EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.\(stage))"),
+                    "Missing begin marker for \(context)"
+                )
+                let end = try XCTUnwrap(
+                    source.range(
+                        of: "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.\(stage),",
+                        range: begin.upperBound ..< source.endIndex
+                    ),
+                    "Missing end marker for \(context)"
+                )
+                try assertCompileGated(begin, in: source, context: "\(context) begin")
+                try assertCompileGated(end, in: source, context: "\(context) end")
+                return String(source[begin.lowerBound ..< end.upperBound])
+            }
+
+            func assertMeasured(
+                stage: String,
+                operation: String,
+                in source: String,
+                context: String
+            ) throws {
+                let region = try measuredRegion(stage: stage, in: source, context: context)
+                XCTAssertTrue(region.contains(operation), "\(context) no longer owns \(operation)")
+            }
+
+            func assertDeferredMeasurement(
+                stage: String,
+                operation: String,
+                in source: String,
+                context: String
+            ) throws {
+                let begin = try XCTUnwrap(
+                    source.range(of: "EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.\(stage))"),
+                    "Missing begin marker for \(context)"
+                )
+                let end = try XCTUnwrap(
+                    source.range(
+                        of: "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.\(stage),",
+                        range: begin.upperBound ..< source.endIndex
+                    ),
+                    "Missing deferred end marker for \(context)"
+                )
+                let deferOpen = try XCTUnwrap(
+                    source.range(of: "defer {", range: begin.upperBound ..< end.lowerBound),
+                    "Missing defer ownership for \(context)"
+                )
+                let deferClose = try XCTUnwrap(
+                    source.range(of: "}", range: end.upperBound ..< source.endIndex),
+                    "Missing defer close for \(context)"
+                )
+                let ownedOperation = try XCTUnwrap(
+                    source.range(of: operation, range: deferClose.upperBound ..< source.endIndex),
+                    "Missing owned operation for \(context)"
+                )
+                try assertCompileGated(begin, in: source, context: "\(context) begin")
+                try assertCompileGated(end, in: source, context: "\(context) end")
+                XCTAssertLessThan(begin.lowerBound, deferOpen.lowerBound, context)
+                XCTAssertLessThan(deferOpen.lowerBound, end.lowerBound, context)
+                XCTAssertLessThan(end.lowerBound, deferClose.lowerBound, context)
+                XCTAssertLessThan(deferClose.lowerBound, ownedOperation.lowerBound, context)
+            }
+
+            // Structural exception: recorder tests prove the stage inventory. These checks retain
+            // only telemetry ownership and DEBUG-gating facts that runtime tests cannot observe.
+            let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
+            try assertMeasured(
+                stage: "serviceToolLookupServiceToolsAwait",
+                operation: "await service.tools",
+                in: manager,
+                context: "service-tools await"
+            )
+            try assertMeasured(
+                stage: "serviceToolLookupToolDefinitionScan",
+                operation: ".first(where:",
+                in: manager,
+                context: "tool-definition scan"
+            )
+            let injectionRegion = try measuredRegion(
+                stage: "serviceToolLookupPublicWindowIDInjection",
+                in: manager,
+                context: "public window-ID injection"
+            )
+            let providerDestination = try XCTUnwrap(injectionRegion.range(of: "effectiveArgs ="))
+            let providerInjection = try XCTUnwrap(
+                injectionRegion.range(
+                    of: "injectWindowIDIfNeeded(",
+                    range: providerDestination.upperBound ..< injectionRegion.endIndex
+                )
+            )
+            let formatterDestination = try XCTUnwrap(
+                injectionRegion.range(
+                    of: "effectiveArgsForFormatter =",
+                    range: providerInjection.upperBound ..< injectionRegion.endIndex
+                )
+            )
+            let formatterInjection = try XCTUnwrap(
+                injectionRegion.range(
+                    of: "injectWindowIDIfNeeded(",
+                    range: formatterDestination.upperBound ..< injectionRegion.endIndex
+                )
+            )
+            XCTAssertLessThan(providerDestination.lowerBound, providerInjection.lowerBound)
+            XCTAssertLessThan(providerInjection.lowerBound, formatterDestination.lowerBound)
+            XCTAssertLessThan(formatterDestination.lowerBound, formatterInjection.lowerBound)
+            XCTAssertEqual(injectionRegion.components(separatedBy: "injectWindowIDIfNeeded(").count - 1, 2)
 
             let appSettings = try source("Sources/RepoPrompt/Infrastructure/MCP/AppSettingsMCPService.swift")
-            XCTAssertEqual(appSettings.components(separatedBy: "serviceToolLookupAppSettingsToolsBuild").count - 1, 2)
-            XCTAssertTrue(appSettings.contains("#if DEBUG || EDIT_FLOW_PERF\n                let appSettingsToolsBuildState"))
-            XCTAssertTrue(appSettings.contains("return makeTools()"))
+            let appSettingsTools = try scopedSource(
+                from: "var tools: [Tool] {",
+                to: "private func makeTools()",
+                in: appSettings,
+                context: "app-settings tools accessor"
+            )
+            try assertDeferredMeasurement(
+                stage: "serviceToolLookupAppSettingsToolsBuild",
+                operation: "makeTools()",
+                in: appSettingsTools,
+                context: "app-settings tool construction"
+            )
 
             let routing = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowRoutingService.swift")
-            let toolsCacheStart = try XCTUnwrap(routing.range(of: "private actor ToolsCache"))
-            let toolsCacheEnd = try XCTUnwrap(routing.range(of: "private extension Array", range: toolsCacheStart.upperBound ..< routing.endIndex))
-            let toolsCache = String(routing[toolsCacheStart.lowerBound ..< toolsCacheEnd.lowerBound])
-            XCTAssertEqual(routing.components(separatedBy: "serviceToolLookupWindowRoutingToolsCacheActorBody").count - 1, 2)
-            XCTAssertTrue(toolsCache.contains("#if DEBUG || EDIT_FLOW_PERF"))
-            XCTAssertTrue(toolsCache.contains("return tools"))
+            let routingCacheGet = try scopedSource(
+                from: "func get() -> [Tool] {",
+                to: "private extension Array",
+                in: routing,
+                context: "window-routing cache getter"
+            )
+            try assertDeferredMeasurement(
+                stage: "serviceToolLookupWindowRoutingToolsCacheActorBody",
+                operation: "return tools",
+                in: routingCacheGet,
+                context: "window-routing cache actor body"
+            )
 
             let catalog = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift")
-            XCTAssertEqual(catalog.components(separatedBy: "serviceToolLookupWindowCatalogToolsActorBodyTotal").count - 1, 2)
-            XCTAssertEqual(catalog.components(separatedBy: "serviceToolLookupWindowCatalogToolsMaterialization").count - 1, 2)
-            let cacheHitReturn = try XCTUnwrap(catalog.range(of: "if let toolsCache {\n                return toolsCache\n            }"))
-            let materialization = try XCTUnwrap(catalog.range(of: "let materializationState = EditFlowPerf.begin(", range: cacheHitReturn.upperBound ..< catalog.endIndex))
-            let providersGrouping = try XCTUnwrap(catalog.range(of: "var providersByGroup:", range: materialization.upperBound ..< catalog.endIndex))
-            XCTAssertLessThan(cacheHitReturn.lowerBound, materialization.lowerBound)
-            XCTAssertLessThan(materialization.lowerBound, providersGrouping.lowerBound)
-            XCTAssertTrue(catalog.contains("#if DEBUG || EDIT_FLOW_PERF"))
-            XCTAssertTrue(catalog.contains("toolsCache = built\n            return built"))
+            let catalogTools = try scopedSource(
+                from: "var tools: [Tool] {",
+                to: "func invalidateToolsCache()",
+                in: catalog,
+                context: "window-catalog tools accessor"
+            )
+            try assertDeferredMeasurement(
+                stage: "serviceToolLookupWindowCatalogToolsActorBodyTotal",
+                operation: "if let toolsCache",
+                in: catalogTools,
+                context: "window-catalog total actor body"
+            )
+            try assertDeferredMeasurement(
+                stage: "serviceToolLookupWindowCatalogToolsMaterialization",
+                operation: "providersByGroup",
+                in: catalogTools,
+                context: "window-catalog materialization"
+            )
         }
 
         func testMCPWindowToolCatalogLifecycleAttributionRecorderUsesStaticEmptyDimensions() {
