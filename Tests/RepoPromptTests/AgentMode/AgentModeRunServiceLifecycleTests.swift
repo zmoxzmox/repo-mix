@@ -94,7 +94,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.endRunAttempt(ifCurrent: reusedOwnership, source: "test.cleanup")
     }
 
-    func testCodexRejectedSendVariantsPreserveReusedOwnership() async {
+    func testCodexFallbackAndRejectedSendVariantsPreserveReusedOwnership() async {
         let rows: [(LifecycleNoopCodexController.SendBehavior, Bool)] = [
             (.failure, true),
             (.cancellation, true),
@@ -123,10 +123,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 attachments: []
             )
 
-            switch behavior {
-            case .cancellation:
-                XCTAssertEqual(outcome, .cancelled)
-            case .failure, .success:
+            if activatesThread {
+                guard case .queuedFallback? = outcome else {
+                    return XCTFail("Expected durable Codex fallback for \(behavior)")
+                }
+            } else {
                 guard case .failed? = outcome else {
                     return XCTFail("Expected rejected Codex send for \(behavior)")
                 }
@@ -657,6 +658,60 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: successor))
     }
 
+    func testProviderSuccessorConsumesOnceAfterAcceptedPublicationWithoutTouchingGenericQueue() async {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var consumedRevisions: [UUID] = []
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                return publicationAttempts == 1
+                    ? .rejected(reason: "transient")
+                    : .accepted(successorEpoch: nil)
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["unrelated generic instruction"]
+        let ownership = session.beginRunAttempt(source: "test.providerSuccessor")
+        let successorID = UUID()
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.providerSuccessor",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            providerSuccessor: .init(
+                id: successorID,
+                transitionKind: .relatedFollowUp,
+                consumeAfterPublication: { revision, result in
+                    if case .accepted = result {
+                        consumedRevisions.append(revision.commitID)
+                        return true
+                    }
+                    return false
+                }
+            ),
+            notifyTurnComplete: false
+        )
+
+        _ = await barrier.commit(request)
+        XCTAssertTrue(consumedRevisions.isEmpty)
+        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+
+        _ = await barrier.commit(request)
+        _ = await barrier.commit(request)
+        XCTAssertEqual(consumedRevisions.count, 1)
+        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+        XCTAssertEqual(session.lastTerminalCommitRevision?.providerSuccessorID, successorID)
+    }
+
     func testConcurrentPublicationOnlyCancellationWaitsForCanonicalPublication() async throws {
         let recorder = LifecycleRecorder()
         let publicationGate = LifecyclePublicationGate()
@@ -991,6 +1046,47 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 : "attachments:deleteFiles"
             XCTAssertTrue(recorder.contains(expectedAttachmentDisposition), row.rawValue)
         }
+    }
+
+    func testCancelRunInterruptsCapturedSessionOwnedCodexTurnByExactID() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            codexController: controller
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .codexExec
+        session.runID = runID
+        session.runState = .running
+        session.codexConversationID = "lifecycle"
+        session.codexController = controller
+        session.beginRunAttempt(source: "test.codexExactCancellation")
+        session.codexAuthoritativeActiveTurn = try .init(
+            threadID: "lifecycle",
+            turnID: "owned-turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalTeardownCompleted
+        )
+
+        XCTAssertTrue(recorder.contains("codex:interrupt:owned-turn"))
+        XCTAssertFalse(recorder.contains("codex:cancel"))
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        assertOrderedEvents(
+            ["commit:", "codex:interrupt:owned-turn", "codex:shutdown"],
+            in: recorder,
+            prefixMatches: true
+        )
     }
 
     func testOpenCodePermissionModesUseModernConfigAfterModelAndBeforePrompt() async throws {
@@ -1777,20 +1873,19 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {
+    func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
         try recordCodexSend()
+        return CodexTurnStartReceipt(provisionalSubmissionID: "lifecycle-submission")
     }
 
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {
+    func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
         try recordCodexSend()
+        return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
     }
 
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {
-        try recordCodexSend()
-    }
-
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {
-        try recordCodexSend()
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        recorder.record("codex:interrupt:\(expectedTurnID)")
+        return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
     private func recordCodexSend() throws {

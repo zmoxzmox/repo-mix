@@ -97,7 +97,11 @@ extension AgentModeViewModel {
         /// and intentionally never persisted as session state.
         var pendingInitialStartLocation: InitialStartLocation = .local
         var composerSubmissionToken = UUID()
-        var isComposerSubmissionInFlight = false
+        var activeComposerSubmitAttempt: AgentComposerSubmitAttempt?
+        var isComposerSubmissionInFlight: Bool {
+            activeComposerSubmitAttempt != nil
+        }
+
         var isPreparingInitialWorktree: Bool = false
         var isChangingExecutionLocation: Bool = false
 
@@ -223,18 +227,172 @@ extension AgentModeViewModel {
             var reasoningEffort: String?
             var serviceTier: String?
             var attachmentReservationID: UUID?
+            var expectedTurnID: String?
             var retryAttempted: Bool = false
         }
 
         enum CodexTurnKind: String {
             case user
             case compact
+            case review
+            case unknown
+        }
+
+        struct CodexAuthoritativeTurnIdentity: Equatable {
+            let threadID: String
+            let turnID: String
+            let turnKind: CodexTurnKind
+            let controllerInstanceID: ObjectIdentifier
+            let controllerGeneration: UUID
+            let runID: UUID
+            let runAttemptID: UUID
+        }
+
+        struct CodexAnonymousTurnLiveness: Equatable {
+            let threadID: String
+            let turnKind: CodexTurnKind
+            let controllerInstanceID: ObjectIdentifier
+            let controllerGeneration: UUID
+            let runID: UUID
+            let runAttemptID: UUID
+        }
+
+        enum CodexFallbackOrigin: Equatable {
+            case manual
+            case mcp(attemptID: UUID)
+        }
+
+        @MainActor
+        final class CodexDispatchSerialGate {
+            private var nextTicket: UInt64 = 0
+            private var servingTicket: UInt64 = 0
+            private var cancelledTickets: Set<UInt64> = []
+            private var waiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+
+            func issueTicket() -> UInt64 {
+                defer { nextTicket &+= 1 }
+                return nextTicket
+            }
+
+            func awaitTurn(_ ticket: UInt64) async -> Bool {
+                if cancelledTickets.remove(ticket) != nil {
+                    advancePastCancelledTickets()
+                    return false
+                }
+                if ticket == servingTicket {
+                    return true
+                }
+                return await withCheckedContinuation { continuation in
+                    waiters[ticket] = continuation
+                }
+            }
+
+            func finish(_ ticket: UInt64) {
+                guard ticket == servingTicket else { return }
+                servingTicket &+= 1
+                advancePastCancelledTickets()
+                waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
+            }
+
+            func cancel(_ ticket: UInt64) {
+                if let waiter = waiters.removeValue(forKey: ticket) {
+                    waiter.resume(returning: false)
+                }
+                cancelledTickets.insert(ticket)
+                guard ticket == servingTicket else { return }
+                advancePastCancelledTickets()
+                waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
+            }
+
+            private func advancePastCancelledTickets() {
+                while cancelledTickets.remove(servingTicket) != nil {
+                    servingTicket &+= 1
+                }
+            }
+        }
+
+        enum CodexFallbackReason: Equatable {
+            case activeWithoutAuthoritativeIdentity
+            case staleAuthoritativeIdentity
+            case nonSteerableTurn(kind: CodexTurnKind)
+            case noActiveTurn(failure: CodexAppServerClient.RequestFailure)
+            case expectedTurnMismatch(
+                expectedTurnID: String,
+                actualTurnID: String?,
+                failure: CodexAppServerClient.RequestFailure
+            )
+            case activeTurnNotSteerable(
+                turnKind: String?,
+                failure: CodexAppServerClient.RequestFailure
+            )
+        }
+
+        struct CodexFallbackSubmissionContext: Equatable {
+            let queueID: UUID
+            let providerText: String
+            let images: [AgentImageAttachment]
+            let taggedFileAttachments: [AgentTaggedFileAttachment]
+            let draftText: String
+            let optimisticUserItemID: UUID?
+            let origin: CodexFallbackOrigin
+            let dispatchTicket: UInt64?
+        }
+
+        struct CodexFallbackBlockingTurn: Equatable {
+            let threadID: String
+            let turnID: String
+            let controllerInstanceID: ObjectIdentifier
+            let controllerGeneration: UUID
+            let runID: UUID
+            let runAttemptID: UUID
+        }
+
+        struct CodexPendingSteerLifecycleReconciliation: Equatable {
+            let priorIdentity: CodexAuthoritativeTurnIdentity
+            let acceptedDispatchTurnID: String
+        }
+
+        enum CodexFallbackQueueState: Equatable {
+            case queued
+            case eligibleForSuccessor(completedTurnID: String)
+            case dispatching
+            case awaitingLifecycleStart
+            case lifecycleStarted
+        }
+
+        struct CodexFallbackQueueEntry: Equatable, Identifiable {
+            let id: UUID
+            let providerText: String
+            let images: [AgentImageAttachment]
+            let taggedFileAttachments: [AgentTaggedFileAttachment]
+            let model: String?
+            let reasoningEffort: String?
+            let serviceTier: String?
+            let attachmentReservationID: UUID?
+            let optimisticUserItemID: UUID?
+            let draftText: String
+            let origin: CodexFallbackOrigin
+            let fallbackReason: CodexFallbackReason
+            let originThreadID: String
+            let originControllerInstanceID: ObjectIdentifier
+            let originControllerGeneration: UUID
+            let originRunID: UUID
+            let originRunAttemptID: UUID
+            var blockingTurn: CodexFallbackBlockingTurn?
+            var state: CodexFallbackQueueState
         }
 
         var codexPendingTurnKind: CodexTurnKind?
         var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn?
-        var codexTurnKindsByID: [String: CodexTurnKind] = [:]
-        var pendingCodexCompactionInstructions: [String] = []
+        var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity?
+        var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
+        var codexRoutingObservedTurnID: String?
+        var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
+        var codexFallbackQueue: [CodexFallbackQueueEntry] = []
+        var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
+        var codexFallbackPumpTask: Task<Void, Never>?
+        var codexFallbackSuccessorRetryTask: Task<Void, Never>?
+        let codexDispatchSerialGate = CodexDispatchSerialGate()
 
         // Instruction steering coordination state
         var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>?
@@ -270,7 +428,14 @@ extension AgentModeViewModel {
         }
 
         /// Draft text for input field
-        var draftText: String = ""
+        var draftText: String = "" {
+            didSet {
+                guard draftText != oldValue else { return }
+                draftMutationGeneration &+= 1
+            }
+        }
+
+        private(set) var draftMutationGeneration: UInt64 = 0
 
         /// Selected workflow template for next message
         var selectedWorkflow: AgentWorkflowDefinition?
@@ -298,7 +463,19 @@ extension AgentModeViewModel {
         var codexNeedsReconnect: Bool = false
         var codexResumeTimeoutState: CodexResumeTimeoutState = .init()
         var codexToolPreferencesGeneration: Int = 0
-        var codexController: (any CodexSessionControlling)?
+        var codexController: (any CodexSessionControlling)? {
+            didSet {
+                let oldIdentity = oldValue.map { ObjectIdentifier($0) }
+                let newIdentity = codexController.map { ObjectIdentifier($0) }
+                guard oldIdentity != newIdentity else { return }
+                codexControllerGeneration = UUID()
+                codexAuthoritativeActiveTurn = nil
+                codexAnonymousActiveTurn = nil
+                codexRoutingObservedTurnID = nil
+            }
+        }
+
+        private(set) var codexControllerGeneration = UUID()
         /// The permission profile the current Codex controller was created with.
         /// Used to detect when MCP control changes require controller recycling.
         var codexControllerPermissionProfile: AgentPermissionProfile?
@@ -348,9 +525,6 @@ extension AgentModeViewModel {
         var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
         var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
         var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
-        var codexCurrentTurnID: String?
-        var codexCurrentTurnKind: CodexTurnKind?
-
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
         var pendingHandoff: PendingHandoffState = .init()
@@ -509,8 +683,10 @@ extension AgentModeViewModel {
             lastTerminalCommitRevision = nil
             lastTerminalPublicationResult = nil
             providerTerminalDrainGeneration = 0
-            codexCurrentTurnID = nil
-            codexCurrentTurnKind = nil
+            codexAuthoritativeActiveTurn = nil
+            codexAnonymousActiveTurn = nil
+            codexRoutingObservedTurnID = nil
+            codexPendingSteerLifecycleReconciliation = nil
             var turnEpoch: AgentRunTurnEpoch?
             if var context = mcpControlContext {
                 turnEpoch = context.preparedEpoch ?? context.currentEpoch
