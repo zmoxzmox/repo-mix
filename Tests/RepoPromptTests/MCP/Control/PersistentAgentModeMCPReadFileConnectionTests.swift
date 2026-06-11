@@ -64,6 +64,36 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
         #endif
     }
+
+    func testReadAutoSelectionDeclinesWhenBoundTabClosesDuringPersistenceSuspension() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .tabCloseDuringPersistence)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testReadAutoSelectionResolvesWorkspaceAndTabAgainAfterWorkspaceReorder() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .workspaceReorderDuringPersistence)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testReadAutoSelectionDeclinesWhenConnectionRebindsDuringPersistenceSuspension() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .rebindDuringPersistence)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
 }
 
 #if DEBUG
@@ -75,6 +105,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case manageSelectionClear
             case endOfRun
             case searchWorkspaceContextDrain
+            case tabCloseDuringPersistence
+            case workspaceReorderDuringPersistence
+            case rebindDuringPersistence
         }
 
         func withFixture(_ operation: (Fixture) async throws -> Void) async throws {
@@ -225,6 +258,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertEndOfRunFinish(fixture: fixture)
             case .searchWorkspaceContextDrain:
                 try await assertSearchWorkspaceContextDrain(fixture: fixture)
+            case .tabCloseDuringPersistence:
+                try await assertTabCloseDuringAutoSelectionPersistence(fixture: fixture)
+            case .workspaceReorderDuringPersistence:
+                try await assertWorkspaceReorderDuringAutoSelectionPersistence(fixture: fixture)
+            case .rebindDuringPersistence:
+                try await assertRebindDuringAutoSelectionPersistence(fixture: fixture)
             }
         }
 
@@ -468,6 +507,145 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let contextResponse = try await contextTask.value
             try Self.assertSuccessfulResponse(contextResponse, id: 7)
             XCTAssertTrue(contextResponse.contains("PersistentAgentModeFixture.swift"), contextResponse)
+        }
+
+        func assertTabCloseDuringAutoSelectionPersistence(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 6)
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 7)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 7)
+
+            let manager = fixture.window.workspaceManager
+            let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            let originalWorkspace = manager.workspaces[workspaceIndex]
+            var workspaceWithoutTab = originalWorkspace
+            workspaceWithoutTab.composeTabs.removeAll { $0.id == Fixture.tabID }
+            if workspaceWithoutTab.activeComposeTabID == Fixture.tabID {
+                workspaceWithoutTab.activeComposeTabID = workspaceWithoutTab.composeTabs.first?.id
+            }
+            manager.workspaces[workspaceIndex] = workspaceWithoutTab
+
+            await gate.release()
+            let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
+            XCTAssertTrue(settled)
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            XCTAssertEqual(boundSelection?.selectedPaths, [])
+            XCTAssertEqual(boundSelection?.slices, [:])
+
+            manager.workspaces[workspaceIndex] = originalWorkspace
+        }
+
+        func assertWorkspaceReorderDuringAutoSelectionPersistence(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 6)
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 7)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 7)
+
+            let manager = fixture.window.workspaceManager
+            let originalIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            var decoy = WorkspaceModel(
+                name: "Read Auto-Selection Reorder Decoy",
+                repoPaths: []
+            )
+            decoy.composeTabs = []
+            let decoyID = decoy.id
+            manager.workspaces.insert(decoy, at: originalIndex)
+            defer { manager.workspaces.removeAll { $0.id == decoyID } }
+
+            await gate.release()
+            let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
+            XCTAssertTrue(settled)
+            let storedSelection = manager.workspaces
+                .first(where: { $0.id == fixture.workspaceID })?
+                .composeTabs.first(where: { $0.id == Fixture.tabID })?
+                .selection
+            XCTAssertEqual(storedSelection?.selectedPaths, [fixture.fileURL.path])
+            XCTAssertEqual(storedSelection?.slices, [:])
+        }
+
+        func assertRebindDuringAutoSelectionPersistence(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 6)
+            let manager = fixture.window.workspaceManager
+            let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            let replacementTabID = UUID()
+            manager.workspaces[workspaceIndex].composeTabs.append(
+                ComposeTabState(id: replacementTabID, name: "Replacement Auto-Selection Owner")
+            )
+
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 7)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 7)
+
+            try fixture.window.mcpServer.bindTabForConnection(
+                connectionID: Fixture.connectionID,
+                clientName: AgentProviderKind.codexMCPClientID,
+                tabID: replacementTabID,
+                workspaceID: fixture.workspaceID,
+                windowID: fixture.windowID,
+                runID: Fixture.runID,
+                explicitlyBound: false
+            )
+            await gate.release()
+            let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
+            XCTAssertTrue(settled)
+
+            let replacementBinding = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]
+            XCTAssertEqual(replacementBinding?.tabID, replacementTabID)
+            XCTAssertEqual(replacementBinding?.selection.selectedPaths, [])
+            XCTAssertEqual(replacementBinding?.selection.slices, [:])
+            let originalSelection = manager.composeTab(with: Fixture.tabID)?.selection
+            XCTAssertEqual(originalSelection?.selectedPaths, [])
+            XCTAssertEqual(originalSelection?.slices, [:])
+        }
+
+        func clearSelection(fixture: Fixture, id: Int) async throws {
+            let response = try await fixture.socketClient.request(
+                id: id,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "clear"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(response, id: id)
+        }
+
+        func waitForCanonicalWorkerToSettle(fixture: Fixture) async -> Bool {
+            let deadline = ContinuousClock.now + .seconds(2)
+            while ContinuousClock.now < deadline {
+                if fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot().canonicalWorkerCount == 0 {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot().canonicalWorkerCount == 0
         }
 
         func gatedReadTask(fixture: Fixture, id: Int) -> Task<String, Error> {

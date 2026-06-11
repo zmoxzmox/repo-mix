@@ -2651,7 +2651,28 @@
             XCTAssertFalse(operations.contains("changePublisher.send"))
             XCTAssertTrue(fsevents.contains("source: .watcherBarrierNoop"))
             XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: publishableWatcherWatermark"))
-            XCTAssertEqual(operations.components(separatedBy: "source: .syntheticMutation").count - 1, 5)
+            let mutationPublicationCount = operations.components(separatedBy: "publishFileSystemDeltas(").count - 1
+            let syntheticMutationSourceCount = operations.components(separatedBy: "source: .syntheticMutation").count - 1
+            XCTAssertGreaterThan(mutationPublicationCount, 0)
+            XCTAssertEqual(syntheticMutationSourceCount, mutationPublicationCount)
+        }
+
+        func testCancellationSafeReadAutoSelectionDrainResultsArePropagated() throws {
+            let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
+            let server = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            let tabContext = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
+            let contextBuilder = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPContextBuilderToolProvider.swift")
+            let promptContext = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift")
+
+            XCTAssertTrue(coordinator.contains("enum DrainResult: Equatable"))
+            XCTAssertTrue(coordinator.contains("async -> DrainResult"))
+            XCTAssertTrue(server.contains("executeAskOracle"))
+            XCTAssertTrue(server.contains("executeOracleSend"))
+            XCTAssertEqual(server.components(separatedBy: "guard await drainReadFileAutoSelection(").count - 1, 2)
+            XCTAssertTrue(contextBuilder.contains("drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else"))
+            XCTAssertEqual(promptContext.components(separatedBy: "drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else").count - 1, 2)
+            XCTAssertTrue(tabContext.contains("if finishResult == .cancelled"))
+            XCTAssertTrue(tabContext.contains("shouldCommit = false"))
         }
 
         @MainActor

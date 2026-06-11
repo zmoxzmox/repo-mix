@@ -1023,6 +1023,10 @@ actor ServerNetworkManager {
     private var connectionWindowMap: [UUID: Int] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
 
+    private struct MCPConnectionCallLimiterWatchdogDiagnostics {
+        let admittedCallCount: Int
+    }
+
     private actor MCPConnectionCallLimiters {
         struct AdmissionRejected: Error {}
 
@@ -1083,6 +1087,10 @@ actor ServerNetworkManager {
 
         func hasInFlightCalls() -> Bool {
             admittedCallCount > 0
+        }
+
+        func executionWatchdogDiagnostics() -> MCPConnectionCallLimiterWatchdogDiagnostics {
+            MCPConnectionCallLimiterWatchdogDiagnostics(admittedCallCount: admittedCallCount)
         }
 
         func admissionRetryReplacement() async -> MCPConnectionCallLimiters? {
@@ -5293,8 +5301,23 @@ actor ServerNetworkManager {
         #endif
     }
 
-    private func abortConnectionForExecutionWatchdog(_ id: UUID) async {
+    private func abortConnectionForExecutionWatchdog(
+        _ id: UUID,
+        toolName: String,
+        invocationID: UUID,
+        elapsedMilliseconds: Double,
+        handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
+        handlerPhaseAgeMilliseconds: Double?
+    ) async {
         guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
+        let activeToolExecutionScopeCount = activeToolScopeIDs(ownedBy: id).values.reduce(0) { $0 + $1.count }
+        let limiterDiagnostics = await callLimiters[id]?.executionWatchdogDiagnostics()
+        let phaseDescription = handlerPhase.map {
+            "\($0.phase.rawValue):\($0.transition.rawValue) entered_ms=\(String(format: "%.3f", $0.elapsedMilliseconds)) age_ms=\(String(format: "%.3f", handlerPhaseAgeMilliseconds ?? 0))"
+        } ?? "unreported"
+        log.error(
+            "MCP execution watchdog abort connection_id=\(id) tool=\(toolName) invocation_id=\(invocationID) elapsed_ms=\(String(format: "%.3f", elapsedMilliseconds)) handler_phase=\(phaseDescription) connection_in_flight_request_count=\(limiterDiagnostics?.admittedCallCount ?? 0) active_tool_execution_scope_count=\(activeToolExecutionScopeCount)"
+        )
         connectionLog("Execution watchdog marked connection terminal: \(id)")
         #if DEBUG
             debugRecordConnectionEvent(
@@ -10296,6 +10319,12 @@ actor ServerNetworkManager {
                                     for: toolName,
                                     arguments: capturedArguments
                                 )
+                                let executionWatchdogEnvironment = await self.toolExecutionWatchdogEnvironment
+                                let executionTraceOrigin = await executionWatchdogEnvironment.now()
+                                let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
+                                    origin: executionTraceOrigin,
+                                    now: { await executionWatchdogEnvironment.now() }
+                                )
 
                                 @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
                                     guard await self.isCurrentConnectionCallLimiterResolution(
@@ -10318,8 +10347,6 @@ actor ServerNetworkManager {
                                         throw MCPToolExecutionDispatchError.missingContract(toolName: toolName)
                                     }
 
-                                    let environment = await self.toolExecutionWatchdogEnvironment
-                                    let traceOrigin = await environment.now()
                                     @Sendable func emitExecutionTrace(
                                         _ phase: MCPToolExecutionTraceEvent.Phase,
                                         cancellationRequested: Bool? = nil,
@@ -10327,7 +10354,11 @@ actor ServerNetworkManager {
                                         graceOutcome: String? = nil,
                                         escalationReason: String? = nil
                                     ) async {
-                                        let now = await environment.now()
+                                        let now = await executionWatchdogEnvironment.now()
+                                        let handlerPhase = handlerPhaseRecorder.snapshot()
+                                        let handlerPhaseAgeMilliseconds = handlerPhase.map {
+                                            max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
+                                        }
                                         MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
                                             toolName: toolName,
                                             connectionID: connectionID,
@@ -10337,11 +10368,13 @@ actor ServerNetworkManager {
                                             executionDeadlineSeconds: contract.deadline?.mcpSeconds,
                                             cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
                                             phase: phase,
-                                            elapsedMilliseconds: max(0, now.mcpMilliseconds - traceOrigin.mcpMilliseconds),
+                                            elapsedMilliseconds: max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             cancellationRequested: cancellationRequested,
                                             cancellationOutcome: cancellationOutcome,
                                             graceOutcome: graceOutcome,
-                                            escalationReason: escalationReason
+                                            escalationReason: escalationReason,
+                                            handlerPhase: handlerPhase,
+                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds
                                         ))
                                     }
 
@@ -10371,11 +10404,13 @@ actor ServerNetworkManager {
                                                     throw ToolDispatchAdmissionError.windowTerminal
                                                 }
                                             }
-                                            let value = try await EditFlowPerf.measure(
-                                                EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                EditFlowPerf.Dimensions(toolName: toolName),
-                                                operation: operation
-                                            )
+                                            let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
+                                                try await EditFlowPerf.measure(
+                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                    EditFlowPerf.Dimensions(toolName: toolName),
+                                                    operation: operation
+                                                )
+                                            }
                                             await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
                                             EditFlowPerf.lifecycleEvent(
                                                 EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
@@ -10401,7 +10436,7 @@ actor ServerNetworkManager {
                                             return try await MCPToolExecutionWatchdog.execute(
                                                 deadline: deadline,
                                                 cancellationGrace: cancellationGrace,
-                                                environment: environment,
+                                                environment: executionWatchdogEnvironment,
                                                 onEvent: { event in
                                                     switch event {
                                                     case .deadlineExpired:
@@ -10543,7 +10578,19 @@ actor ServerNetworkManager {
                                         message: message
                                     )
                                     if shouldForceDisconnect {
-                                        await self.abortConnectionForExecutionWatchdog(connectionID)
+                                        let abortNow = await executionWatchdogEnvironment.now()
+                                        let handlerPhase = handlerPhaseRecorder.snapshot()
+                                        let handlerPhaseAgeMilliseconds = handlerPhase.map {
+                                            max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
+                                        }
+                                        await self.abortConnectionForExecutionWatchdog(
+                                            connectionID,
+                                            toolName: toolName,
+                                            invocationID: invocationID,
+                                            elapsedMilliseconds: max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
+                                            handlerPhase: handlerPhase,
+                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds
+                                        )
                                         // The transport is already severed. Deliberately skip handlerResult so
                                         // execution-completion tracing cannot be mistaken for response delivery.
                                         return result

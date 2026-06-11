@@ -11,6 +11,9 @@ public enum MCPTimeoutPolicy {
         workspaceSwitchToolExecutionDeadlineSeconds
     )
 
+    /// Allows the 120-second workspace-switch window, 5-second cleanup grace, and 25 seconds of transport margin.
+    public static let postStdinHalfCloseBridgeDrainDeadlineSeconds = 150
+
     public static let boundedToolCancellationCleanupGraceSeconds = 5
     public static let boundedToolCancellationCleanupGrace: Duration = .seconds(boundedToolCancellationCleanupGraceSeconds)
 

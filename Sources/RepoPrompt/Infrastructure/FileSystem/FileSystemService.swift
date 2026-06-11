@@ -14,6 +14,18 @@ import UniversalCharsetDetection
     import Glibc
 #endif
 
+enum FileSystemUncancellableMutation: Equatable {
+    case create
+    case edit
+    case move
+    case delete
+    case trash
+}
+
+struct FileSystemMutationWaiter {
+    let continuation: CheckedContinuation<Void, any Error>
+}
+
 actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
     // These are not public API; preserve actor isolation when accessing them.
@@ -115,7 +127,13 @@ actor FileSystemService {
 
         /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
         var contentReadChunkHandler: (@Sendable (String) async -> Void)?
+
+        /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
+        var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
     #endif
+
+    /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
+    var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
 
     /// Tracks paths we know about, to detect additions/removals
     var visitedPaths = Set<String>()
@@ -274,6 +292,16 @@ actor FileSystemService {
     }
 
     #if DEBUG
+        func setMutationIOWillBeginHandlerForTesting(
+            _ handler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+        ) {
+            mutationIOWillBeginHandler = handler
+        }
+
+        func pendingMutationWaiterCountForTesting() -> Int {
+            mutationWaiters.count
+        }
+
         /// Test-only initializer that allows injecting initial state
         init(
             path: String,

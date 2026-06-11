@@ -246,6 +246,263 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.stopWatchingRoot(id: rootID)
         }
 
+        func testCancelledCreateSettlesBeforeUncancellableIOAndReconcilesCatalogAfterCompletion() async throws {
+            let root = try makeTemporaryRoot(name: "CancelledCreateReconciliation")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            let mutationGate = AsyncGate()
+            await service.setMutationIOWillBeginHandlerForTesting { operation in
+                guard operation == .create else { return }
+                await mutationGate.markStartedAndWaitForRelease()
+            }
+
+            let createTask = Task {
+                try await store.createFile(
+                    rootID: record.id,
+                    relativePath: "CreatedAfterCancellation.swift",
+                    content: "struct CreatedAfterCancellation {}"
+                )
+            }
+            await mutationGate.waitUntilStarted()
+            let settledSignal = AsyncSignal()
+            let resultTask = Task {
+                do {
+                    _ = try await createTask.value
+                    await settledSignal.mark()
+                    return false
+                } catch is CancellationError {
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+
+            createTask.cancel()
+
+            let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(settledBeforeRelease)
+            let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
+            XCTAssertEqual(waiterCountAfterCancellation, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("CreatedAfterCancellation.swift").path))
+
+            await mutationGate.release()
+            let observedCancellation = await resultTask.value
+            XCTAssertTrue(observedCancellation)
+            let reconciled = await waitForAsyncCondition(maxYields: 10000) {
+                guard FileManager.default.fileExists(atPath: root.appendingPathComponent("CreatedAfterCancellation.swift").path) else {
+                    return false
+                }
+                return await store.file(
+                    rootID: record.id,
+                    relativePath: "CreatedAfterCancellation.swift"
+                ) != nil
+            }
+            XCTAssertTrue(reconciled)
+            let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
+            XCTAssertEqual(finalWaiterCount, 0)
+
+            await service.setMutationIOWillBeginHandlerForTesting(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testCancelledOverwriteSettlesBeforeUncancellableIOAndReconcilesCatalogAfterCompletion() async throws {
+            let root = try makeTemporaryRoot(name: "CancelledOverwriteReconciliation")
+            let fileURL = root.appendingPathComponent("OverwriteAfterCancellation.swift")
+            try write("old", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            let mutationGate = AsyncGate()
+            await service.setMutationIOWillBeginHandlerForTesting { operation in
+                guard operation == .edit else { return }
+                await mutationGate.markStartedAndWaitForRelease()
+            }
+            let host = WorkspaceFileEditHost(
+                store: store,
+                lookupRootScope: .visibleWorkspace,
+                createPathResolutionPolicy: .literalPreferredIfStronger,
+                selectCreatedFiles: false
+            )
+
+            let overwriteTask = Task {
+                try await host.writeText(
+                    path: fileURL.path,
+                    content: "new",
+                    overwrite: true
+                )
+            }
+            await mutationGate.waitUntilStarted()
+            let settledSignal = AsyncSignal()
+            let resultTask = Task {
+                do {
+                    try await overwriteTask.value
+                    await settledSignal.mark()
+                    return false
+                } catch is CancellationError {
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+
+            overwriteTask.cancel()
+            let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(settledBeforeRelease)
+            XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "old")
+            let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
+            XCTAssertEqual(waiterCountAfterCancellation, 0)
+
+            await mutationGate.release()
+            let observedCancellation = await resultTask.value
+            XCTAssertTrue(observedCancellation)
+            let reconciled = await waitForAsyncCondition(maxYields: 10000) {
+                guard (try? String(contentsOf: fileURL, encoding: .utf8)) == "new" else { return false }
+                return await (try? store.readContent(
+                    rootID: record.id,
+                    relativePath: "OverwriteAfterCancellation.swift"
+                )) == "new"
+            }
+            XCTAssertTrue(reconciled)
+            let catalogFile = await store.file(rootID: record.id, relativePath: "OverwriteAfterCancellation.swift")
+            XCTAssertNotNil(catalogFile)
+            let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
+            XCTAssertEqual(finalWaiterCount, 0)
+
+            await service.setMutationIOWillBeginHandlerForTesting(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testCancelledMoveDeleteAndTrashSettleBeforeIOAndReconcileAfterCompletion() async throws {
+            let root = try makeTemporaryRoot(name: "CancelledMutationReconciliation")
+            try write("move", to: root.appendingPathComponent("MoveSource.swift"))
+            try write("delete", to: root.appendingPathComponent("Delete.swift"))
+            try write("trash", to: root.appendingPathComponent("Trash.swift"))
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+
+            func exercise(
+                operation: FileSystemUncancellableMutation,
+                mutation: @escaping () async throws -> Void,
+                beforeRelease: () -> Bool,
+                reconciled: @escaping () async -> Bool
+            ) async throws {
+                let gate = AsyncGate()
+                await service.setMutationIOWillBeginHandlerForTesting { observed in
+                    guard observed == operation else { return }
+                    await gate.markStartedAndWaitForRelease()
+                }
+                let mutationTask = Task {
+                    try await mutation()
+                }
+                await gate.waitUntilStarted()
+                let settledSignal = AsyncSignal()
+                let resultTask = Task {
+                    do {
+                        try await mutationTask.value
+                        await settledSignal.mark()
+                        return false
+                    } catch is CancellationError {
+                        await settledSignal.mark()
+                        return true
+                    } catch {
+                        await settledSignal.mark()
+                        return false
+                    }
+                }
+
+                mutationTask.cancel()
+                let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+                    await settledSignal.isMarked()
+                }
+                XCTAssertTrue(settledBeforeRelease)
+                XCTAssertTrue(beforeRelease())
+                let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
+                XCTAssertEqual(waiterCountAfterCancellation, 0)
+
+                await gate.release()
+                let observedCancellation = await resultTask.value
+                XCTAssertTrue(observedCancellation)
+                let didReconcile = await waitForAsyncCondition(maxYields: 10000, reconciled)
+                XCTAssertTrue(didReconcile)
+                let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
+                XCTAssertEqual(finalWaiterCount, 0)
+            }
+
+            try await exercise(
+                operation: .move,
+                mutation: {
+                    try await store.moveFile(
+                        rootID: record.id,
+                        from: "MoveSource.swift",
+                        to: "MoveDestination.swift"
+                    )
+                },
+                beforeRelease: {
+                    FileManager.default.fileExists(atPath: root.appendingPathComponent("MoveSource.swift").path)
+                        && !FileManager.default.fileExists(atPath: root.appendingPathComponent("MoveDestination.swift").path)
+                },
+                reconciled: {
+                    guard !FileManager.default.fileExists(atPath: root.appendingPathComponent("MoveSource.swift").path),
+                          FileManager.default.fileExists(atPath: root.appendingPathComponent("MoveDestination.swift").path)
+                    else { return false }
+                    let source = await store.file(rootID: record.id, relativePath: "MoveSource.swift")
+                    let destination = await store.file(rootID: record.id, relativePath: "MoveDestination.swift")
+                    return source == nil && destination != nil
+                }
+            )
+
+            try await exercise(
+                operation: .delete,
+                mutation: {
+                    try await store.deleteFile(rootID: record.id, relativePath: "Delete.swift")
+                },
+                beforeRelease: {
+                    FileManager.default.fileExists(atPath: root.appendingPathComponent("Delete.swift").path)
+                },
+                reconciled: {
+                    guard !FileManager.default.fileExists(atPath: root.appendingPathComponent("Delete.swift").path) else {
+                        return false
+                    }
+                    return await store.file(rootID: record.id, relativePath: "Delete.swift") == nil
+                }
+            )
+
+            try await exercise(
+                operation: .trash,
+                mutation: {
+                    try await store.moveItemToTrash(rootID: record.id, relativePath: "Trash.swift")
+                },
+                beforeRelease: {
+                    FileManager.default.fileExists(atPath: root.appendingPathComponent("Trash.swift").path)
+                },
+                reconciled: {
+                    guard !FileManager.default.fileExists(atPath: root.appendingPathComponent("Trash.swift").path) else {
+                        return false
+                    }
+                    return await store.file(rootID: record.id, relativePath: "Trash.swift") == nil
+                }
+            )
+
+            await service.setMutationIOWillBeginHandlerForTesting(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
         func testStopWatchingRootDrainsTrackedPublisherIngress() async throws {
             let root = try makeTemporaryRoot(name: "StopWatcherPublisherIngress")
             let lateFileURL = root.appendingPathComponent("Late.swift")

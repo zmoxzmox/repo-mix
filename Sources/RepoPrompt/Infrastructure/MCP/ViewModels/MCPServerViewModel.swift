@@ -545,13 +545,19 @@ final class MCPServerViewModel: ObservableObject {
         executeAskOracle: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
             let metadata = await captureRequestMetadata()
-            await drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics)
+            guard await drainReadFileAutoSelection(
+                metadata: metadata,
+                requirement: .mirroredSelectionAndMetrics
+            ) == .completed else { throw CancellationError() }
             return try await oracleToolService.executeAskOracle(args: args)
         },
         executeOracleSend: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
             let metadata = await captureRequestMetadata()
-            await drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics)
+            guard await drainReadFileAutoSelection(
+                metadata: metadata,
+                requirement: .mirroredSelectionAndMetrics
+            ) == .completed else { throw CancellationError() }
             return try await oracleToolService.executeOracleSend(args: args)
         },
         executeOracleChatLog: { [weak self] args in
@@ -643,14 +649,16 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, mode, prompt, selection in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, mode, prompt, selection, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             return try await contextBuilderVM.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: oracleVM,
                 mode: mode,
                 prompt: prompt,
-                selection: selection
+                selection: selection,
+                progressReporter: progressReporter,
+                activityReporter: activityReporter
             )
         },
         windowID: windowID,
@@ -805,8 +813,8 @@ final class MCPServerViewModel: ObservableObject {
             await enqueueReadFileAutoSelection(reply: reply, requestedPath: requestedPath, metadata: metadata)
         },
         drainReadFileAutoSelection: { [weak self] metadata, requirement in
-            guard let self else { return }
-            await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
+            guard let self else { return .cancelled }
+            return await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
         },
         enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, metadata in
             guard let self else { return }
@@ -910,6 +918,10 @@ final class MCPServerViewModel: ObservableObject {
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor
     var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
+    #if DEBUG
+        @MainActor
+        var readFileAutoSelectionPersistenceWillResolveHandlerForTesting: (() async -> Void)?
+    #endif
     @MainActor
     var pendingRunScopedTabContexts = PendingRunScopedContextStore()
     @MainActor
@@ -2768,8 +2780,21 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+        private var stageProgressSinkForTesting: MCPWindowToolDependencies.SendStageProgress?
+
+        func installStageProgressSinkForTesting(
+            _ sink: MCPWindowToolDependencies.SendStageProgress?
+        ) {
+            stageProgressSinkForTesting = sink
+        }
+    #endif
+
     /// Sends a stage progress notification for the current connection.
     private func sendStageProgress(connectionID: UUID?, tool: String, stage: String, message: String) async {
+        #if DEBUG
+            await stageProgressSinkForTesting?(connectionID, tool, stage, message)
+        #endif
         guard let connectionID else { return }
         await ServerNetworkManager.shared.sendProgress(
             for: connectionID,
@@ -2994,20 +3019,25 @@ final class MCPServerViewModel: ObservableObject {
     func drainReadFileAutoSelection(
         metadata: RequestMetadata,
         requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement
-    ) async {
+    ) async -> MCPReadFileAutoSelectionCoordinator.DrainResult {
         guard let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "drainReadFileAutoSelection",
             policy: .allowLegacyImplicitRouting
-        ) else { return }
+        ) else { return Task.isCancelled ? .cancelled : .completed }
         let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
-        await readFileAutoSelectionCoordinator.drain(requirement, for: key)
+        return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
     }
 
     #if DEBUG
         @MainActor
         func setReadFileAutoSelectionCanonicalApplyGateForTesting(_ gate: (() async -> Void)?) {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
+        }
+
+        @MainActor
+        func setReadFileAutoSelectionPersistenceGateForTesting(_ gate: (() async -> Void)?) {
+            readFileAutoSelectionPersistenceWillResolveHandlerForTesting = gate
         }
 
         @MainActor
@@ -3813,8 +3843,11 @@ final class MCPServerViewModel: ObservableObject {
         newPath: String? = nil,
         ifExists: String? = nil
     ) async throws -> String? {
+        try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks)
         // Enforce workspace presence in multi-window mode
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
+        try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
         var resolvedContext = try resolveTabContextSnapshot(
             from: metadata,
@@ -3822,10 +3855,14 @@ final class MCPServerViewModel: ObservableObject {
             policy: .allowLegacyImplicitRouting
         )
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        try Task.checkCancellation()
         let effectivePath = lookupContext.translateInputPath(path)
         let effectiveNewPath = newPath.map { lookupContext.translateInputPath($0) }
         let shouldSelectCreatedFileInActiveUI = resolvedContext.usesActiveTabCompatibility
         let store = promptVM.workspaceFileContextStore
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
+        try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
         _ = await store.awaitAppliedIngressForExplicitRequest(
             userPath: effectivePath,
             fallbackScope: lookupContext.rootScope
@@ -3836,8 +3873,11 @@ final class MCPServerViewModel: ObservableObject {
                 fallbackScope: lookupContext.rootScope
             )
         }
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility, transition: .completed)
+        try Task.checkCancellation()
 
         do {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO)
             switch action.lowercased() {
             case "create":
                 guard let content else {
@@ -3869,17 +3909,27 @@ final class MCPServerViewModel: ObservableObject {
             default:
                 throw MCPError.invalidParams("invalid action: \(action). Must be 'create', 'delete', or 'move'")
             }
+            try Task.checkCancellation()
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
+        } catch is CancellationError {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
+            throw CancellationError()
         } catch let fmErr as FileManagerError {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
             // Convert internal file-manager errors to friendly, contextual MCP errors
             throw await mapFileManagerErrorToMCP(fmErr, action: action, path: path)
         } catch let mcpErr as MCPError {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
             throw mcpErr
         } catch {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
             // Generic fallback
             throw MCPError.invalidParams("File action '\(action)' failed: \(error.localizedDescription)")
         }
 
         // Ensure resulting synthetic publications are canonical before returning.
+        try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
         _ = await store.awaitAppliedIngressForExplicitRequest(
             userPath: effectivePath,
             fallbackScope: lookupContext.rootScope
@@ -3890,7 +3940,10 @@ final class MCPServerViewModel: ObservableObject {
                 fallbackScope: lookupContext.rootScope
             )
         }
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
+        try Task.checkCancellation()
         if action.lowercased() == "create", !resolvedContext.usesActiveTabCompatibility {
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
             let addResult = await addStoredSelectionPaths(
                 existing: resolvedContext.snapshot.selection,
                 paths: [effectivePath],
@@ -3898,9 +3951,14 @@ final class MCPServerViewModel: ObservableObject {
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            guard addResult.selection != resolvedContext.snapshot.selection else { return nil }
+            try Task.checkCancellation()
+            guard addResult.selection != resolvedContext.snapshot.selection else {
+                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
+                return nil
+            }
             resolvedContext.snapshot.selection = addResult.selection
             let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            try Task.checkCancellation()
             do {
                 _ = try MCPSelectionToolProvider.requireCanonicalSelection(
                     verification,
@@ -3909,9 +3967,14 @@ final class MCPServerViewModel: ObservableObject {
                     operation: "file_actions create selection update",
                     recovery: "Retry manage_selection for the same context_id."
                 )
+            } catch is CancellationError {
+                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
+                throw CancellationError()
             } catch {
+                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
                 return "The file was created, but its selection was not confirmed. \(error)"
             }
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
         return nil
     }
@@ -3935,6 +3998,8 @@ final class MCPServerViewModel: ObservableObject {
                 selectCreatedFiles: addToSelection
             )
             try await host.writeText(path: path, content: content, overwrite: overwrite)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let fmErr as FileManagerError {
             throw await mapFileManagerErrorToMCP(fmErr, action: "create", path: path)
         } catch let mcpErr as MCPError {

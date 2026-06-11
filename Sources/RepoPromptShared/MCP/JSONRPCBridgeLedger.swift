@@ -159,13 +159,12 @@ public enum MCPResponseDeliveryTracer {
     ) {
         guard event.terminalReason != nil || successTracingEnabled else { return }
         guard let data = "[MCPResponseDelivery] \(event)\n".data(using: .utf8) else { return }
-        lock.lock()
+        // Terminal tracing must not wait behind another diagnostic emitter or
+        // a full stderr pipe. Dropping a contended/unwritable trace is safer
+        // than delaying the transport's required terminal exit.
+        guard lock.try() else { return }
         defer { lock.unlock() }
-        // Terminal events are emitted even with success tracing disabled, so
-        // this path runs during transport failure handling when stderr may
-        // already be closed. Best-effort raw write; never FileHandle.write,
-        // whose ObjC exception on a broken pipe would abort the process.
-        BestEffortStderrWriter.write(data, to: descriptor)
+        BestEffortStderrWriter.writeNonBlocking(data, to: descriptor)
     }
 
     public static func sha256Hex(_ data: Data) -> String {
@@ -302,6 +301,23 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
             && pendingTransactionCount == 0
             && terminalReason == nil
     }
+
+    public func canFinishSocketDrain(partialByteCount: Int) -> Bool {
+        terminalReason == nil
+            && activeRequestCount == 0
+            && pendingTransactionCount == 0
+            && partialByteCount == 0
+    }
+
+    public func socketDrainBlockerDescription(partialByteCount: Int) -> String {
+        [
+            "active_requests=\(activeRequestCount)",
+            "pending_transactions=\(pendingTransactionCount)",
+            "partial_bytes=\(max(0, partialByteCount))",
+            "response_in_delivery=\(responseInDeliveryCount)",
+            "terminal_reason=\(terminalReason ?? "none")"
+        ].joined(separator: " ")
+    }
 }
 
 public enum JSONRPCBridgeLedgerError: Swift.Error, Equatable, CustomStringConvertible {
@@ -331,6 +347,8 @@ public enum JSONRPCBridgeLedgerError: Swift.Error, Equatable, CustomStringConver
 }
 
 public actor JSONRPCBridgeLedger {
+    public static let postStdinHalfCloseDrainDeadlineExceededReason = "post_stdin_half_close_drain_deadline_exceeded"
+
     public struct Configuration: Equatable, Sendable {
         public var cancellationTombstoneTTL: TimeInterval
         public var maximumCancellationTombstones: Int
@@ -845,6 +863,24 @@ public actor JSONRPCBridgeLedger {
         }
         emit(phase: "clean_eof", direction: direction, messages: [], prepared: nil, terminalReason: nil)
         return .clean
+    }
+
+    @discardableResult
+    public func terminalizePostStdinHalfCloseDrainDeadline() -> String {
+        if let terminalReason {
+            return terminalReason
+        }
+
+        let reason = Self.postStdinHalfCloseDrainDeadlineExceededReason
+        _ = failTerminal(reason)
+        emit(
+            phase: "post_stdin_half_close_drain_deadline_exceeded",
+            direction: .serverToClient,
+            messages: [],
+            prepared: nil,
+            terminalReason: reason
+        )
+        return reason
     }
 
     public func recordConnectionFailure(_ reason: String) -> Bool {

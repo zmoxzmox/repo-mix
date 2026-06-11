@@ -170,7 +170,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.captureRequestMetadata()
-        await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
+        guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
+            throw CancellationError()
+        }
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {
@@ -271,6 +273,22 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 return promptManager.planningModel.displayName
             } : nil
 
+            let sendStageProgress = dependencies.sendStageProgress
+            let progressTimeline = ContextBuilderMCPProgressTimeline { event in
+                await sendStageProgress(
+                    connectionID,
+                    MCPWindowToolName.contextBuilder,
+                    event.stage,
+                    event.message
+                )
+            }
+            let progressReporter: ContextBuilderMCPProgressReporter = { phase in
+                await progressTimeline.transition(to: phase)
+            }
+            let activityReporter: ContextBuilderMCPActivityReporter = { phase, message in
+                await progressTimeline.reportActivity(phase: phase, message: message)
+            }
+
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
                 await dependencies.sendStageProgress(
                     connectionID,
@@ -285,24 +303,28 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "discovering",
                     "Running Context Builder agent..."
                 )
-                let snapshot = try await withHeartbeat(
-                    connectionID: connectionID,
-                    tool: MCPWindowToolName.contextBuilder,
-                    stage: "discovering",
-                    message: "Still building context..."
-                ) {
-                    try await contextBuilderVM.runContextBuilderForMCP(
-                        tabID: finalTabID,
-                        instructionsOverride: instructions.isEmpty ? nil : instructions,
-                        tokenBudgetOverride: tokenBudgetOverride,
-                        persistTokenBudget: false,
-                        enhancementModeOverride: .fullRewrite,
-                        agentOverride: preferredAgent,
-                        modelOverrideRaw: preferredModelRaw,
-                        responseType: responseType?.rawValue,
-                        planModelName: planModelName,
-                        mcpControlToken: mcpControlToken
-                    )
+                let snapshot = try await withTimelinePhaseCompletion(progressTimeline) {
+                    try await withHeartbeat(
+                        connectionID: connectionID,
+                        tool: MCPWindowToolName.contextBuilder,
+                        stage: "discovering",
+                        message: "Still building context...",
+                        timeline: progressTimeline
+                    ) {
+                        try await contextBuilderVM.runContextBuilderForMCP(
+                            tabID: finalTabID,
+                            instructionsOverride: instructions.isEmpty ? nil : instructions,
+                            tokenBudgetOverride: tokenBudgetOverride,
+                            persistTokenBudget: false,
+                            enhancementModeOverride: .fullRewrite,
+                            agentOverride: preferredAgent,
+                            modelOverrideRaw: preferredModelRaw,
+                            responseType: responseType?.rawValue,
+                            planModelName: planModelName,
+                            mcpControlToken: mcpControlToken,
+                            progressReporter: progressReporter
+                        )
+                    }
                 }
 
                 await dependencies.sendStageProgress(
@@ -362,19 +384,24 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         "Generating \(modeLabel)..."
                     )
 
-                    let reply = try await withHeartbeat(
-                        connectionID: connectionID,
-                        tool: MCPWindowToolName.contextBuilder,
-                        stage: "generating",
-                        message: "Still generating \(modeLabel)..."
-                    ) {
-                        try await dependencies.runMCPPlanOrQuestion(
-                            contextBuilderVM,
-                            resultTab.id,
-                            mode,
-                            effectivePrompt,
-                            sel
-                        )
+                    let reply = try await withTimelinePhaseCompletion(progressTimeline) {
+                        try await withHeartbeat(
+                            connectionID: connectionID,
+                            tool: MCPWindowToolName.contextBuilder,
+                            stage: "generating",
+                            message: "Still generating \(modeLabel)...",
+                            timeline: progressTimeline
+                        ) {
+                            try await dependencies.runMCPPlanOrQuestion(
+                                contextBuilderVM,
+                                resultTab.id,
+                                mode,
+                                effectivePrompt,
+                                sel,
+                                progressReporter,
+                                activityReporter
+                            )
+                        }
                     }
 
                     if mode == .review {
@@ -476,6 +503,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         tool: String,
         stage: String,
         message: String,
+        timeline: ContextBuilderMCPProgressTimeline? = nil,
         interval: Duration = .seconds(30),
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -492,12 +520,20 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 while !Task.isCancelled {
                     try await Task.sleep(for: interval)
                     try Task.checkCancellation()
+                    let heartbeat: (stage: String, message: String) = if let timeline {
+                        await timeline.heartbeat(
+                            fallbackStage: stage,
+                            fallbackMessage: message
+                        )
+                    } else {
+                        (stage, message)
+                    }
                     await ServerNetworkManager.shared.sendProgress(
                         for: connectionID,
                         tool: tool,
                         kind: .heartbeat,
-                        stage: stage,
-                        message: message
+                        stage: heartbeat.stage,
+                        message: heartbeat.message
                     )
                 }
             } catch {
@@ -506,5 +542,21 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
         defer { heartbeatTask.cancel() }
         return try await operation()
+    }
+
+    private static func withTimelinePhaseCompletion<T: Sendable>(
+        _ timeline: ContextBuilderMCPProgressTimeline,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        do {
+            let result = try await operation()
+            await timeline.finishCurrentPhase()
+            await timeline.flush()
+            return result
+        } catch {
+            await timeline.finishCurrentPhase()
+            await timeline.flush()
+            throw error
+        }
     }
 }
