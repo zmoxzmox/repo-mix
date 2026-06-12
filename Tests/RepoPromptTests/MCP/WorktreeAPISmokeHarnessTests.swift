@@ -113,6 +113,75 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testBoundChildManageSelectionPersistsWorktreeOnlyFile() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/selection-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+        let worktreeOnlyFile = URL(fileURLWithPath: worktreePath)
+            .appendingPathComponent("WorktreeOnly.swift")
+        try "struct WorktreeOnly {}\n".write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
+
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sessionID = UUID()
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "worktree_id": .string(worktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "bound-selection-regression",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        let setValue = try await ServerNetworkManager.withConnectionID(connectionID) {
+            try await manageSelection([
+                "op": .string("set"),
+                "paths": .array([.string("WorktreeOnly.swift")]),
+                "mode": .string("full"),
+                "view": .string("files"),
+                "path_display": .string("full"),
+                "strict": .bool(true)
+            ])
+        }
+
+        let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
+        XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
+
+        let getValue = try await ServerNetworkManager.withConnectionID(connectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
+    }
+
     func testManageWorktreeMergePreviewCleanApplyRawAndFormattedContract() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
@@ -443,6 +512,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
         let first = try XCTUnwrap(bindings.first)
         return try XCTUnwrap(first.objectValue)
+    }
+
+    private static func selectionPaths(_ value: Value) throws -> [String] {
+        let object = try XCTUnwrap(value.objectValue)
+        let files = try XCTUnwrap(object["files"]?.arrayValue)
+        return try files.map { file in
+            try XCTUnwrap(file.objectValue?["path"]?.stringValue)
+        }
     }
 
     private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {

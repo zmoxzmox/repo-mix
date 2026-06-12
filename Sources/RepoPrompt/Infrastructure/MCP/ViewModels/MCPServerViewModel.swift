@@ -634,11 +634,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return }
             await sendStageProgress(connectionID: connectionID, tool: tool, stage: stage, message: message)
         },
-        makeOracleExportDestination: { workspace, windowID, tabID in
+        makeOracleExportDestination: { workspace, windowID, tabID, lookupContext in
             try MCPServerViewModel.makeOracleExportDestination(
                 workspace: workspace,
                 windowID: windowID,
-                tabID: tabID
+                tabID: tabID,
+                lookupContext: lookupContext
             )
         },
         resolveDefaultOracleExportPath: { [weak self] mode, chatID, destination in
@@ -3958,7 +3959,8 @@ final class MCPServerViewModel: ObservableObject {
     static func makeOracleExportDestination(
         workspace: WorkspaceModel?,
         windowID: Int,
-        tabID: UUID?
+        tabID: UUID?,
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) throws -> OracleExportDestination {
         guard let workspace else {
             throw MCPError.invalidParams("Cannot create generated Oracle export: no active workspace is available.")
@@ -3974,12 +3976,17 @@ final class MCPServerViewModel: ObservableObject {
         }
         let standardizedRoot = (expandedRoot as NSString).standardizingPath
         try validateOracleExportPrimaryRoot(standardizedRoot)
+        // Generated handoff files must live in the same effective root that read_file uses
+        // for this context; otherwise the returned logical path is remapped to a missing file.
+        let effectiveRoot = StandardizedPath.absolute(lookupContext.translateInputPath(standardizedRoot))
+        try validateOracleExportPrimaryRoot(effectiveRoot)
 
         return OracleExportDestination(
             workspaceID: workspace.id,
             windowID: windowID,
             tabID: tabID,
-            primaryRootPath: standardizedRoot
+            primaryRootPath: effectiveRoot,
+            rootScope: lookupContext.rootScope
         )
     }
 

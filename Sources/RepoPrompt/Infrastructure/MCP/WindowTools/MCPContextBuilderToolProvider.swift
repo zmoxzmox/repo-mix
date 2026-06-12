@@ -200,15 +200,6 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             connectionID
         )
         let finalTabID = tabResolution.tabID
-        let capturedOracleExportDestination: OracleExportDestination? = if exportResponse {
-            try dependencies.makeOracleExportDestination(
-                workspace,
-                targetWindow.windowID,
-                finalTabID
-            )
-        } else {
-            nil
-        }
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -219,6 +210,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 tabResolution.workspaceID ?? workspace.id,
                 targetWindow.windowID
             )
+        }
+
+        let capturedOracleExportDestination: OracleExportDestination? = if exportResponse {
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            try dependencies.makeOracleExportDestination(
+                workspace,
+                targetWindow.windowID,
+                finalTabID,
+                lookupContext
+            )
+        } else {
+            nil
         }
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel

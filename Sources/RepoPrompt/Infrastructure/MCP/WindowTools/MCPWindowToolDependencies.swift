@@ -60,7 +60,8 @@ struct MCPWindowToolDependencies {
     typealias MakeOracleExportDestination = @MainActor @Sendable (
         _ workspace: WorkspaceModel?,
         _ windowID: Int,
-        _ tabID: UUID?
+        _ tabID: UUID?,
+        _ lookupContext: WorkspaceLookupContext
     ) throws -> OracleExportDestination
     typealias ResolveDefaultOracleExportPath = @MainActor @Sendable (
         _ mode: String,

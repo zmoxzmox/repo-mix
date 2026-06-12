@@ -1380,10 +1380,13 @@ extension MCPServerViewModel {
     ) async -> MCPSelectionPersistenceVerification? {
         guard mutated else { return nil }
         let context = await persistenceSafeTabContext(resolved.snapshot)
+        // The visible file-tree UI is backed by logical workspace roots. Mirroring a
+        // worktree-only selection through it would drop paths that exist only in the bound root.
         var verification = await Self.persistMCPSelectionAndVerifyThroughCoordinator(
             context.selection,
             for: context.tabID,
-            selectionCoordinator: selectionCoordinator
+            selectionCoordinator: selectionCoordinator,
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty
         )
         if verification.outcome == .unavailable {
             await commitTabContext(selectionOnlyCommitContext(from: context))
