@@ -28,6 +28,17 @@ public enum MCPTimeoutPolicy {
 
     public static let codexServerActiveTimeoutSeconds = 10000
 
+    /// Default CLI-side deadline for ordinary tool responses.
+    public static let cliDefaultToolCallTimeoutSeconds: TimeInterval = 300
+    /// Long-running tools whose provider/run cancellation contract is authoritative.
+    public static let cliDefaultUnboundedToolNames: Set<String> = [
+        "ask_oracle",
+        "context_builder"
+    ]
+    /// Extra time after a caller-requested server-side wait for response encoding
+    /// and transport delivery before the CLI cancels the request.
+    public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
+
     public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
