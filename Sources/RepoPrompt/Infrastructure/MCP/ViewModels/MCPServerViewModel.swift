@@ -608,7 +608,8 @@ final class MCPServerViewModel: ObservableObject {
             return MCPWindowToolDependencies.ContextBuilderTabResolution(
                 tabID: resolution.tabID,
                 workspaceID: resolution.workspaceID,
-                bindCaller: resolution.bindCaller
+                bindCaller: resolution.bindCaller,
+                lookupContext: resolution.lookupContext
             )
         },
         bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
@@ -2674,7 +2675,7 @@ final class MCPServerViewModel: ObservableObject {
         args: [String: Value],
         targetWindow: WindowState,
         connectionID: UUID?
-    ) async throws -> (tabID: UUID, workspaceID: UUID?, bindCaller: Bool) {
+    ) async throws -> (tabID: UUID, workspaceID: UUID?, bindCaller: Bool, lookupContext: WorkspaceLookupContext) {
         let purpose: MCPRunPurpose = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
         } else {
@@ -2718,7 +2719,11 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.invalidParams("Tab context '\(context.tabID.uuidString)' is not available in window \(targetWindow.windowID).")
             }
             let shouldBindCaller = source == .explicitHint && purpose != .agentModeRun && connectionID != nil
-            return (context.tabID, context.workspaceID, shouldBindCaller)
+            let lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                tabID: context.tabID,
+                workspaceID: context.workspaceID
+            )
+            return (context.tabID, context.workspaceID, shouldBindCaller, lookupContext)
         } catch {
             if explicitHint != nil || existingBinding != nil {
                 throw error
@@ -2738,7 +2743,7 @@ final class MCPServerViewModel: ObservableObject {
         ) else {
             throw MCPError.internalError("Failed to create compose tab.")
         }
-        return (createdTab.id, targetWindow.workspaceManager.activeWorkspace?.id, true)
+        return (createdTab.id, targetWindow.workspaceManager.activeWorkspace?.id, true, .visibleWorkspace)
     }
 
     /// Runs an async operation with periodic heartbeat emissions to prevent agent timeouts.

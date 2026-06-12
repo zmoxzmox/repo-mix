@@ -212,18 +212,21 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             )
         }
 
+        // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
         if exportResponse {
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            // Export into the exact root scope selected by Context Builder's final tab resolution.
+            // Ambient request metadata may still describe a different active tab.
             capturedOracleExportDestination = try dependencies.makeOracleExportDestination(
                 workspace,
                 targetWindow.windowID,
                 finalTabID,
-                lookupContext
+                tabResolution.lookupContext
             )
         } else {
             capturedOracleExportDestination = nil
         }
+        // swiftformat:enable conditionalAssignment
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID

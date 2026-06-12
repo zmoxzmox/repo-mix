@@ -10,6 +10,7 @@ struct MCPWindowToolDependencies {
         let tabID: UUID
         let workspaceID: UUID?
         let bindCaller: Bool
+        let lookupContext: WorkspaceLookupContext
     }
 
     typealias ExecuteTool = @Sendable (_ args: [String: Value]) async throws -> Value

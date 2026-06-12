@@ -1525,6 +1525,23 @@ extension MCPServerViewModel {
 
     @MainActor
     func resolveFileToolLookupContext(
+        tabID: UUID,
+        workspaceID: UUID?
+    ) async throws -> WorkspaceLookupContext {
+        let snapshot = try makeTabContextSnapshot(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: windowID,
+            runID: nil,
+            explicitlyBound: false,
+            captureActiveUIState: false,
+            flushActiveSelection: false
+        )
+        return await lookupContext(for: snapshot)
+    }
+
+    @MainActor
+    func resolveFileToolLookupContext(
         from metadata: RequestMetadata
     ) async -> WorkspaceLookupContext {
         let purpose = metadata.runPurpose ?? .unknown

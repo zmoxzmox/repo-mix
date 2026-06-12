@@ -170,7 +170,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
         XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
-        XCTAssertTrue(window.fileManager.snapshotSelection().selectedPaths.isEmpty)
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
 
         let secondConnectionID = UUID()
@@ -185,7 +185,112 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         }
         XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
-        XCTAssertTrue(window.fileManager.snapshotSelection().selectedPaths.isEmpty)
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+    }
+
+    func testContextBuilderExportUsesResolvedWorktreeContextAndIsReadableFromFreshConnection() async throws {
+        #if DEBUG
+            let fixture = try Self.makeGitFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+            let provider = WorktreeContextBuilderImmediateCompletionProvider()
+            let window = try await Self.makeWindow(
+                root: fixture.repo,
+                contextBuilderProviderFactory: { _, _, _ in provider }
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+            let contextBuilder = try await Self.windowTool(named: MCPWindowToolName.contextBuilder, in: window)
+            let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
+
+            let targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
+            let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+            XCTAssertNotEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, targetTab.id)
+            let sessionID = UUID()
+            let session = window.agentModeViewModel.session(for: targetTab.id)
+            _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: true
+            )
+
+            let createValue = try await manageWorktree([
+                "op": .string("create"),
+                "branch": .string("feature/export-\(fixture.suffix)"),
+                "base_ref": .string("HEAD")
+            ])
+            let created = try Self.worktreeObject(createValue, key: "created_worktree")
+            let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+            let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+            _ = try await manageWorktree([
+                "op": .string("bind"),
+                "worktree_id": .string(worktreeID),
+                "session_id": .string(sessionID.uuidString)
+            ])
+
+            window.contextBuilderAgentViewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    runMCPFollowUp: { mode, _, _ in
+                        let chatID = UUID()
+                        return ChatSendReply(
+                            chatId: chatID,
+                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                            mode: mode.mcpModeName,
+                            response: "deterministic worktree export response",
+                            errors: nil
+                        )
+                    }
+                )
+            )
+            defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+            let exportConnectionID = UUID()
+            let exportValue = try await ServerNetworkManager.withConnectionID(exportConnectionID) {
+                // Exercise the provider's explicit context_id resolution without an ambient
+                // TaskLocal hint; the active tab intentionally points at the base checkout.
+                try await contextBuilder([
+                    "instructions": .string("Inspect the worktree-bound target."),
+                    "response_type": .string("plan"),
+                    "context_id": .string(targetTab.id.uuidString),
+                    "export_response": .bool(true)
+                ])
+            }
+            let exportObject = try XCTUnwrap(exportValue.objectValue)
+            let exportPath = try XCTUnwrap(exportObject["oracle_export_path"]?.stringValue)
+            let exportInstruction = try XCTUnwrap(exportObject["oracle_export_instruction"]?.stringValue)
+            let standardizedWorktreePath = StandardizedPath.absolute(worktreePath)
+            XCTAssertTrue(
+                exportPath.hasPrefix(standardizedWorktreePath + "/prompt-exports/"),
+                exportPath
+            )
+            XCTAssertTrue(exportInstruction.contains(exportPath), exportInstruction)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: exportPath), exportPath)
+
+            let relativeExportPath = String(exportPath.dropFirst(standardizedWorktreePath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let logicalExportPath = fixture.repo.appendingPathComponent(relativeExportPath).path
+            XCTAssertFalse(FileManager.default.fileExists(atPath: logicalExportPath), logicalExportPath)
+
+            let readConnectionID = UUID()
+            let contextHint = MCPServerViewModel.TabContextHint(
+                tabID: targetTab.id,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            let readValue = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+                try await ServerNetworkManager.$currentTabContextHint.withValue(contextHint) {
+                    try await readFile(["path": .string(exportPath)])
+                }
+            }
+            let readReply = try XCTUnwrap(readValue.decode(ToolResultDTOs.ReadFileReply.self))
+            XCTAssertTrue(readReply.content.contains("deterministic worktree export response"), readReply.content)
+            XCTAssertNotNil(readReply.worktreeScope)
+        #else
+            throw XCTSkip("Context Builder provider injection is DEBUG-only.")
+        #endif
     }
 
     func testManageWorktreeMergePreviewCleanApplyRawAndFormattedContract() async throws {
@@ -405,10 +510,23 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
     }
 
-    private static func makeWindow(root: URL) async throws -> WindowState {
+    private static func makeWindow(
+        root: URL,
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
+    ) async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window: WindowState
+        #if DEBUG
+            if let contextBuilderProviderFactory {
+                window = WindowState(contextBuilderProviderFactory: contextBuilderProviderFactory)
+            } else {
+                window = WindowState()
+            }
+        #else
+            _ = contextBuilderProviderFactory
+            window = WindowState()
+        #endif
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
@@ -537,3 +655,24 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return text
     }
 }
+
+#if DEBUG
+    private final class WorktreeContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
+        func streamAgentMessage(
+            _ message: AgentMessage,
+            runID: UUID?
+        ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+            _ = message
+            let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
+                continuation.yield(AIStreamResult(type: "content", text: "Discovery complete"))
+                continuation.finish()
+            }
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
+            return stream
+        }
+
+        func dispose() async {}
+    }
+#endif
