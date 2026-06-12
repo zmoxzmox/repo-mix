@@ -4373,7 +4373,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let loadedRoots = await store.roots()
             let loadedRoot = try XCTUnwrap(loadedRoots.first)
             XCTAssertEqual(loadedRoots.map(\.standardizedFullPath), [root.path])
-            XCTAssertFalse(try await store.rootWatcherIsActiveForTesting(rootID: loadedRoot.id))
+            await XCTAssertFalse(try store.rootWatcherIsActiveForTesting(rootID: loadedRoot.id))
             XCTAssertEqual(manager.currentSlicesByRootForTesting()[root.path]?["Sliced.swift"]?.ranges, ranges)
 
             await manager.applyStoredSelection(StoredSelection(
