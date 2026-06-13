@@ -1752,6 +1752,66 @@
             XCTAssertFalse(workspaceManager.contains("EditFlowPerf.Dimensions(path:"))
         }
 
+        func testAgentExportPopoverResolvesSlicesAndCodemapsWithBatchedLookups() throws {
+            let resolver = try source("Sources/RepoPrompt/Features/AgentMode/Services/AgentContextExportResolver.swift")
+            let resolveStart = try XCTUnwrap(resolver.range(of: "    private static func resolveRows("))
+            let resolveEnd = try XCTUnwrap(
+                resolver.range(
+                    of: "    private static func row(",
+                    range: resolveStart.upperBound ..< resolver.endIndex
+                )
+            )
+            let resolveRows = String(resolver[resolveStart.lowerBound ..< resolveEnd.lowerBound])
+
+            XCTAssertTrue(resolveRows.contains("await store.lookupPaths(sliceLookupRequests)"))
+            XCTAssertTrue(resolveRows.contains("await store.lookupPaths(codemapLookupRequests)"))
+            XCTAssertFalse(resolveRows.contains("await store.lookupPath(path, profile: profile, rootScope: rootScope)"))
+        }
+
+        func testCanonicalSelectionRebaseRemainsInsideDeferredAutoSelectionWorker() throws {
+            let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            let applyStart = try XCTUnwrap(viewModel.range(of: "    private func applyReadFileAutoSelectionBatch("))
+            let applyEnd = try XCTUnwrap(
+                viewModel.range(
+                    of: "    @MainActor\n    func readFileAutoSelectionContext(",
+                    range: applyStart.upperBound ..< viewModel.endIndex
+                )
+            )
+            let applyMethod = String(viewModel[applyStart.lowerBound ..< applyEnd.lowerBound])
+            XCTAssertTrue(applyMethod.contains("workspaceManager?.composeTab("))
+
+            let readEnqueueStart = try XCTUnwrap(viewModel.range(of: "    private func enqueueReadFileAutoSelection("))
+            let readEnqueueEnd = try XCTUnwrap(
+                viewModel.range(
+                    of: "    @MainActor\n    func drainReadFileAutoSelection(",
+                    range: readEnqueueStart.upperBound ..< viewModel.endIndex
+                )
+            )
+            let readEnqueue = String(viewModel[readEnqueueStart.lowerBound ..< readEnqueueEnd.lowerBound])
+            XCTAssertFalse(readEnqueue.contains("composeTab("))
+
+            let searchEnqueueStart = try XCTUnwrap(viewModel.range(of: "    private func enqueueFileSearchAutoSelection("))
+            let searchEnqueueEnd = try XCTUnwrap(
+                viewModel.range(
+                    of: "    private func applySelectionSlices(",
+                    range: searchEnqueueStart.upperBound ..< viewModel.endIndex
+                )
+            )
+            let searchEnqueue = String(viewModel[searchEnqueueStart.lowerBound ..< searchEnqueueEnd.lowerBound])
+            XCTAssertFalse(searchEnqueue.contains("composeTab("))
+
+            let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
+            let workerStart = try XCTUnwrap(coordinator.range(of: "    private func runCanonicalWorker("))
+            let workerEnd = try XCTUnwrap(
+                coordinator.range(
+                    of: "    private func completeCanonicalBatch(",
+                    range: workerStart.upperBound ..< coordinator.endIndex
+                )
+            )
+            let worker = String(coordinator[workerStart.lowerBound ..< workerEnd.lowerBound])
+            XCTAssertTrue(worker.contains("await applyCanonical(key, queued.batch)"))
+        }
+
         func testReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle() throws {
             _ = startedCapture(label: "read-file-auto-selection-queue", maxSamples: 100)
             let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())

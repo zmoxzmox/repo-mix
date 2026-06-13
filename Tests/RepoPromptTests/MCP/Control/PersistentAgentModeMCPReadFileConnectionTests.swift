@@ -15,6 +15,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testPairAgentOwnedSequentialFullAndSlicedReadsUnionCanonicalSelection() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .agentOwnedSequentialReadUnion)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testAgentOwnedExplicitSetPersistsForIndependentCanonicalLookup() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
@@ -140,12 +150,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case workspaceReorderDuringPersistence
             case rebindDuringPersistence
             case agentOwnedCanonicalSelection
+            case agentOwnedSequentialReadUnion
             case agentOwnedExplicitSetIndependentLookup
             case agentOwnedNoRangeNonEmptyWorktreeFile
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
-                case .agentOwnedNoRangeNonEmptyWorktreeFile:
+                case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion:
                     false
                 default:
                     true
@@ -320,11 +331,68 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertRebindDuringAutoSelectionPersistence(fixture: fixture)
             case .agentOwnedCanonicalSelection:
                 try await assertAgentOwnedCanonicalSelection(fixture: fixture)
+            case .agentOwnedSequentialReadUnion:
+                try await assertAgentOwnedSequentialReadUnion(fixture: fixture)
             case .agentOwnedExplicitSetIndependentLookup:
                 try await assertAgentOwnedExplicitSetIndependentLookup(fixture: fixture)
             case .agentOwnedNoRangeNonEmptyWorktreeFile:
                 try await assertAgentOwnedNoRangeNonEmptyWorktreeFile(fixture: fixture)
             }
+        }
+
+        func assertAgentOwnedSequentialReadUnion(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+
+            let fullRead = try await fixture.socketClient.request(
+                id: 4,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": fixture.fileURL.path]
+                ]
+            )
+            let fullText = try Self.readFileText(from: fullRead, id: 4)
+            XCTAssertTrue(fullText.contains(Fixture.sentinelContent), fullText)
+            let firstSettled = await waitForReadFileAutoSelectionToSettle(fixture: fixture)
+            XCTAssertTrue(firstSettled, "First read auto-selection did not converge without manage_selection get")
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.fileURL.path],
+                slices: [:]
+            )
+
+            // Reproduce the production failure boundary: routing/handoff/mirror state may retain
+            // an older working snapshot even though canonical persistence and its mirror completed.
+            // The next additive read must merge from canonical storage, never this cache.
+            fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection = StoredSelection()
+
+            let slicedRead = try await fixture.socketClient.request(
+                id: 5,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": [
+                        "path": fixture.liveFileURL.path,
+                        "start_line": 2,
+                        "limit": 2
+                    ]
+                ]
+            )
+            let slicedText = try Self.readFileText(from: slicedRead, id: 5)
+            XCTAssertTrue(slicedText.contains("**Lines**: 2–3"), slicedText)
+            let finalSettled = await waitForReadFileAutoSelectionToSettle(fixture: fixture)
+            XCTAssertTrue(finalSettled, "Cumulative read auto-selection did not converge without manage_selection get")
+
+            let expectedPaths = [fixture.fileURL.path, fixture.liveFileURL.path]
+            let expectedSlices = [fixture.liveFileURL.path: [LineRange(start: 2, end: 3)]]
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: expectedPaths,
+                slices: expectedSlices
+            )
+            let liveSelection = fixture.window.workspaceFilesViewModel.snapshotSelection()
+            XCTAssertEqual(Set(liveSelection.selectedPaths), Set(expectedPaths))
+            XCTAssertEqual(liveSelection.slices, expectedSlices)
         }
 
         func assertAgentOwnedExplicitSetIndependentLookup(fixture: Fixture) async throws {
@@ -1149,6 +1217,26 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ]
             )
             try Self.assertSuccessfulResponse(response, id: id)
+        }
+
+        func waitForReadFileAutoSelectionToSettle(fixture: Fixture) async -> Bool {
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline {
+                let snapshot = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+                if snapshot.canonicalWorkerCount == 0,
+                   snapshot.mirrorWorkerCount == 0,
+                   snapshot.pendingCanonicalBatchCount == 0,
+                   snapshot.pendingMirrorBatchCount == 0
+                {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            let snapshot = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+            return snapshot.canonicalWorkerCount == 0
+                && snapshot.mirrorWorkerCount == 0
+                && snapshot.pendingCanonicalBatchCount == 0
+                && snapshot.pendingMirrorBatchCount == 0
         }
 
         func waitForCanonicalWorkerToSettle(fixture: Fixture) async -> Bool {

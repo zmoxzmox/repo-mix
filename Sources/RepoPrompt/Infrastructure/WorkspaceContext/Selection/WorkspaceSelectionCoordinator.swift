@@ -532,6 +532,7 @@ final class WorkspaceSelectionCoordinator {
                         workspaceID: target.workspaceID
                     )
                 }
+                refreshDeferredUISelectionFence(forTabID: target.tabID)
             }
             finishSelectionMirrorTask(
                 taskID,
@@ -567,6 +568,7 @@ final class WorkspaceSelectionCoordinator {
                         workspaceID: target.workspaceID
                     )
                 }
+                refreshDeferredUISelectionFence(forTabID: target.tabID)
             }
             finishSelectionMirrorTask(
                 taskID,

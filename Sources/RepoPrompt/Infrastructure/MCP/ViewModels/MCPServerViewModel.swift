@@ -3180,7 +3180,14 @@ final class MCPServerViewModel: ObservableObject {
             windowID: key.windowID
         )
         let lookupRootScope = await resolveFileToolLookupContext(from: metadata).rootScope
-        let initialSelection = context.selection
+        guard let workspaceID = key.workspaceID,
+              let initialSelection = workspaceManager?.composeTab(
+                  for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
+              )?.selection
+        else { return .unchanged }
+        // The bound tab context is a routable working snapshot, not canonical selection authority.
+        // Handoffs and delayed mirrors can leave it behind the stored compose-tab selection, so
+        // every additive read/search batch must rebase on the latest canonical value.
         var selection = initialSelection
 
         if !batch.fullPaths.isEmpty {
