@@ -43,6 +43,24 @@ final class GitProcessPipeDrainTests: XCTestCase {
         XCTAssertEqual(output, callbackData + tailData)
     }
 
+    func testOwnedDescriptorSurvivesOriginalFileHandleCloseBeforeQueuedRead() async throws {
+        let pipe = Pipe()
+        let originalReadHandle = pipe.fileHandleForReading
+        let (stream, drain) = try GitProcessPipeDrain.makeStream(readingFrom: originalReadHandle)
+        let collected = Task { await Self.collect(stream) }
+        let expected = Data("queued callback".utf8)
+
+        pipe.fileHandleForWriting.write(expected)
+        originalReadHandle.closeFile()
+
+        XCTAssertFalse(drain.consumeAvailableData())
+        pipe.fileHandleForWriting.closeFile()
+        XCTAssertTrue(drain.consumeAvailableData())
+
+        let output = await collected.value
+        XCTAssertEqual(output, expected)
+    }
+
     func testReadabilityCallbackAfterFinishCannotConsumeOrAppendData() async {
         let (stream, drain) = GitProcessPipeDrain.makeStream()
         let tailData = Data("tail".utf8)
