@@ -2273,7 +2273,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: seedURL)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
-            try await store.startWatchingRoot(id: record.id)
+            // Keep the callback cut deterministic; real FSEvents can race these exact barrier counters.
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attached)
 
             let initial = await store.awaitAppliedIngressForExplicitRequest(
                 userPath: seedURL.path,

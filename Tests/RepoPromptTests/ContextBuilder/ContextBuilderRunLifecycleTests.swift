@@ -259,44 +259,68 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 Task { await ServerNetworkManager.shared.debugRemoveConnection(connectionID) }
             }
 
-            let didFinalize = await ContextBuilderChildConnectionFinalizer.finalize(
-                connectionIDs: [connectionID],
-                awaitResponseDeliveryDrain: { _ in true },
-                commitContext: { committedID in
-                    await window.mcpServer.commitAndClearTabContext(
-                        connectionID: committedID,
-                        expectedRunID: runID,
-                        deferRunMappingCleanupUntilCaller: true
-                    )
-                },
-                beforeTerminationRequest: {},
-                requestTermination: { requestedID in
-                    Task {
-                        await ServerNetworkManager.shared.terminateConnection(
-                            requestedID,
-                            reason: .runCompleted,
-                            message: "test successful completion"
+            let commitGate = LifecycleTestGate()
+            var commitCount = 0
+            var cleanupCount = 0
+            let finalization = Task { @MainActor in
+                await ContextBuilderChildConnectionFinalizer.finalize(
+                    connectionIDs: [connectionID],
+                    awaitResponseDeliveryDrain: { _ in true },
+                    commitContext: { committedID in
+                        commitCount += 1
+                        return await window.mcpServer.commitAndClearTabContext(
+                            connectionID: committedID,
+                            expectedRunID: runID,
+                            progressReporter: { phase in
+                                if phase == .tabContextCommit {
+                                    await commitGate.arriveAndWait()
+                                }
+                            },
+                            deferRunMappingCleanupUntilCaller: true
+                        )
+                    },
+                    beforeTerminationRequest: {},
+                    requestTermination: { requestedID in
+                        Task {
+                            await ServerNetworkManager.shared.terminateConnection(
+                                requestedID,
+                                reason: .runCompleted,
+                                message: "test successful completion"
+                            )
+                        }
+                    },
+                    beforeTerminationJoin: {},
+                    cleanupMapping: { cleanedID in
+                        cleanupCount += 1
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: cleanedID,
+                            clientName: clientName,
+                            windowID: window.windowID,
+                            runID: runID
                         )
                     }
-                },
-                beforeTerminationJoin: {},
-                cleanupMapping: { cleanedID in
-                    window.mcpServer.removeTabContext(
-                        forConnectionID: cleanedID,
-                        clientName: clientName,
-                        windowID: window.windowID,
-                        runID: runID
-                    )
-                }
-            )
+                )
+            }
 
-            XCTAssertTrue(didFinalize)
-            XCTAssertEqual(
-                window.workspaceManager.composeTab(with: tabID)?.promptText,
-                expectedPrompt
+            await commitGate.waitUntilArrived()
+            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
+            await ServerNetworkManager.shared.terminateConnection(
+                connectionID,
+                reason: .runCompleted,
+                message: "test cleanup while commit is paused"
             )
+            let removedClient = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
+            XCTAssertNil(removedClient)
+
+            await commitGate.release()
+            let didFinalize = await finalization.value
+            XCTAssertTrue(didFinalize)
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
+            XCTAssertEqual(commitCount, 1)
+            XCTAssertEqual(cleanupCount, 1)
             XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
             XCTAssertFalse(window.mcpServer.hasRunID(runID))
+            XCTAssertTrue(window.mcpServer.connectionIDs(forRunID: runID).isEmpty)
             let terminationCount = await connection.terminationCount()
             let stopCount = await connection.stopCount()
             XCTAssertEqual(terminationCount, 1)

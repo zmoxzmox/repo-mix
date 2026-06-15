@@ -332,6 +332,7 @@ class WindowState: ObservableObject {
                 codexModelPollingService: codexModelPollingService
             )
         }
+
     #endif
 
     private init(
@@ -1294,6 +1295,9 @@ class WindowState: ObservableObject {
     // MARK: - Teardown
 
     func tearDown() async {
+        beginClose()
+        await promptManager.gitViewModel.shutdownForWindowClose()
+
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG
             agentChatStressHarness?.pause()

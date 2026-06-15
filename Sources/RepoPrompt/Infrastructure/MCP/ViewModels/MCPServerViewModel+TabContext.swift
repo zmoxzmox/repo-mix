@@ -2614,31 +2614,28 @@ extension MCPServerViewModel {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
         // but it cannot invalidate this locally owned snapshot.
-        guard var context = tabContextByConnectionID[connectionID] else { return false }
+        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return false }
 
         // Decide whether we will commit stored UI state for this context.
         // Mismatch or logical cancellation => clear binding only.
         var shouldCommit = isStillCurrent()
-        if let expected = expectedRunID, context.runID != expected {
-            tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) — clearing binding without commit")
+        if let expected = expectedRunID, commitOwnedContext.runID != expected {
+            tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(commitOwnedContext.runID?.uuidString ?? "nil") tab=\(commitOwnedContext.tabID) — clearing binding without commit")
             shouldCommit = false
         }
 
         if shouldCommit {
-            let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+            let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: commitOwnedContext)
             await progressReporter?(.readFileAutoSelectionFinish)
             let finishResult = await readFileAutoSelectionCoordinator.finish(context: key)
             if finishResult == .cancelled {
                 shouldCommit = false
             }
-            if let latest = tabContextByConnectionID[connectionID], latest.runID == context.runID {
-                context = latest
-            }
             if !isStillCurrent() || Task.isCancelled {
                 shouldCommit = false
             }
         } else {
-            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+            invalidateReadFileAutoSelection(connectionID: connectionID, context: commitOwnedContext)
         }
 
         // Clear the mutable tab snapshot regardless of mismatch so future calls cannot
@@ -2649,7 +2646,7 @@ extension MCPServerViewModel {
         tabContextByConnectionID.removeValue(forKey: connectionID)
         if !deferRunMappingCleanupUntilCaller {
             windowIDByConnection.removeValue(forKey: connectionID)
-            if let runID = context.runID {
+            if let runID = commitOwnedContext.runID {
                 connectionIDByRunID.removeValue(forKey: runID)
             }
             connectionIDToRunID.removeValue(forKey: connectionID)
@@ -2657,20 +2654,20 @@ extension MCPServerViewModel {
 
         guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return false }
 
-        tabContextLog("commitAndClearTabContext committing tab=\(context.tabID) connectionID=\(connectionID) runID=\(context.runID?.uuidString ?? "nil")")
+        tabContextLog("commitAndClearTabContext committing tab=\(commitOwnedContext.tabID) connectionID=\(connectionID) runID=\(commitOwnedContext.runID?.uuidString ?? "nil")")
 
         // IMPORTANT: Await the commit to ensure tab state is written before caller reads it.
-        // This fixes a race condition where context_builder would read stale tab state.
+        // The immutable payload remains owned by this run even if transport cleanup proceeds.
         await progressReporter?(.tabContextCommit)
-        let didCommit = await commitTabContext(context, isStillCurrent: isStillCurrent)
+        let didCommit = await commitTabContext(commitOwnedContext, isStillCurrent: isStillCurrent)
         guard didCommit, isStillCurrent(), !Task.isCancelled else { return false }
 
         var discoveredTabName: String?
         if let manager = workspaceManager,
-           let tab = manager.composeTab(with: context.tabID)
+           let tab = manager.composeTab(with: commitOwnedContext.tabID)
         {
             discoveredTabName = tab.name
-        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == context.tabID }) {
+        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == commitOwnedContext.tabID }) {
             discoveredTabName = tab.name
         }
         if let tabName = discoveredTabName, !tabName.isEmpty {
