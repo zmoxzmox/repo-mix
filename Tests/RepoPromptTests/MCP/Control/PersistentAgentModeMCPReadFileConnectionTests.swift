@@ -1,10 +1,44 @@
 import Darwin
 import Foundation
+import MCP
 @testable import RepoPrompt
 import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
+    func testWorktreeReadCoverageCertificateHitsExactFullAndSliceRepeatsButNotExpansion() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .worktreeCoverageCertificateRepeats)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testWorktreeReadCoverageCertificateMintsOnlyAfterVerifiedPersistenceAndResponseStaysAsync() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .worktreeCoverageCertificatePersistenceBoundary)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testWorktreeReadCoverageCertificateFailsClosedAcrossStaleStateAndLifecycleReplacement() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .worktreeCoverageCertificateFailClosed)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testPairAgentOwnedConnectionWithDistinctRunTokenPersistsCanonicalSelection() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
@@ -164,11 +198,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case agentOwnedExplicitSetIndependentLookup
             case agentOwnedNoRangeNonEmptyWorktreeFile
             case manageSelectionGetCanonicalHandover
+            case worktreeCoverageCertificateRepeats
+            case worktreeCoverageCertificatePersistenceBoundary
+            case worktreeCoverageCertificateFailClosed
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
-                     .manageSelectionGetCanonicalHandover:
+                     .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
+                     .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed:
                     false
                 default:
                     true
@@ -351,7 +389,483 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertAgentOwnedNoRangeNonEmptyWorktreeFile(fixture: fixture)
             case .manageSelectionGetCanonicalHandover:
                 try await assertManageSelectionGetCanonicalHandover(fixture: fixture)
+            case .worktreeCoverageCertificateRepeats:
+                try await assertWorktreeCoverageCertificateRepeats(fixture: fixture)
+            case .worktreeCoverageCertificatePersistenceBoundary:
+                try await assertWorktreeCoverageCertificatePersistenceBoundary(fixture: fixture)
+            case .worktreeCoverageCertificateFailClosed:
+                try await assertWorktreeCoverageCertificateFailClosed(fixture: fixture)
             }
+        }
+
+        func assertWorktreeCoverageCertificateRepeats(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 4,
+                path: fixture.fileURL.path
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterFull = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterFull.authoritativeFallbackCount, 1)
+            XCTAssertEqual(afterFull.coverageCertificateHitCount, 0)
+            XCTAssertEqual(afterFull.coverageCertificateMissReasonCounts[.noCertificate], 1)
+            XCTAssertNotNil(try fixture.readFileAutoSelectionCoverageCertificate())
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 5,
+                path: fixture.fileURL.path
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterFullRepeat = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterFullRepeat.coverageCertificateHitCount, 1)
+            XCTAssertEqual(afterFullRepeat.authoritativeFallbackCount, 1)
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 6,
+                path: fixture.liveFileURL.path,
+                startLine: 10,
+                limit: 11
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterSlice = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterSlice.authoritativeFallbackCount, 2)
+            XCTAssertEqual(afterSlice.coverageCertificateMissReasonCounts[.batchMismatch], 1)
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 7,
+                path: fixture.liveFileURL.path,
+                startLine: 10,
+                limit: 11
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterSliceRepeat = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterSliceRepeat.coverageCertificateHitCount, 2)
+
+            let preexistingSliceFence = try await fixture.window.workspaceManager.fileManager
+                .waitForPendingSliceRebasesAndCaptureFence(
+                    affectingCandidatePaths: [fixture.liveFileURL.path, fixture.worktreeLiveFileURL.path]
+                )
+            XCTAssertTrue(
+                fixture.window.workspaceManager.fileManager.isSliceRebaseFenceCurrent(preexistingSliceFence),
+                "Fixture slice ingress must be quiescent before installing the deterministic late-ingress race"
+            )
+
+            let expansionContextKey = try fixture.readFileAutoSelectionContextKey()
+            fixture.window.mcpServer.readFileAutoSelectionCoverageCertificates.removeValue(forKey: expansionContextKey)
+
+            let delayedIngressGate = PersistentAsyncGate()
+            let delayedIngressCompleted = PersistentAsyncSignal()
+            var registeredDelayedIngress = false
+            fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting {
+                guard !registeredDelayedIngress else { return }
+                registeredDelayedIngress = true
+                fixture.window.workspaceManager.fileManager.debugRegisterSliceRebaseTask(
+                    fullPath: fixture.liveFileURL.path
+                ) {
+                    await fixture.window.workspaceManager.rebaseSlicesForFileAcrossTabs(
+                        fullPath: fixture.liveFileURL.path,
+                        asyncTransform: { ranges in
+                            await delayedIngressGate.markStartedAndWaitForRelease()
+                            return ranges
+                        }
+                    )
+                    await delayedIngressCompleted.mark()
+                }
+                let started = await delayedIngressGate.waitUntilStarted()
+                XCTAssertTrue(started, "Delayed slice-rebase ingress did not start during final revalidation")
+                let completed = await self.waitUntilMarked(delayedIngressCompleted, timeout: .seconds(3))
+                XCTAssertTrue(completed, "Delayed slice-rebase ingress did not complete before final revalidation")
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting(nil)
+                Task { await delayedIngressGate.release() }
+            }
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 8,
+                path: fixture.liveFileURL.path,
+                startLine: 5,
+                limit: 16
+            )
+            try await requireGateStarted(delayedIngressGate)
+            XCTAssertNil(try fixture.readFileAutoSelectionCoverageCertificate())
+
+            var selectionAdvancedAfterIngressSnapshot = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)
+            )
+            selectionAdvancedAfterIngressSnapshot.selection = StoredSelection(
+                selectedPaths: [
+                    fixture.fileURL.path,
+                    fixture.liveFileURL.path,
+                    fixture.worktreeOnlyLogicalURL.path
+                ],
+                autoCodemapPaths: selectionAdvancedAfterIngressSnapshot.selection.autoCodemapPaths,
+                slices: [
+                    fixture.liveFileURL.path: [LineRange(start: 1, end: 20)],
+                    fixture.worktreeOnlyLogicalURL.path: [LineRange(start: 30, end: 40)]
+                ],
+                codemapAutoEnabled: selectionAdvancedAfterIngressSnapshot.selection.codemapAutoEnabled
+            )
+            XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
+                selectionAdvancedAfterIngressSnapshot,
+                inWorkspaceID: fixture.workspaceID
+            ))
+
+            await delayedIngressGate.release()
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterExpansion = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterExpansion.authoritativeFallbackCount, 3)
+            XCTAssertEqual(afterExpansion.coverageCertificateMissReasonCounts[.noCertificate], 2)
+            XCTAssertEqual(afterExpansion.coverageCertificateMissReasonCounts[.batchMismatch], 1)
+            XCTAssertNotNil(try fixture.readFileAutoSelectionCoverageCertificate())
+
+            let target = try fixture.readFileAutoSelectionTarget()
+            let staleTarget = MCPServerViewModel.DebugReadFileAutoSelectionTarget(
+                connectionID: target.connectionID,
+                runID: target.runID,
+                agentSessionID: UUID(),
+                workspaceID: target.workspaceID,
+                tabID: target.tabID,
+                route: target.route,
+                bindingGeneration: target.bindingGeneration,
+                contextKey: target.contextKey
+            )
+            XCTAssertNil(fixture.window.mcpServer.debugBeginReadFileAutoSelectionProbe(
+                probeID: UUID(),
+                forceAuthoritative: true,
+                for: staleTarget
+            ))
+
+            let registry = MCPReadFileAutoSelectionProbeRegistry.shared
+            await registry.resetForTesting()
+            defer { Task { await registry.resetForTesting() } }
+
+            let probeArguments: [String: Value] = [
+                "window_id": .int(fixture.windowID),
+                "target_connection_id": .string(Fixture.connectionID.uuidString),
+                "expected_run_id": .string(Fixture.runID.uuidString),
+                "force_authoritative": .bool(true),
+                "expiry_ms": .int(10000)
+            ]
+            var probeIDs: [UUID] = []
+            for _ in 0 ..< 16 {
+                let begin = await fixture.networkManager.debugMCPReadFileAutoSelectionProbeBeginPayload(
+                    op: "mcp_read_file_auto_selection_probe_begin",
+                    arguments: probeArguments
+                )
+                let payload = try Self.diagnosticsPayload(begin)
+                XCTAssertEqual(payload["ok"] as? Bool, true)
+                try probeIDs.append(XCTUnwrap((payload["probe_id"] as? String).flatMap(UUID.init(uuidString:))))
+            }
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeCount(for: target),
+                16
+            )
+            let otherKey = MCPReadFileAutoSelectionCoordinator.ContextKey(
+                windowID: target.contextKey.windowID,
+                workspaceID: target.contextKey.workspaceID,
+                tabID: UUID(),
+                route: target.contextKey.route,
+                bindingGeneration: target.contextKey.bindingGeneration
+            )
+            let otherTarget = MCPServerViewModel.DebugReadFileAutoSelectionTarget(
+                connectionID: target.connectionID,
+                runID: target.runID,
+                agentSessionID: target.agentSessionID,
+                workspaceID: target.workspaceID,
+                tabID: otherKey.tabID,
+                route: target.route,
+                bindingGeneration: otherKey.bindingGeneration,
+                contextKey: otherKey
+            )
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeCount(for: otherTarget),
+                0
+            )
+
+            let installCountBeforeRejectedAdmission = fixture.window.mcpServer
+                .debugReadFileAutoSelectionForcedAuthoritativeProbeInstallCount()
+            let rejectedBegin = await fixture.networkManager.debugMCPReadFileAutoSelectionProbeBeginPayload(
+                op: "mcp_read_file_auto_selection_probe_begin",
+                arguments: probeArguments
+            )
+            let rejectedPayload = try Self.diagnosticsPayload(rejectedBegin)
+            XCTAssertEqual(rejectedPayload["code"] as? String, "probe_capacity")
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeInstallCount(),
+                installCountBeforeRejectedAdmission,
+                "A rejected admission must never invoke force installation"
+            )
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeCount(for: target),
+                16,
+                "A rejected admission must never transiently install another force lease"
+            )
+
+            _ = try await readFile(
+                fixture: fixture,
+                id: 9,
+                path: fixture.liveFileURL.path,
+                startLine: 5,
+                limit: 16
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterForcedAuthoritative = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(afterForcedAuthoritative.authoritativeFallbackCount, 4)
+            XCTAssertEqual(afterForcedAuthoritative.coverageCertificateMissReasonCounts[.forcedAuthoritative], 1)
+
+            let drainedProbeID = probeIDs.removeFirst()
+            let drain = await fixture.networkManager.debugMCPReadFileAutoSelectionProbeDrainPayload(
+                op: "mcp_read_file_auto_selection_probe_drain",
+                arguments: ["probe_id": .string(drainedProbeID.uuidString)]
+            )
+            let drainPayload = try Self.diagnosticsPayload(drain)
+            XCTAssertEqual(drainPayload["result"] as? String, "completed")
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeCount(for: target),
+                15
+            )
+            for probeID in probeIDs {
+                let cancel = await fixture.networkManager.debugMCPReadFileAutoSelectionProbeCancelPayload(
+                    op: "mcp_read_file_auto_selection_probe_cancel",
+                    arguments: ["probe_id": .string(probeID.uuidString)]
+                )
+                let cancelPayload = try Self.diagnosticsPayload(cancel)
+                XCTAssertEqual(cancelPayload["result"] as? String, "cancelled")
+            }
+            XCTAssertEqual(
+                fixture.window.mcpServer.debugReadFileAutoSelectionForcedAuthoritativeProbeCount(for: target),
+                0
+            )
+            let remainingProbeEntryCount = await registry.entryCountForTesting()
+            let remainingProbeReservationCount = await registry.reservationCountForTesting()
+            XCTAssertEqual(remainingProbeEntryCount, 0)
+            XCTAssertEqual(remainingProbeReservationCount, 0)
+            _ = try await readFile(
+                fixture: fixture,
+                id: 10,
+                path: fixture.liveFileURL.path,
+                startLine: 5,
+                limit: 16
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            XCTAssertEqual(try fixture.readFileAutoSelectionContextSnapshot().coverageCertificateHitCount, 3)
+
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [
+                    fixture.fileURL.path,
+                    fixture.liveFileURL.path,
+                    fixture.worktreeOnlyLogicalURL.path
+                ],
+                slices: [
+                    fixture.liveFileURL.path: [LineRange(start: 1, end: 20)],
+                    fixture.worktreeOnlyLogicalURL.path: [LineRange(start: 30, end: 40)]
+                ]
+            )
+        }
+
+        func assertWorktreeCoverageCertificatePersistenceBoundary(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting {
+                guard var tab = fixture.window.workspaceManager.composeTab(with: Fixture.tabID) else {
+                    return XCTFail("Missing canonical tab during final certificate revalidation")
+                }
+                tab.selection = StoredSelection(selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path])
+                XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
+                    tab,
+                    inWorkspaceID: fixture.workspaceID
+                ))
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
+                fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 4)
+            try await requireGateStarted(gate)
+            try await assertReadReplyReturned(read, gate: gate, id: 4)
+            XCTAssertNil(try fixture.readFileAutoSelectionCoverageCertificate())
+
+            await gate.release()
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let certificate = try XCTUnwrap(fixture.readFileAutoSelectionCoverageCertificate())
+            XCTAssertEqual(certificate.selectionRevision, fixture.canonicalSelectionRevision())
+            XCTAssertEqual(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection.selectedPaths,
+                [fixture.fileURL.path, fixture.liveFileURL.path]
+            )
+
+            _ = try await readFile(fixture: fixture, id: 5, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let final = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(final.coverageCertificateHitCount, 1)
+            XCTAssertEqual(final.authoritativeFallbackCount, 1)
+        }
+
+        func assertWorktreeCoverageCertificateFailClosed(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+            _ = try await readFile(fixture: fixture, id: 4, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            _ = try await readFile(fixture: fixture, id: 5, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            XCTAssertEqual(try fixture.readFileAutoSelectionContextSnapshot().coverageCertificateHitCount, 1)
+
+            try fixture.replaceReadFileAutoSelectionCertificate { certificate in
+                ReadFileAutoSelectionCoverageCertificate(
+                    batchIdentity: certificate.batchIdentity,
+                    agentSessionID: certificate.agentSessionID,
+                    bindingFingerprint: certificate.bindingFingerprint,
+                    selectionRevision: certificate.selectionRevision &+ 1,
+                    rootScope: certificate.rootScope,
+                    visibleCatalogGeneration: certificate.visibleCatalogGeneration,
+                    rootScopeCatalogGeneration: certificate.rootScopeCatalogGeneration
+                )
+            }
+            _ = try await readFile(fixture: fixture, id: 6, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            var snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.selectionRevisionMismatch], 1)
+
+            try fixture.replaceReadFileAutoSelectionCertificate { certificate in
+                ReadFileAutoSelectionCoverageCertificate(
+                    batchIdentity: certificate.batchIdentity,
+                    agentSessionID: certificate.agentSessionID,
+                    bindingFingerprint: certificate.bindingFingerprint,
+                    selectionRevision: certificate.selectionRevision,
+                    rootScope: certificate.rootScope,
+                    visibleCatalogGeneration: certificate.visibleCatalogGeneration &+ 1,
+                    rootScopeCatalogGeneration: certificate.rootScopeCatalogGeneration
+                )
+            }
+            _ = try await readFile(fixture: fixture, id: 7, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.visibleCatalogGenerationMismatch], 1)
+
+            try fixture.replaceReadFileAutoSelectionCertificate { certificate in
+                ReadFileAutoSelectionCoverageCertificate(
+                    batchIdentity: certificate.batchIdentity,
+                    agentSessionID: certificate.agentSessionID,
+                    bindingFingerprint: certificate.bindingFingerprint,
+                    selectionRevision: certificate.selectionRevision,
+                    rootScope: certificate.rootScope,
+                    visibleCatalogGeneration: certificate.visibleCatalogGeneration,
+                    rootScopeCatalogGeneration: certificate.rootScopeCatalogGeneration &+ 1
+                )
+            }
+            _ = try await readFile(fixture: fixture, id: 8, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.rootScopeCatalogGenerationMismatch], 1)
+
+            try fixture.replaceWorktreeBindingCheckoutMetadata()
+            _ = try await readFile(fixture: fixture, id: 9, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.bindingFingerprintMismatch], 1)
+            _ = try await readFile(fixture: fixture, id: 10, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            XCTAssertEqual(try fixture.readFileAutoSelectionContextSnapshot().coverageCertificateHitCount, 2)
+
+            let worktreeAKey = try fixture.readFileAutoSelectionContextKey()
+            XCTAssertNotNil(fixture.window.mcpServer.readFileAutoSelectionCoverageCertificates[worktreeAKey])
+            try await fixture.rebindToReplacementPhysicalWorktree()
+            let worktreeBKey = try fixture.readFileAutoSelectionContextKey()
+            XCTAssertNotEqual(worktreeBKey, worktreeAKey)
+            XCTAssertNil(fixture.window.mcpServer.readFileAutoSelectionCoverageCertificates[worktreeAKey])
+
+            let worktreeBRead = try await readFile(fixture: fixture, id: 11, path: fixture.fileURL.path)
+            XCTAssertTrue(worktreeBRead.contains(Fixture.replacementWorktreeSentinelContent), worktreeBRead)
+            XCTAssertFalse(worktreeBRead.contains(Fixture.sentinelContent), worktreeBRead)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.authoritativeFallbackCount, 1)
+            XCTAssertEqual(snapshot.coverageCertificateHitCount, 0)
+
+            _ = try await readFile(fixture: fixture, id: 12, path: fixture.fileURL.path)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            XCTAssertEqual(try fixture.readFileAutoSelectionContextSnapshot().coverageCertificateHitCount, 1)
+
+            _ = try XCTUnwrap(
+                fixture.window.mcpServer.readFileAutoSelectionCoverageCertificates[worktreeBKey]
+            )
+            let physicalPath = try fixture.worktreeFileURL.path
+            try fixture.removeWorktreeDirectory()
+            let intent = MCPReadFileAutoSelectionCoordinator.Intent.full(paths: [fixture.fileURL.path])
+            let coverage = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+                intent: intent,
+                resolvedPaths: [physicalPath]
+            ))
+            XCTAssertTrue(fixture.window.mcpServer.readFileAutoSelectionCoordinator.enqueue(
+                intent: intent,
+                coverageIdentity: coverage,
+                for: worktreeBKey
+            ))
+            let unavailableDrain = await fixture.window.mcpServer.readFileAutoSelectionCoordinator.drain(
+                .canonicalSelection,
+                for: worktreeBKey
+            )
+            XCTAssertEqual(unavailableDrain, .completed)
+            snapshot = try fixture.readFileAutoSelectionContextSnapshot()
+            XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.bindingUnavailable], 1)
+            XCTAssertNil(fixture.window.mcpServer.readFileAutoSelectionCoverageCertificates[worktreeBKey])
+        }
+
+        func readFile(
+            fixture: Fixture,
+            id: Int,
+            path: String,
+            startLine: Int? = nil,
+            limit: Int? = nil
+        ) async throws -> String {
+            let target = try fixture.readFileAutoSelectionTarget()
+            let acceptedBeforeRead = fixture.window.mcpServer
+                .debugReadFileAutoSelectionContextSnapshot(for: target)?.acceptedIntentCount ?? 0
+            var arguments: [String: Any] = ["path": path]
+            if let startLine { arguments["start_line"] = startLine }
+            if let limit { arguments["limit"] = limit }
+            let response = try await fixture.socketClient.request(
+                id: id,
+                method: "tools/call",
+                params: ["name": MCPWindowToolName.readFile, "arguments": arguments]
+            )
+            let text = try Self.readFileText(from: response, id: id)
+            let intentAccepted = await waitForReadFileAutoSelectionAcceptedCount(
+                fixture: fixture,
+                target: target,
+                minimum: acceptedBeforeRead + 1
+            )
+            XCTAssertTrue(intentAccepted, "Read-file auto-selection intent was not accepted")
+            return text
+        }
+
+        func waitForReadFileAutoSelectionAcceptedCount(
+            fixture: Fixture,
+            target: MCPServerViewModel.DebugReadFileAutoSelectionTarget,
+            minimum: UInt64
+        ) async -> Bool {
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline {
+                let accepted = fixture.window.mcpServer
+                    .debugReadFileAutoSelectionContextSnapshot(for: target)?.acceptedIntentCount ?? 0
+                if accepted >= minimum { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            let accepted = fixture.window.mcpServer
+                .debugReadFileAutoSelectionContextSnapshot(for: target)?.acceptedIntentCount ?? 0
+            return accepted >= minimum
         }
 
         func assertAgentOwnedSequentialReadUnion(fixture: Fixture) async throws {
@@ -396,7 +910,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertTrue(slicedText.contains("**Lines**: 2–3"), slicedText)
             let finalSettled = await waitForReadFileAutoSelectionToSettle(fixture: fixture)
             XCTAssertTrue(finalSettled, "Cumulative read auto-selection did not converge without manage_selection get")
-
             let expectedPaths = [fixture.fileURL.path, fixture.liveFileURL.path]
             let expectedSlices = [fixture.liveFileURL.path: [LineRange(start: 2, end: 3)]]
             assertCanonicalSelection(
@@ -1334,6 +1847,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(response, id: id)
         }
 
+        func assertReadFileAutoSelectionSettled(fixture: Fixture) async {
+            let settled = await waitForReadFileAutoSelectionToSettle(fixture: fixture)
+            XCTAssertTrue(settled, "Read-file auto-selection did not settle")
+        }
+
         func waitForReadFileAutoSelectionToSettle(fixture: Fixture) async -> Bool {
             let deadline = ContinuousClock.now + .seconds(3)
             while ContinuousClock.now < deadline {
@@ -1483,6 +2001,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             return content.compactMap { $0["text"] as? String }.joined()
         }
 
+        static func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
+            let text = result.content.compactMap { content -> String? in
+                if case let .text(text, _, _) = content { return text }
+                return nil
+            }.joined()
+            let data = try XCTUnwrap(text.data(using: .utf8))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
         static func responseObject(from rawJSON: String, id: Int) throws -> [String: Any] {
             let data = try XCTUnwrap(rawJSON.data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -1580,6 +2107,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let persistentAgentModeLineThree = 3
         let persistentAgentModeLineFour = 4
         """
+        static let replacementWorktreeSentinelContent = """
+        let persistentAgentModeCheckpoint = "replacement-physical-worktree-read"
+        let persistentAgentModeReplacementLineTwo = 22
+        """
         static let liveRelativePath = "Tests/RepoPromptTests/MCP/GeneratedOracleExportFileWriterTests.swift"
         static let worktreeOnlyRelativePath = "Tests/RepoPromptTests/MCP/WorktreeOnlySelection.swift"
         static func liveContents() throws -> (logical: String, worktree: String) {
@@ -1612,6 +2143,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let agentOwned: Bool
         private var worktreeRootURL: URL?
         private var worktreeRootID: UUID?
+        private var retiredWorktreeRootURLs: [URL] = []
+        private var retiredWorktreeRootIDs: [UUID] = []
+        private var worktreeBinding: AgentSessionWorktreeBinding?
         private var auxiliaryRootURL: URL?
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
@@ -1953,10 +2487,162 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 head: "54410152deac877f8a3422344da97da37eba47e7",
                 source: "test"
             )
+            worktreeBinding = binding
+            installWorktreeBindingProvider(binding)
+        }
+
+        private func installWorktreeBindingProvider(_ binding: AgentSessionWorktreeBinding) {
             window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
                 guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
                 return .hydrated([binding])
             }
+        }
+
+        var worktreeFileURL: URL {
+            get throws {
+                try XCTUnwrap(worktreeRootURL).appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
+            }
+        }
+
+        var worktreeLiveFileURL: URL {
+            get throws {
+                try XCTUnwrap(worktreeRootURL).appendingPathComponent(Self.liveRelativePath)
+            }
+        }
+
+        func readFileAutoSelectionContextKey() throws -> MCPReadFileAutoSelectionCoordinator.ContextKey {
+            let context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[Self.connectionID])
+            return MCPReadFileAutoSelectionCoordinator.ContextKey(
+                windowID: context.windowID,
+                workspaceID: context.workspaceID,
+                tabID: context.tabID,
+                route: .bound(connectionID: Self.connectionID, runID: context.runID),
+                bindingGeneration: context.readFileAutoSelectionGeneration
+            )
+        }
+
+        func readFileAutoSelectionTarget() throws -> MCPServerViewModel.DebugReadFileAutoSelectionTarget {
+            let targets = window.mcpServer.debugResolveReadFileAutoSelectionTargets(
+                targetConnectionID: Self.connectionID,
+                agentSessionID: nil,
+                tabID: nil,
+                expectedRunID: Self.runID
+            )
+            XCTAssertEqual(targets.count, 1)
+            return try XCTUnwrap(targets.first)
+        }
+
+        func readFileAutoSelectionContextSnapshot() throws -> MCPReadFileAutoSelectionCoordinator.DebugContextSnapshot {
+            let target = try readFileAutoSelectionTarget()
+            return try XCTUnwrap(window.mcpServer.debugReadFileAutoSelectionContextSnapshot(for: target))
+        }
+
+        func readFileAutoSelectionCoverageCertificate() throws -> ReadFileAutoSelectionCoverageCertificate? {
+            let target = try readFileAutoSelectionTarget()
+            return window.mcpServer.debugReadFileAutoSelectionCoverageCertificate(for: target)
+        }
+
+        func replaceReadFileAutoSelectionCertificate(
+            _ transform: (ReadFileAutoSelectionCoverageCertificate) -> ReadFileAutoSelectionCoverageCertificate
+        ) throws {
+            let key = try readFileAutoSelectionContextKey()
+            let certificate = try XCTUnwrap(window.mcpServer.readFileAutoSelectionCoverageCertificates[key])
+            window.mcpServer.readFileAutoSelectionCoverageCertificates[key] = transform(certificate)
+        }
+
+        func replaceWorktreeBindingCheckoutMetadata() throws {
+            let current = try XCTUnwrap(worktreeBinding)
+            let replacement = current.updatingCheckout(
+                branch: "test/rebound-coverage-certificate",
+                head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            worktreeBinding = replacement
+            installWorktreeBindingProvider(replacement)
+            guard var context = window.mcpServer.tabContextByConnectionID[Self.connectionID] else {
+                return XCTFail("Missing bound context")
+            }
+            context.worktreeBindingState = .hydrated([replacement])
+            window.mcpServer.tabContextByConnectionID[Self.connectionID] = context
+        }
+
+        func rebindToReplacementPhysicalWorktree() async throws {
+            if let worktreeRootURL {
+                retiredWorktreeRootURLs.append(worktreeRootURL)
+            }
+            if let worktreeRootID {
+                retiredWorktreeRootIDs.append(worktreeRootID)
+            }
+
+            let replacementRootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests-Worktree-B", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let replacementFileURL = replacementRootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
+            let replacementLiveFileURL = replacementRootURL.appendingPathComponent(Self.liveRelativePath)
+            let replacementWorktreeOnlyFileURL = replacementRootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
+            try FileManager.default.createDirectory(
+                at: replacementFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: replacementLiveFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: replacementWorktreeOnlyFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let liveContents = try Self.liveContents()
+            try Self.replacementWorktreeSentinelContent.write(
+                to: replacementFileURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            try liveContents.worktree.write(to: replacementLiveFileURL, atomically: true, encoding: .utf8)
+            try "let replacementWorktreeOnlySelection = true\n".write(
+                to: replacementWorktreeOnlyFileURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            let replacementRoot = try await window.workspaceFileContextStore.loadRoot(
+                path: replacementRootURL.path,
+                kind: .sessionWorktree
+            )
+            worktreeRootURL = replacementRootURL
+            worktreeRootID = replacementRoot.id
+
+            let replacementBinding = AgentSessionWorktreeBinding(
+                id: "persistent-read-worktree-binding-b",
+                repositoryID: "persistent-read-repository",
+                repoKey: "persistent-read-repo-key",
+                logicalRootPath: rootURL.path,
+                logicalRootName: rootURL.lastPathComponent,
+                worktreeID: "persistent-read-worktree-b",
+                worktreeRootPath: replacementRootURL.path,
+                worktreeName: replacementRootURL.lastPathComponent,
+                branch: "test/replacement-physical-worktree",
+                head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                source: "test"
+            )
+            worktreeBinding = replacementBinding
+            installWorktreeBindingProvider(replacementBinding)
+            try rebindCurrentConnection()
+        }
+
+        func removeWorktreeDirectory() throws {
+            let root = try XCTUnwrap(worktreeRootURL)
+            try FileManager.default.removeItem(at: root)
+        }
+
+        func rebindCurrentConnection() throws {
+            try window.mcpServer.bindTabForConnection(
+                connectionID: Self.connectionID,
+                clientName: AgentProviderKind.codexMCPClientID,
+                tabID: Self.tabID,
+                workspaceID: workspaceID,
+                windowID: windowID,
+                runID: Self.runID,
+                explicitlyBound: false
+            )
         }
 
         func installPeerWindowLookupSnapshot() async throws {
@@ -2402,6 +3088,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if let worktreeRootID {
                 await window.workspaceFileContextStore.unloadRoot(id: worktreeRootID)
             }
+            for retiredWorktreeRootID in retiredWorktreeRootIDs {
+                await window.workspaceFileContextStore.unloadRoot(id: retiredWorktreeRootID)
+            }
             if let auxiliaryRootID {
                 await window.workspaceFileContextStore.unloadRoot(id: auxiliaryRootID)
             }
@@ -2410,6 +3099,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try? FileManager.default.removeItem(at: rootURL)
             if let worktreeRootURL {
                 try? FileManager.default.removeItem(at: worktreeRootURL)
+            }
+            for retiredWorktreeRootURL in retiredWorktreeRootURLs {
+                try? FileManager.default.removeItem(at: retiredWorktreeRootURL)
             }
             if let auxiliaryRootURL {
                 try? FileManager.default.removeItem(at: auxiliaryRootURL)

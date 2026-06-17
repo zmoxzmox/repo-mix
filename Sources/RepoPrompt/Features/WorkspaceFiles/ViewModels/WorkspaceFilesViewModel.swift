@@ -676,6 +676,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
     private var sliceRebaseTasksByFullPath: [String: Task<Void, Never>] = [:]
     private var sliceRebaseTaskIDsByFullPath: [String: UUID] = [:]
+    private var sliceRebaseRegistrationGenerationByFullPath: [String: UInt64] = [:]
     /// Monotonic revision incremented for any partition save seen in the current workspace.
     /// Used to avoid re-checking files already confirmed as "no slices" until new saves occur.
     private var partitionSliceSaveRevision: UInt64 = 0
@@ -12015,29 +12016,41 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
+    private func registerSliceRebaseTask(
+        fullPath: String,
+        operation: @escaping @MainActor (UUID) async -> Void
+    ) {
+        sliceRebaseTasksByFullPath[fullPath]?.cancel()
+
+        let taskID = UUID()
+        sliceRebaseTaskIDsByFullPath[fullPath] = taskID
+        sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] &+= 1
+
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if let self,
+                   self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID
+                {
+                    self.sliceRebaseTasksByFullPath.removeValue(forKey: fullPath)
+                    self.sliceRebaseTaskIDsByFullPath.removeValue(forKey: fullPath)
+                }
+            }
+            await operation(taskID)
+        }
+        sliceRebaseTasksByFullPath[fullPath] = task
+    }
+
+    @MainActor
     private func scheduleSliceRebaseForModifiedFile(
         _ file: FileViewModel,
         relativePath: String
     ) {
         let fullPath = file.standardizedFullPath
         guard shouldScheduleSliceRebase(for: file, fullPath: fullPath) else { return }
-        sliceRebaseTasksByFullPath[fullPath]?.cancel()
 
-        let taskID = UUID()
-        sliceRebaseTaskIDsByFullPath[fullPath] = taskID
-
-        let task = Task { [weak self] in
-            defer {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    guard self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
-                    self.sliceRebaseTasksByFullPath.removeValue(forKey: fullPath)
-                    self.sliceRebaseTaskIDsByFullPath.removeValue(forKey: fullPath)
-                }
-            }
+        registerSliceRebaseTask(fullPath: fullPath) { [weak self, weak file] taskID in
             try? await Task.sleep(nanoseconds: 300_000_000)
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
+            guard let self, let file, !Task.isCancelled else { return }
             let hasSlices = await hasAnySlicesForFile(file)
             guard !Task.isCancelled else { return }
             guard sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
@@ -12052,9 +12065,20 @@ extension WorkspaceFilesViewModel {
                 expectedTaskID: taskID
             )
         }
-
-        sliceRebaseTasksByFullPath[fullPath] = task
     }
+
+    #if DEBUG
+        @MainActor
+        func debugRegisterSliceRebaseTask(
+            fullPath: String,
+            operation: @escaping @MainActor () async -> Void
+        ) {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath) else { return }
+            registerSliceRebaseTask(fullPath: standardizedFullPath) { _ in
+                await operation()
+            }
+        }
+    #endif
 
     /// Waits for pending slice-rebase tasks that affect currently selected files.
     /// Used by selection/reporting paths so line-range metadata reflects post-edit rebases.
@@ -12064,50 +12088,75 @@ extension WorkspaceFilesViewModel {
         await waitForPendingSliceRebases(affectingFullPaths: selectedFullPaths)
     }
 
-    /// Waits for pending slice-rebase tasks affecting candidate file paths.
-    /// Candidates can be absolute full paths or relative paths.
+    /// Waits for currently pending slice-rebase work, then captures the exact path set whose
+    /// quiescence must be revalidated before authoritative selection verification completes.
     @MainActor
-    func waitForPendingSliceRebases(affectingCandidatePaths candidatePaths: [String]) async {
-        let fullPaths = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
-        await waitForPendingSliceRebases(affectingFullPaths: fullPaths)
+    func waitForPendingSliceRebasesAndCaptureFence(
+        affectingCandidatePaths candidatePaths: [String]
+    ) async -> WorkspaceSliceRebaseFence {
+        let normalized = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
+        await waitForPendingSliceRebases(affectingFullPaths: normalized.fullPaths)
+        return WorkspaceSliceRebaseFence(
+            registrationGenerationsByFullPath: Dictionary(uniqueKeysWithValues: normalized.fullPaths.map {
+                ($0, sliceRebaseRegistrationGenerationByFullPath[$0, default: 0])
+            }),
+            unresolvedCandidatePaths: normalized.unresolved
+        )
+    }
+
+    @MainActor
+    func isSliceRebaseFenceCurrent(_ fence: WorkspaceSliceRebaseFence) -> Bool {
+        guard fence.unresolvedCandidatePaths.isEmpty else { return false }
+        return fence.registrationGenerationsByFullPath.allSatisfy { fullPath, capturedGeneration in
+            sliceRebaseTasksByFullPath[fullPath] == nil
+                && sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] == capturedGeneration
+        }
     }
 
     @MainActor
     private func waitForPendingSliceRebases(affectingFullPaths fullPaths: Set<String>) async {
         guard !fullPaths.isEmpty else { return }
-        let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
-            fullPaths.contains(path) ? task : nil
-        }
-        guard !pending.isEmpty else { return }
+        for _ in 0 ..< 3 {
+            let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
+                fullPaths.contains(path) ? task : nil
+            }
+            guard !pending.isEmpty else { return }
 
-        for task in pending {
-            await task.value
+            for task in pending {
+                await task.value
+            }
+            await Task.yield()
         }
     }
 
     @MainActor
-    private func normalizedFullPathsForSliceRebaseWait(from candidatePaths: [String]) -> Set<String> {
-        var result: Set<String> = []
+    private func normalizedFullPathsForSliceRebaseWait(
+        from candidatePaths: [String]
+    ) -> (fullPaths: Set<String>, unresolved: Set<String>) {
+        var fullPaths: Set<String> = []
+        var unresolved: Set<String> = []
         for raw in candidatePaths {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let standardized = (trimmed as NSString).standardizingPath
 
             if standardized.hasPrefix("/") {
-                result.insert(standardized)
+                fullPaths.insert(standardized)
                 continue
             }
 
             if let file = findFileByRelativePath(standardized) {
-                result.insert(file.standardizedFullPath)
+                fullPaths.insert(file.standardizedFullPath)
                 continue
             }
 
             if let full = findFullPath(for: standardized) {
-                result.insert((full as NSString).standardizingPath)
+                fullPaths.insert((full as NSString).standardizingPath)
+            } else {
+                unresolved.insert(standardized)
             }
         }
-        return result
+        return (fullPaths, unresolved)
     }
 
     @MainActor

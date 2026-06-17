@@ -175,6 +175,12 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_file_auto_selection_probe_drain` is only available in DEBUG builds.")
                 #endif
+            case "mcp_read_file_auto_selection_probe_cancel":
+                #if DEBUG
+                    return await debugMCPReadFileAutoSelectionProbeCancelPayload(op: op, arguments: arguments)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_file_auto_selection_probe_cancel` is only available in DEBUG builds.")
+                #endif
             case "bootstrap_diagnostics":
                 return await debugBootstrapDiagnosticsPayload(op: op)
             case "sparkle_status":

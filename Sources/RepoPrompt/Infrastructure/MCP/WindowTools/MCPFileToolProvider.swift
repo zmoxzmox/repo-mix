@@ -371,7 +371,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
         ) {
             if readResult.shouldAutoSelect {
-                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
+                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, resolvedPath, metadata)
             }
         }
         try Task.checkCancellation()

@@ -4252,33 +4252,42 @@ class WorkspaceManagerViewModel: ObservableObject {
     ) async {
         guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath),
               let workspaceID = activeWorkspaceID,
-              let wi = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+              let workspace = workspaces.first(where: { $0.id == workspaceID }) else { return }
 
-        let tabs = workspaces[wi].composeTabs
-        guard !tabs.isEmpty else { return }
+        let tabIDs = workspace.composeTabs.map(\.id)
+        for tabID in tabIDs {
+            let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+            for _ in 0 ..< 3 {
+                guard let currentTab = composeTab(for: identity),
+                      !currentTab.selection.slices.isEmpty
+                else { break }
+                let currentSlices = StoredSelectionPathNormalization.standardizedSlices(currentTab.selection.slices)
+                guard let currentRanges = currentSlices[standardizedFullPath] else { break }
 
-        for var tab in tabs {
-            guard !tab.selection.slices.isEmpty else { continue }
-            let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
-            guard let existingRanges = normalizedSlices[standardizedFullPath] else { continue }
+                let nextRanges = await SliceRangeMath.normalize(asyncTransform(currentRanges))
+                guard var latestTab = composeTab(for: identity) else { break }
+                let latestSlices = StoredSelectionPathNormalization.standardizedSlices(latestTab.selection.slices)
+                guard let latestRanges = latestSlices[standardizedFullPath] else { break }
+                guard latestRanges == currentRanges else { continue }
 
-            let nextRanges = await SliceRangeMath.normalize(asyncTransform(existingRanges))
-            var nextSlices = normalizedSlices
-            if nextRanges.isEmpty {
-                nextSlices.removeValue(forKey: standardizedFullPath)
-            } else {
-                nextSlices[standardizedFullPath] = nextRanges
+                var nextSlices = latestSlices
+                if nextRanges.isEmpty {
+                    nextSlices.removeValue(forKey: standardizedFullPath)
+                } else {
+                    nextSlices[standardizedFullPath] = nextRanges
+                }
+                guard nextSlices != latestTab.selection.slices else { break }
+
+                latestTab.selection = StoredSelection(
+                    selectedPaths: latestTab.selection.selectedPaths,
+                    autoCodemapPaths: latestTab.selection.autoCodemapPaths,
+                    slices: nextSlices,
+                    codemapAutoEnabled: latestTab.selection.codemapAutoEnabled
+                )
+                latestTab.lastModified = Date()
+                _ = updateComposeTabStoredOnly(latestTab, inWorkspaceID: workspaceID)
+                break
             }
-            guard nextSlices != tab.selection.slices else { continue }
-
-            tab.selection = StoredSelection(
-                selectedPaths: tab.selection.selectedPaths,
-                autoCodemapPaths: tab.selection.autoCodemapPaths,
-                slices: nextSlices,
-                codemapAutoEnabled: tab.selection.codemapAutoEnabled
-            )
-            tab.lastModified = Date()
-            updateComposeTabStoredOnly(tab)
         }
     }
 

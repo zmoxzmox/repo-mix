@@ -53,20 +53,178 @@ final class MCPReadFileAutoSelectionCoordinator {
         case slices(entries: [WorkspaceSelectionSliceInput])
     }
 
+    /// Exact normalized physical coverage requested by one complete canonical batch.
+    /// Logical/display paths remain in `Intent`; this identity is carried separately so
+    /// equivalent ordering/coalescing compares equal without ever projecting the fast path.
+    struct CoverageIdentity: Hashable {
+        struct Slice: Hashable {
+            let path: String
+            let ranges: [LineRange]
+        }
+
+        let fullPaths: [String]
+        let slices: [Slice]
+
+        init?(intent: Intent, resolvedPaths: [String]) {
+            var fullPathKeys = Set<String>()
+            var rangesByPath: [String: [LineRange]] = [:]
+
+            switch intent {
+            case let .full(paths):
+                guard paths.count == resolvedPaths.count else { return nil }
+                for resolvedPath in resolvedPaths {
+                    guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
+                    fullPathKeys.insert(path)
+                }
+            case let .slices(entries):
+                guard entries.count == resolvedPaths.count else { return nil }
+                for (entry, resolvedPath) in zip(entries, resolvedPaths) {
+                    guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
+                    let ranges = SliceRangeMath.normalize(entry.ranges).map {
+                        LineRange(start: $0.start, end: $0.end)
+                    }
+                    guard !ranges.isEmpty else { return nil }
+                    rangesByPath[path, default: []].append(contentsOf: ranges)
+                }
+            }
+
+            self.init(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+        }
+
+        private init(fullPathKeys: Set<String>, rangesByPath: [String: [LineRange]]) {
+            fullPaths = fullPathKeys.sorted()
+            slices = rangesByPath.keys
+                .filter { !fullPathKeys.contains($0) }
+                .sorted()
+                .compactMap { path in
+                    let ranges = SliceRangeMath.normalize(rangesByPath[path] ?? []).map {
+                        LineRange(start: $0.start, end: $0.end)
+                    }
+                    return ranges.isEmpty ? nil : Slice(path: path, ranges: ranges)
+                }
+        }
+
+        func merging(_ other: CoverageIdentity) -> CoverageIdentity {
+            var fullPathKeys = Set(fullPaths)
+            fullPathKeys.formUnion(other.fullPaths)
+            var rangesByPath = Dictionary(uniqueKeysWithValues: slices.map { ($0.path, $0.ranges) })
+            for slice in other.slices {
+                rangesByPath[slice.path, default: []].append(contentsOf: slice.ranges)
+            }
+            return CoverageIdentity(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+        }
+
+        func isCovered(by physicalSelection: StoredSelection) -> Bool {
+            let selectedPathKeys = Set(StoredSelectionPathNormalization.standardizedPaths(physicalSelection.selectedPaths))
+            let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(physicalSelection.slices)
+
+            for path in fullPaths {
+                guard selectedPathKeys.contains(path), normalizedSlices[path]?.isEmpty != false else { return false }
+            }
+            for slice in slices {
+                guard selectedPathKeys.contains(slice.path) else { return false }
+                guard normalizedSlices[slice.path]?.isEmpty != false || Self.ranges(slice.ranges, areCoveredBy: normalizedSlices[slice.path] ?? []) else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        private static func ranges(_ requested: [LineRange], areCoveredBy selected: [LineRange]) -> Bool {
+            let selected = SliceRangeMath.normalize(selected)
+            return requested.allSatisfy { request in
+                selected.contains { $0.start <= request.start && $0.end >= request.end }
+            }
+        }
+
+        private static func normalizedPhysicalPath(_ rawPath: String) -> String? {
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/") else { return nil }
+            return StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
+        }
+    }
+
+    static func authoritativeSelection(
+        _ expected: StoredSelection,
+        isPreservedBy candidate: StoredSelection
+    ) -> Bool {
+        let expectedSelectedPaths = Set(StoredSelectionPathNormalization.standardizedPaths(expected.selectedPaths))
+        let candidateSelectedPaths = Set(StoredSelectionPathNormalization.standardizedPaths(candidate.selectedPaths))
+        guard expectedSelectedPaths.isSubset(of: candidateSelectedPaths) else { return false }
+
+        let expectedAutoCodemapPaths = Set(StoredSelectionPathNormalization.standardizedPaths(expected.autoCodemapPaths))
+        let candidateAutoCodemapPaths = Set(StoredSelectionPathNormalization.standardizedPaths(candidate.autoCodemapPaths))
+        guard expectedAutoCodemapPaths.isSubset(of: candidateAutoCodemapPaths),
+              expected.codemapAutoEnabled == candidate.codemapAutoEnabled
+        else { return false }
+
+        let expectedSlices = StoredSelectionPathNormalization.standardizedSlices(expected.slices).mapValues {
+            SliceRangeMath.normalize($0)
+        }
+        let candidateSlices = StoredSelectionPathNormalization.standardizedSlices(candidate.slices).mapValues {
+            SliceRangeMath.normalize($0)
+        }
+
+        for path in expectedSelectedPaths {
+            let expectedRanges = expectedSlices[path] ?? []
+            let candidateRanges = candidateSlices[path] ?? []
+            if expectedRanges.isEmpty {
+                guard candidateRanges.isEmpty else { return false }
+            } else if !candidateRanges.isEmpty {
+                guard ranges(expectedRanges, areCoveredBy: candidateRanges) else { return false }
+            }
+        }
+
+        for (path, expectedRanges) in expectedSlices where !expectedRanges.isEmpty {
+            guard candidateSelectedPaths.contains(path) else { return false }
+            let candidateRanges = candidateSlices[path] ?? []
+            if !candidateRanges.isEmpty,
+               !ranges(expectedRanges, areCoveredBy: candidateRanges)
+            {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func ranges(_ expected: [LineRange], areCoveredBy candidate: [LineRange]) -> Bool {
+        let candidate = SliceRangeMath.normalize(candidate)
+        return SliceRangeMath.normalize(expected).allSatisfy { expectedRange in
+            candidate.contains { $0.start <= expectedRange.start && $0.end >= expectedRange.end }
+        }
+    }
+
+    enum CoverageCertificateOutcome: Equatable {
+        case hit
+        case authoritativeFallback(ReadFileAutoSelectionCoverageCertificateMissReason)
+    }
+
     struct CanonicalBatch: Equatable {
         private(set) var fullPaths: [String] = []
         private(set) var sliceEntries: [WorkspaceSelectionSliceInput] = []
+        private(set) var coverageIdentity: CoverageIdentity?
 
         private var fullPathKeys = Set<String>()
         private var slicePathOrder: [String] = []
         private var sliceRangesByPath: [String: [LineRange]] = [:]
         private var originalSlicePathByKey: [String: String] = [:]
+        private var coveragePermitted: Bool
 
-        init(intent: Intent) {
-            merge(intent)
+        init(intent: Intent, coverageIdentity: CoverageIdentity? = nil) {
+            self.coverageIdentity = nil
+            coveragePermitted = coverageIdentity != nil
+            merge(intent, coverageIdentity: coverageIdentity)
         }
 
-        mutating func merge(_ intent: Intent) {
+        mutating func merge(_ intent: Intent, coverageIdentity incomingCoverageIdentity: CoverageIdentity? = nil) {
+            if coveragePermitted {
+                if let incomingCoverageIdentity {
+                    coverageIdentity = coverageIdentity?.merging(incomingCoverageIdentity) ?? incomingCoverageIdentity
+                } else {
+                    coveragePermitted = false
+                    coverageIdentity = nil
+                }
+            }
             switch intent {
             case let .full(paths):
                 for rawPath in paths {
@@ -121,13 +279,16 @@ final class MCPReadFileAutoSelectionCoordinator {
 
         let mirrorKey: TabMirrorKey?
         let disposition: Disposition
+        let coverageCertificateOutcome: CoverageCertificateOutcome?
 
         init(
             mirrorKey: TabMirrorKey?,
-            disposition: Disposition? = nil
+            disposition: Disposition? = nil,
+            coverageCertificateOutcome: CoverageCertificateOutcome? = nil
         ) {
             self.mirrorKey = mirrorKey
             self.disposition = disposition ?? (mirrorKey == nil ? .semanticNoOp : .changed)
+            self.coverageCertificateOutcome = coverageCertificateOutcome
         }
 
         static let unchanged = CanonicalApplyResult(mirrorKey: nil, disposition: .semanticNoOp)
@@ -148,6 +309,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             let outcome: DebugCanonicalApplyOutcome
             let acceptedIntentCount: UInt64
             let completedHighWaterSequence: UInt64
+            let coverageCertificateOutcome: CoverageCertificateOutcome?
         }
 
         struct DebugContextSnapshot: Equatable {
@@ -163,6 +325,9 @@ final class MCPReadFileAutoSelectionCoordinator {
             let semanticNoOpIntentCount: UInt64
             let rejectedIntentCount: UInt64
             let invalidatedIntentCount: UInt64
+            let coverageCertificateHitCount: UInt64
+            let authoritativeFallbackCount: UInt64
+            let coverageCertificateMissReasonCounts: [ReadFileAutoSelectionCoverageCertificateMissReason: UInt64]
             let mutationTotalMilliseconds: Double
             let mutationSamples: [DebugCanonicalApplySample]
             let sampleOverflowCount: UInt64
@@ -268,6 +433,9 @@ final class MCPReadFileAutoSelectionCoordinator {
             var semanticNoOpIntentCount: UInt64 = 0
             var rejectedIntentCount: UInt64 = 0
             var invalidatedIntentCount: UInt64 = 0
+            var coverageCertificateHitCount: UInt64 = 0
+            var authoritativeFallbackCount: UInt64 = 0
+            var coverageCertificateMissReasonCounts: [ReadFileAutoSelectionCoverageCertificateMissReason: UInt64] = [:]
             var mutationTotalMilliseconds: Double = 0
             var nextSampleOrdinal: UInt64 = 0
             var mutationSamples: [DebugCanonicalApplySample] = []
@@ -292,6 +460,7 @@ final class MCPReadFileAutoSelectionCoordinator {
     @discardableResult
     func enqueue(
         intent: Intent,
+        coverageIdentity: CoverageIdentity? = nil,
         for key: ContextKey,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = EditFlowPerf.currentLifecycleCorrelation
     ) -> Bool {
@@ -319,7 +488,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         let previousAcceptedSequence = lane.acceptedSequence
         lane.acceptedSequence = sequence
         if var pending = lane.pending {
-            pending.batch.merge(intent)
+            pending.batch.merge(intent, coverageIdentity: coverageIdentity)
             pending.highestSequence = sequence
             pending.acceptedIntentCount &+= 1
             pending.lifecycleCorrelation = lifecycleCorrelation ?? pending.lifecycleCorrelation
@@ -332,7 +501,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             )
         } else {
             lane.pending = QueuedCanonicalBatch(
-                batch: CanonicalBatch(intent: intent),
+                batch: CanonicalBatch(intent: intent, coverageIdentity: coverageIdentity),
                 lowestSequence: sequence,
                 highestSequence: sequence,
                 acceptedIntentCount: 1,
@@ -469,6 +638,9 @@ final class MCPReadFileAutoSelectionCoordinator {
                 semanticNoOpIntentCount: accounting.semanticNoOpIntentCount,
                 rejectedIntentCount: accounting.rejectedIntentCount,
                 invalidatedIntentCount: accounting.invalidatedIntentCount,
+                coverageCertificateHitCount: accounting.coverageCertificateHitCount,
+                authoritativeFallbackCount: accounting.authoritativeFallbackCount,
+                coverageCertificateMissReasonCounts: accounting.coverageCertificateMissReasonCounts,
                 mutationTotalMilliseconds: accounting.mutationTotalMilliseconds,
                 mutationSamples: accounting.mutationSamples,
                 sampleOverflowCount: accounting.sampleOverflowCount,
@@ -543,6 +715,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             #if DEBUG
                 var debugApplyOutcome: DebugCanonicalApplyOutcome?
                 var debugMutationDurationMilliseconds: Double?
+                var debugCoverageCertificateOutcome: CoverageCertificateOutcome?
             #endif
             if !invalidatedContexts.contains(key), isContextCurrent(key) {
                 #if DEBUG
@@ -569,6 +742,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                         debugMutationDurationMilliseconds = Self.debugMilliseconds(
                             debugMutationStartedAt.duration(to: debugMutationClock.now)
                         )
+                        debugCoverageCertificateOutcome = result.coverageCertificateOutcome
                     #endif
                     if !invalidatedContexts.contains(key), isContextCurrent(key) {
                         switch result.disposition {
@@ -613,7 +787,8 @@ final class MCPReadFileAutoSelectionCoordinator {
                         outcome: debugApplyOutcome,
                         acceptedIntentCount: queued.acceptedIntentCount,
                         durationMilliseconds: debugMutationDurationMilliseconds,
-                        completedHighWaterSequence: queued.highestSequence
+                        completedHighWaterSequence: queued.highestSequence,
+                        coverageCertificateOutcome: debugCoverageCertificateOutcome
                     )
                 } else {
                     debugAccountingByContext[key, default: DebugContextAccounting()].invalidatedIntentCount &+= queued.acceptedIntentCount
@@ -671,7 +846,8 @@ final class MCPReadFileAutoSelectionCoordinator {
             outcome: DebugCanonicalApplyOutcome,
             acceptedIntentCount: UInt64,
             durationMilliseconds: Double,
-            completedHighWaterSequence: UInt64
+            completedHighWaterSequence: UInt64,
+            coverageCertificateOutcome: CoverageCertificateOutcome?
         ) {
             var accounting = debugAccountingByContext[key] ?? DebugContextAccounting()
             accounting.canonicalApplyAttemptCount &+= 1
@@ -689,6 +865,15 @@ final class MCPReadFileAutoSelectionCoordinator {
                 accounting.rejectedApplyCount &+= 1
                 accounting.invalidatedIntentCount &+= acceptedIntentCount
             }
+            switch coverageCertificateOutcome {
+            case .hit:
+                accounting.coverageCertificateHitCount &+= 1
+            case let .authoritativeFallback(reason):
+                accounting.authoritativeFallbackCount &+= 1
+                accounting.coverageCertificateMissReasonCounts[reason, default: 0] &+= 1
+            case nil:
+                break
+            }
             accounting.mutationTotalMilliseconds += durationMilliseconds
             accounting.nextSampleOrdinal &+= 1
             let sample = DebugCanonicalApplySample(
@@ -696,7 +881,8 @@ final class MCPReadFileAutoSelectionCoordinator {
                 durationMilliseconds: durationMilliseconds,
                 outcome: outcome,
                 acceptedIntentCount: acceptedIntentCount,
-                completedHighWaterSequence: completedHighWaterSequence
+                completedHighWaterSequence: completedHighWaterSequence,
+                coverageCertificateOutcome: coverageCertificateOutcome
             )
             if accounting.mutationSamples.count == Self.debugMutationSampleLimit {
                 accounting.mutationSamples.removeFirst()

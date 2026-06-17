@@ -201,7 +201,8 @@ struct WorkspaceRootBindingProjection: Equatable {
     func logicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         var slices: [String: [LineRange]] = [:]
         for (path, ranges) in selection.slices {
-            slices[logicalDisplayPath(forPhysicalPath: path, display: .full)] = ranges
+            let logicalPath = logicalDisplayPath(forPhysicalPath: path, display: .full)
+            slices[logicalPath] = SliceRangeMath.normalize((slices[logicalPath] ?? []) + ranges)
         }
         return StoredSelection(
             selectedPaths: selection.selectedPaths.map { logicalDisplayPath(forPhysicalPath: $0, display: .full) },
@@ -214,7 +215,8 @@ struct WorkspaceRootBindingProjection: Equatable {
     func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         var slices: [String: [LineRange]] = [:]
         for (path, ranges) in selection.slices {
-            slices[translateInputPath(path)] = ranges
+            let physicalPath = translateInputPath(path)
+            slices[physicalPath] = SliceRangeMath.normalize((slices[physicalPath] ?? []) + ranges)
         }
         return StoredSelection(
             selectedPaths: selection.selectedPaths.map { translateInputPath($0) },

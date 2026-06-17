@@ -226,6 +226,25 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             persistedSelection.slices["/repo/project/Sources/Sliced.swift"],
             [LineRange(start: 3, end: 9)]
         )
+
+        let mixedAliasSelection = StoredSelection(
+            selectedPaths: [
+                "/repo/project/Sources/Sliced.swift",
+                "/tmp/worktrees/project-agent/Sources/Sliced.swift"
+            ],
+            slices: [
+                "/repo/project/Sources/Sliced.swift": [LineRange(start: 1, end: 20)],
+                "/tmp/worktrees/project-agent/Sources/Sliced.swift": [LineRange(start: 5, end: 25)]
+            ]
+        )
+        XCTAssertEqual(
+            projection.logicalizeSelection(mixedAliasSelection).slices["/repo/project/Sources/Sliced.swift"],
+            [LineRange(start: 1, end: 25)]
+        )
+        XCTAssertEqual(
+            projection.physicalizeSelection(mixedAliasSelection).slices["/tmp/worktrees/project-agent/Sources/Sliced.swift"],
+            [LineRange(start: 1, end: 25)]
+        )
     }
 
     func testMaterializerFailsClosedWhenPhysicalRootCannotBeLoaded() async throws {

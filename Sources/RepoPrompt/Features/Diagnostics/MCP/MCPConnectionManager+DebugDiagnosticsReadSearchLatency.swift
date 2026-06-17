@@ -71,6 +71,24 @@ import RepoPromptShared
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "Connection, session, tab, and run identifiers must be UUID strings when provided.")
             }
 
+            let forceAuthoritative = debugBool(arguments, "force_authoritative") ?? false
+            let expiryMilliseconds: Int
+            switch debugBoundedInt(
+                arguments,
+                "expiry_ms",
+                defaultValue: 30 * 60 * 1000,
+                range: 100 ... 30 * 60 * 1000
+            ) {
+            case let .value(parsed), let .defaulted(parsed):
+                expiryMilliseconds = parsed
+            case .invalid:
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "invalid_params",
+                    message: "`expiry_ms` must be an integer between 100 and 1800000."
+                )
+            }
+
             let usesConnectionTarget = targetConnectionID != nil
             let usesSessionTarget = agentSessionID != nil || tabID != nil
             guard usesConnectionTarget != usesSessionTarget,
@@ -113,25 +131,71 @@ import RepoPromptShared
                         : "Multiple current bound read-file auto-selection contexts matched the requested identity."
                 )
             }
+            let probeID = UUID()
+            let createdAt = Date()
+            guard let reservation = await MCPReadFileAutoSelectionProbeRegistry.shared.reserve(
+                probeID: probeID,
+                createdAt: createdAt
+            ) else {
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "probe_capacity",
+                    message: "The DEBUG read-file auto-selection probe registry is at its 16-probe capacity."
+                )
+            }
             guard let baseline = await MainActor.run(body: {
                 WindowStatesManager.shared.allWindows
-                    .first(where: { $0.windowID == windowID && ObjectIdentifier($0.mcpServer) == resolved.serverIdentity })?
-                    .mcpServer.debugReadFileAutoSelectionContextSnapshot(for: target)
+                    .first(where: {
+                        $0.windowID == windowID && ObjectIdentifier($0.mcpServer) == resolved.serverIdentity
+                    })?
+                    .mcpServer.debugBeginReadFileAutoSelectionProbe(
+                        probeID: probeID,
+                        forceAuthoritative: forceAuthoritative,
+                        for: target
+                    )
             }) else {
-                return debugDiagnosticsError(op: op, code: "stale_target", message: "The matched auto-selection context became stale before the probe began.")
+                await MCPReadFileAutoSelectionProbeRegistry.shared.release(reservation)
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "stale_target",
+                    message: "The matched auto-selection context became stale before the probe began."
+                )
             }
-
-            let probeID = UUID()
+            let releaseForceAuthoritative: @Sendable () async -> Void = {
+                guard forceAuthoritative else { return }
+                await MainActor.run {
+                    WindowStatesManager.shared.allWindows
+                        .first(where: {
+                            $0.windowID == windowID && ObjectIdentifier($0.mcpServer) == resolved.serverIdentity
+                        })?
+                        .mcpServer.debugReleaseReadFileAutoSelectionForcedAuthoritativeProbe(
+                            probeID: probeID,
+                            for: target
+                        )
+                }
+            }
             let entry = MCPReadFileAutoSelectionProbeRegistry.Entry(
                 probeID: probeID,
-                createdAt: Date(),
+                createdAt: createdAt,
+                expiryMilliseconds: expiryMilliseconds,
                 windowID: windowID,
                 serverIdentity: resolved.serverIdentity,
                 target: target,
-                baseline: baseline
+                baseline: baseline,
+                forceAuthoritative: forceAuthoritative,
+                releaseForceAuthoritative: releaseForceAuthoritative
             )
-            guard await MCPReadFileAutoSelectionProbeRegistry.shared.insert(entry) else {
-                return debugDiagnosticsError(op: op, code: "probe_capacity", message: "The DEBUG read-file auto-selection probe registry is at its 16-probe capacity.")
+            let committed = await MCPReadFileAutoSelectionProbeRegistry.shared.commit(
+                reservation,
+                entry: entry
+            )
+            guard committed else {
+                await releaseForceAuthoritative()
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "probe_admission_failed",
+                    message: "The reserved DEBUG read-file auto-selection probe admission could not be committed."
+                )
             }
 
             return debugDiagnosticsResult([
@@ -146,6 +210,8 @@ import RepoPromptShared
                 "tab_id": target.tabID.uuidString,
                 "route": target.route,
                 "binding_generation": target.bindingGeneration,
+                "force_authoritative": forceAuthoritative,
+                "expiry_ms": expiryMilliseconds,
                 "baseline": readFileAutoSelectionContextPayload(baseline)
             ])
         }
@@ -173,14 +239,17 @@ import RepoPromptShared
             guard let server,
                   await server.debugReadFileAutoSelectionContextSnapshot(for: entry.target) != nil
             else {
+                await entry.releaseForceAuthoritative()
                 return debugDiagnosticsResult(readFileAutoSelectionStaleProbePayload(op: op, entry: entry))
             }
 
             let clock = ContinuousClock()
             let drainStartedAt = clock.now
             guard let drain = await server.debugDrainReadFileAutoSelection(for: entry.target) else {
+                await entry.releaseForceAuthoritative()
                 return debugDiagnosticsResult(readFileAutoSelectionStaleProbePayload(op: op, entry: entry))
             }
+            await entry.releaseForceAuthoritative()
             let drainElapsedMS = Self.debugDurationMilliseconds(drainStartedAt.duration(to: clock.now))
 
             let settleStartedAt = clock.now
@@ -216,6 +285,27 @@ import RepoPromptShared
                 "pending_work": final.pendingWork,
                 "waiter_count": final.waiterCount,
                 "sample_overflow_count": debugCounterDelta(final.sampleOverflowCount, entry.baseline.sampleOverflowCount)
+            ])
+        }
+
+        func debugMCPReadFileAutoSelectionProbeCancelPayload(
+            op: String,
+            arguments: [String: Value]
+        ) async -> CallTool.Result {
+            guard let rawProbeID = debugString(arguments, "probe_id"),
+                  let probeID = UUID(uuidString: rawProbeID)
+            else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "`probe_id` is required and must be a UUID string.")
+            }
+            guard let entry = await MCPReadFileAutoSelectionProbeRegistry.shared.cancel(probeID) else {
+                return debugDiagnosticsError(op: op, code: "unknown_probe", message: "The probe was not found, expired, or already consumed.")
+            }
+            return debugDiagnosticsResult([
+                "ok": true,
+                "op": op,
+                "probe_id": probeID.uuidString,
+                "result": "cancelled",
+                "force_authoritative": entry.forceAuthoritative
             ])
         }
 
@@ -696,6 +786,11 @@ import RepoPromptShared
                 "semantic_noop_intent_count": snapshot.semanticNoOpIntentCount,
                 "rejected_intent_count": snapshot.rejectedIntentCount,
                 "invalidated_intent_count": snapshot.invalidatedIntentCount,
+                "coverage_certificate_hit_count": snapshot.coverageCertificateHitCount,
+                "authoritative_fallback_count": snapshot.authoritativeFallbackCount,
+                "coverage_certificate_miss_reason_counts": Dictionary(uniqueKeysWithValues: snapshot.coverageCertificateMissReasonCounts.map {
+                    ($0.key.rawValue, $0.value)
+                }),
                 "mutation_total_ms": Self.debugRoundedMS(snapshot.mutationTotalMilliseconds),
                 "mutation_samples": snapshot.mutationSamples.map(readFileAutoSelectionMutationSamplePayload),
                 "sample_overflow_count": snapshot.sampleOverflowCount,
@@ -714,7 +809,10 @@ import RepoPromptShared
                 "duration_ms": Self.debugRoundedMS(sample.durationMilliseconds),
                 "outcome": sample.outcome.rawValue,
                 "accepted_intent_count": sample.acceptedIntentCount,
-                "completed_high_water_sequence": sample.completedHighWaterSequence
+                "completed_high_water_sequence": sample.completedHighWaterSequence,
+                "coverage_certificate_outcome": readFileAutoSelectionCoverageCertificateOutcomePayload(
+                    sample.coverageCertificateOutcome
+                )
             ]
         }
 
@@ -728,6 +826,15 @@ import RepoPromptShared
                 .filter { $0.ordinal > baselineSampleOrdinal }
                 .map(readFileAutoSelectionMutationSamplePayload)
             let mutationTotalMS = max(0, final.mutationTotalMilliseconds - baseline.mutationTotalMilliseconds)
+            let missReasonCounts = Dictionary(uniqueKeysWithValues: ReadFileAutoSelectionCoverageCertificateMissReason.allCases.map { reason in
+                (
+                    reason.rawValue,
+                    debugCounterDelta(
+                        final.coverageCertificateMissReasonCounts[reason, default: 0],
+                        baseline.coverageCertificateMissReasonCounts[reason, default: 0]
+                    )
+                )
+            }.filter { $0.1 > 0 })
             return [
                 "accepted_intent_count": acceptedIntentCount,
                 "completed_intent_count": debugCounterDelta(final.completedIntentCount, baseline.completedIntentCount),
@@ -739,12 +846,34 @@ import RepoPromptShared
                 "semantic_noop_intent_count": debugCounterDelta(final.semanticNoOpIntentCount, baseline.semanticNoOpIntentCount),
                 "rejected_intent_count": debugCounterDelta(final.rejectedIntentCount, baseline.rejectedIntentCount),
                 "invalidated_intent_count": debugCounterDelta(final.invalidatedIntentCount, baseline.invalidatedIntentCount),
+                "coverage_certificate_hit_count": debugCounterDelta(
+                    final.coverageCertificateHitCount,
+                    baseline.coverageCertificateHitCount
+                ),
+                "authoritative_fallback_count": debugCounterDelta(
+                    final.authoritativeFallbackCount,
+                    baseline.authoritativeFallbackCount
+                ),
+                "coverage_certificate_miss_reason_counts": missReasonCounts,
                 "mutation_total_ms": Self.debugRoundedMS(mutationTotalMS),
                 "mutation_ms_per_accepted_intent": acceptedIntentCount > 0
                     ? Self.debugRoundedMS(mutationTotalMS / Double(acceptedIntentCount))
                     : 0,
                 "mutation_samples": samples
             ]
+        }
+
+        private func readFileAutoSelectionCoverageCertificateOutcomePayload(
+            _ outcome: MCPReadFileAutoSelectionCoordinator.CoverageCertificateOutcome?
+        ) -> Any {
+            switch outcome {
+            case .hit:
+                ["kind": "hit"]
+            case let .authoritativeFallback(reason):
+                ["kind": "authoritative_fallback", "miss_reason": reason.rawValue]
+            case nil:
+                NSNull()
+            }
         }
 
         private func readFileAutoSelectionStaleProbePayload(
@@ -1036,35 +1165,136 @@ import RepoPromptShared
         }
     }
 
-    private actor MCPReadFileAutoSelectionProbeRegistry {
+    actor MCPReadFileAutoSelectionProbeRegistry {
+        struct Reservation {
+            fileprivate let probeID: UUID
+            fileprivate let token: UUID
+        }
+
         struct Entry: @unchecked Sendable {
             let probeID: UUID
             let createdAt: Date
+            let expiryMilliseconds: Int
             let windowID: Int
             let serverIdentity: ObjectIdentifier
             let target: MCPServerViewModel.DebugReadFileAutoSelectionTarget
             let baseline: MCPReadFileAutoSelectionCoordinator.DebugContextSnapshot
+            let forceAuthoritative: Bool
+            let releaseForceAuthoritative: @Sendable () async -> Void
         }
 
         static let shared = MCPReadFileAutoSelectionProbeRegistry()
         private static let capacity = 16
         private static let expirySeconds: TimeInterval = 30 * 60
+        private var reservations: [UUID: UUID] = [:]
         private var entries: [UUID: Entry] = [:]
+        private var expiryTasks: [UUID: Task<Void, Never>] = [:]
 
-        func insert(_ entry: Entry) -> Bool {
-            pruneExpired(now: entry.createdAt)
-            guard entries.count < Self.capacity else { return false }
+        func reserve(probeID: UUID, createdAt: Date = Date()) async -> Reservation? {
+            await pruneExpired(now: createdAt)
+            guard entries[probeID] == nil,
+                  reservations[probeID] == nil,
+                  entries.count + reservations.count < Self.capacity
+            else { return nil }
+            let reservation = Reservation(probeID: probeID, token: UUID())
+            reservations[probeID] = reservation.token
+            return reservation
+        }
+
+        func commit(_ reservation: Reservation, entry: Entry) -> Bool {
+            guard entry.probeID == reservation.probeID,
+                  reservations[reservation.probeID] == reservation.token
+            else { return false }
+            reservations.removeValue(forKey: reservation.probeID)
             entries[entry.probeID] = entry
+            expiryTasks[entry.probeID] = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(entry.expiryMilliseconds))
+                guard !Task.isCancelled else { return }
+                await self?.expire(entry.probeID)
+            }
             return true
         }
 
-        func take(_ probeID: UUID) -> Entry? {
-            pruneExpired(now: Date())
+        func release(_ reservation: Reservation) {
+            guard reservations[reservation.probeID] == reservation.token else { return }
+            reservations.removeValue(forKey: reservation.probeID)
+        }
+
+        func insert(_ entry: Entry) async -> Bool {
+            guard let reservation = await reserve(probeID: entry.probeID, createdAt: entry.createdAt) else {
+                return false
+            }
+            return commit(reservation, entry: entry)
+        }
+
+        func take(_ probeID: UUID) async -> Entry? {
+            await pruneExpired(now: Date())
+            expiryTasks.removeValue(forKey: probeID)?.cancel()
             return entries.removeValue(forKey: probeID)
         }
 
-        private func pruneExpired(now: Date) {
-            entries = entries.filter { now.timeIntervalSince($0.value.createdAt) <= Self.expirySeconds }
+        func cancel(_ probeID: UUID) async -> Entry? {
+            guard let entry = await take(probeID) else { return nil }
+            await entry.releaseForceAuthoritative()
+            return entry
+        }
+
+        func cancel(
+            serverIdentity: ObjectIdentifier,
+            contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+        ) async {
+            let probeIDs = entries.values.compactMap { entry in
+                entry.serverIdentity == serverIdentity && entry.target.contextKey == contextKey
+                    ? entry.probeID
+                    : nil
+            }
+            for probeID in probeIDs {
+                _ = await cancel(probeID)
+            }
+        }
+
+        func expireForTesting(_ probeID: UUID) async {
+            await expire(probeID)
+        }
+
+        func containsForTesting(_ probeID: UUID) -> Bool {
+            entries[probeID] != nil
+        }
+
+        func entryCountForTesting() -> Int {
+            entries.count
+        }
+
+        func reservationCountForTesting() -> Int {
+            reservations.count
+        }
+
+        func resetForTesting() async {
+            let retainedEntries = Array(entries.values)
+            entries.removeAll()
+            reservations.removeAll()
+            for task in expiryTasks.values {
+                task.cancel()
+            }
+            expiryTasks.removeAll()
+            for entry in retainedEntries {
+                await entry.releaseForceAuthoritative()
+            }
+        }
+
+        private func expire(_ probeID: UUID) async {
+            expiryTasks.removeValue(forKey: probeID)?.cancel()
+            guard let entry = entries.removeValue(forKey: probeID) else { return }
+            await entry.releaseForceAuthoritative()
+        }
+
+        private func pruneExpired(now: Date) async {
+            let expired = entries.values.filter { entry in
+                now.timeIntervalSince(entry.createdAt) * 1000 >= Double(entry.expiryMilliseconds)
+            }
+            for entry in expired {
+                await expire(entry.probeID)
+            }
         }
     }
 

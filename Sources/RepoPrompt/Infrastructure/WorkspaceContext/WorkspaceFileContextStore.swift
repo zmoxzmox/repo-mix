@@ -1636,6 +1636,22 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    struct ReadFileAutoSelectionCatalogValidationSnapshot: Equatable {
+        let visibleCatalogGeneration: UInt64
+        let rootScopeCatalogGeneration: UInt64
+        let rootScopeAvailability: WorkspaceLookupRootScopeAvailability
+    }
+
+    func readFileAutoSelectionCatalogValidationSnapshot(
+        rootScope: WorkspaceLookupRootScope
+    ) -> ReadFileAutoSelectionCatalogValidationSnapshot {
+        ReadFileAutoSelectionCatalogValidationSnapshot(
+            visibleCatalogGeneration: scopedSnapshotGeneration(scope: .visibleWorkspace),
+            rootScopeCatalogGeneration: scopedSnapshotGeneration(scope: rootScope),
+            rootScopeAvailability: rootScopeAvailability(rootScope)
+        )
+    }
+
     func catalogGeneration(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> UInt64 {
         scopedSnapshotGeneration(scope: rootScope)
     }

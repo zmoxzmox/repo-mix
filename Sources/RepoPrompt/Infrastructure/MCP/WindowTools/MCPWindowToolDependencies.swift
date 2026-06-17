@@ -186,7 +186,12 @@ struct MCPWindowToolDependencies {
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
     typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
-    typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (_ reply: ToolResultDTOs.ReadFileReply, _ requestedPath: String, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
+    typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (
+        _ reply: ToolResultDTOs.ReadFileReply,
+        _ requestedPath: String,
+        _ resolvedPhysicalPath: String,
+        _ metadata: MCPServerViewModel.RequestMetadata
+    ) async -> Void
     typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async -> MCPReadFileAutoSelectionCoordinator.DrainResult
     typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (_ mode: SearchMode, _ contextLines: Int, _ reply: ToolResultDTOs.SearchResultDTO, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String

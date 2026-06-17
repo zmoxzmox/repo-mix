@@ -7,6 +7,123 @@
     import XCTest
 
     final class MCPReadSearchLatencyDiagnosticsGuardTests: XCTestCase {
+        @MainActor
+        func testReadFileAutoSelectionProbeRegistryRemovesOnTakeAndReleasesOnCallerCancelExpiryAndContextCancellation() async throws {
+            let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
+                windowID: 1,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                route: .bound(connectionID: UUID(), runID: UUID()),
+                bindingGeneration: 1
+            )
+            let coordinator = MCPReadFileAutoSelectionCoordinator(
+                isContextCurrent: { $0 == key },
+                applyCanonical: { _, _ in .unchanged },
+                applyMirror: { _ in }
+            )
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+            let drainResult = await coordinator.drain(.canonicalSelection, for: key)
+            XCTAssertEqual(drainResult, .completed)
+            let baseline = try XCTUnwrap(coordinator.debugContextSnapshot(for: key))
+            let target = MCPServerViewModel.DebugReadFileAutoSelectionTarget(
+                connectionID: UUID(),
+                runID: UUID(),
+                agentSessionID: UUID(),
+                workspaceID: key.workspaceID,
+                tabID: key.tabID,
+                route: key.route.diagnosticScope,
+                bindingGeneration: key.bindingGeneration,
+                contextKey: key
+            )
+            let releases = ProbeReleaseRecorder()
+            let registry = MCPReadFileAutoSelectionProbeRegistry()
+
+            func entry(
+                expiryMilliseconds: Int,
+                target entryTarget: MCPServerViewModel.DebugReadFileAutoSelectionTarget? = nil
+            ) -> MCPReadFileAutoSelectionProbeRegistry.Entry {
+                MCPReadFileAutoSelectionProbeRegistry.Entry(
+                    probeID: UUID(),
+                    createdAt: Date(),
+                    expiryMilliseconds: expiryMilliseconds,
+                    windowID: 1,
+                    serverIdentity: ObjectIdentifier(coordinator),
+                    target: entryTarget ?? target,
+                    baseline: baseline,
+                    forceAuthoritative: true,
+                    releaseForceAuthoritative: { await releases.record() }
+                )
+            }
+
+            let taken = entry(expiryMilliseconds: 1000)
+            let insertedTaken = await registry.insert(taken)
+            XCTAssertTrue(insertedTaken)
+            let retainedTakenEntry = await registry.take(taken.probeID)
+            let takenEntry = try XCTUnwrap(retainedTakenEntry)
+            await takenEntry.releaseForceAuthoritative()
+            let containsTaken = await registry.containsForTesting(taken.probeID)
+            let releaseCountAfterTake = await releases.count()
+            XCTAssertFalse(containsTaken)
+            XCTAssertEqual(releaseCountAfterTake, 1)
+
+            let cancelled = entry(expiryMilliseconds: 1000)
+            let insertedCancelled = await registry.insert(cancelled)
+            XCTAssertTrue(insertedCancelled)
+            let cancelledEntry = await registry.cancel(cancelled.probeID)
+            let containsCancelled = await registry.containsForTesting(cancelled.probeID)
+            let releaseCountAfterCancel = await releases.count()
+            XCTAssertNotNil(cancelledEntry)
+            XCTAssertFalse(containsCancelled)
+            XCTAssertEqual(releaseCountAfterCancel, 2)
+
+            let expired = entry(expiryMilliseconds: 1000)
+            let insertedExpired = await registry.insert(expired)
+            XCTAssertTrue(insertedExpired)
+            await registry.expireForTesting(expired.probeID)
+            let containsExpired = await registry.containsForTesting(expired.probeID)
+            let releaseCountAfterExpiry = await releases.count()
+            XCTAssertFalse(containsExpired)
+            XCTAssertEqual(releaseCountAfterExpiry, 3)
+
+            let lifecycleEntry = entry(expiryMilliseconds: 1000)
+            let insertedLifecycle = await registry.insert(lifecycleEntry)
+            XCTAssertTrue(insertedLifecycle)
+            let otherKey = MCPReadFileAutoSelectionCoordinator.ContextKey(
+                windowID: key.windowID,
+                workspaceID: key.workspaceID,
+                tabID: UUID(),
+                route: key.route,
+                bindingGeneration: key.bindingGeneration
+            )
+            let otherTarget = MCPServerViewModel.DebugReadFileAutoSelectionTarget(
+                connectionID: target.connectionID,
+                runID: target.runID,
+                agentSessionID: target.agentSessionID,
+                workspaceID: otherKey.workspaceID,
+                tabID: otherKey.tabID,
+                route: otherKey.route.diagnosticScope,
+                bindingGeneration: otherKey.bindingGeneration,
+                contextKey: otherKey
+            )
+            let otherEntry = entry(expiryMilliseconds: 1000, target: otherTarget)
+            let insertedOther = await registry.insert(otherEntry)
+            XCTAssertTrue(insertedOther)
+
+            await registry.cancel(
+                serverIdentity: lifecycleEntry.serverIdentity,
+                contextKey: key
+            )
+            let containsLifecycle = await registry.containsForTesting(lifecycleEntry.probeID)
+            let containsOther = await registry.containsForTesting(otherEntry.probeID)
+            let releaseCountAfterContextCancellation = await releases.count()
+            XCTAssertFalse(containsLifecycle)
+            XCTAssertTrue(containsOther)
+            XCTAssertEqual(releaseCountAfterContextCancellation, 4)
+            _ = await registry.cancel(otherEntry.probeID)
+            let finalReleaseCount = await releases.count()
+            XCTAssertEqual(finalReleaseCount, 5)
+        }
+
         private var temporaryRoots = FileSystemTemporaryRoots()
 
         override func tearDown() {
@@ -91,10 +208,12 @@
             XCTAssertTrue(diagnostics.contains("mcp_read_search_content_read_scheduler_snapshot"))
             XCTAssertTrue(diagnostics.contains("mcp_read_file_auto_selection_probe_begin"))
             XCTAssertTrue(diagnostics.contains("mcp_read_file_auto_selection_probe_drain"))
+            XCTAssertTrue(diagnostics.contains("mcp_read_file_auto_selection_probe_cancel"))
 
             for operation in [
                 "mcp_read_file_auto_selection_probe_begin",
-                "mcp_read_file_auto_selection_probe_drain"
+                "mcp_read_file_auto_selection_probe_drain",
+                "mcp_read_file_auto_selection_probe_cancel"
             ] {
                 XCTAssertEqual(
                     try sourceFilesContaining(operation),
@@ -140,11 +259,17 @@
                 "mutation_samples",
                 "worker_idle",
                 "pending_work",
-                "sample_overflow_count"
+                "sample_overflow_count",
+                "coverage_certificate_hit_count",
+                "authoritative_fallback_count",
+                "coverage_certificate_miss_reason_counts"
             ] {
                 XCTAssertTrue(sibling.contains("\"\(payloadKey)\""), payloadKey)
             }
-            XCTAssertTrue(sibling.contains("private actor MCPReadFileAutoSelectionProbeRegistry"))
+            XCTAssertTrue(sibling.contains("actor MCPReadFileAutoSelectionProbeRegistry"))
+            XCTAssertTrue(sibling.contains("force_authoritative"))
+            XCTAssertTrue(sibling.contains("expiry_ms"))
+            XCTAssertTrue(sibling.contains("releaseForceAuthoritative"))
             XCTAssertTrue(sibling.contains("private static let capacity = 16"))
             XCTAssertTrue(sibling.contains("private static let expirySeconds: TimeInterval = 30 * 60"))
             let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
@@ -1765,6 +1890,18 @@
                 matches.append(fileURL.path.replacingOccurrences(of: root.path + "/", with: ""))
             }
             return matches.sorted()
+        }
+    }
+
+    private actor ProbeReleaseRecorder {
+        private var releaseCount = 0
+
+        func record() {
+            releaseCount += 1
+        }
+
+        func count() -> Int {
+            releaseCount
         }
     }
 #endif
