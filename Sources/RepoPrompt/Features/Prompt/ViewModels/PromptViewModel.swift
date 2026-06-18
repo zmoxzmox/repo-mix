@@ -4051,7 +4051,7 @@ class PromptViewModel: ObservableObject {
                 includeFiles: includeFiles,
                 includeUserPrompt: includeUserPrompt,
                 filePathDisplay: filePathDisplayOption,
-                codemapSnapshots: preAssembly.codemapSnapshots,
+                codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
                 includeDatetimeInUserInstructions: includeDatetime,
                 promptSectionsOrder: promptSectionsOrder,
                 disabledPromptSections: disabledPromptSections,
@@ -4878,7 +4878,7 @@ class PromptViewModel: ObservableObject {
         let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
             codeEntries,
             filePathDisplay: filePathDisplay,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             displayPathResolver: { entry in
                 preAssembly.displayPath(for: entry)
             }
@@ -5476,7 +5476,7 @@ extension PromptViewModel {
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,

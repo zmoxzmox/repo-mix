@@ -67,7 +67,7 @@ struct PromptContextPreAssemblyResult {
     let entries: [ResolvedPromptFileEntry]
     let missingPaths: [String]
     let invalidPaths: [String]
-    let codemapSnapshots: [UUID: WorkspaceCodemapSnapshot]
+    let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
     let fileTreeContent: String?
     let gitDiff: String?
     let lookupContext: WorkspaceLookupContext
@@ -84,18 +84,22 @@ struct PromptContextPreAssemblyResult {
 enum PromptContextPreAssemblyService {
     static func resolve(_ request: PromptContextPreAssemblyRequest) async -> PromptContextPreAssemblyResult {
         let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
+        let codemapSnapshotBundle = await request.store.codemapSnapshotBundle(
+            rootScope: request.lookupContext.rootScope
+        )
         let accountingService = PromptContextAccountingService()
         let resolution = await accountingService.resolveEntries(
             selection: physicalSelection,
             store: request.store,
             rootScope: request.lookupContext.rootScope,
             profile: request.entryResolutionProfile,
-            codeMapUsage: request.codeMapUsage
+            codeMapUsage: request.codeMapUsage,
+            codemapSnapshotBundle: codemapSnapshotBundle
         )
-        let codemapSnapshots = await request.store.codemapSnapshotDictionary()
         let fileTreeContent = await resolveFileTreeContent(
             request: request,
-            physicalSelection: physicalSelection
+            physicalSelection: physicalSelection,
+            codemapSnapshotBundle: codemapSnapshotBundle
         )
         let gitDiff = await resolveGitDiff(request: request, physicalSelection: physicalSelection, entries: resolution.entries)
         let packagingEntries = entriesForPackaging(request: request, entries: resolution.entries)
@@ -105,7 +109,7 @@ enum PromptContextPreAssemblyService {
             entries: packagingEntries,
             missingPaths: resolution.missingPaths,
             invalidPaths: resolution.invalidPaths,
-            codemapSnapshots: codemapSnapshots,
+            codemapSnapshotBundle: codemapSnapshotBundle,
             fileTreeContent: fileTreeContent,
             gitDiff: gitDiff,
             lookupContext: request.lookupContext,
@@ -115,7 +119,8 @@ enum PromptContextPreAssemblyService {
 
     private static func resolveFileTreeContent(
         request: PromptContextPreAssemblyRequest,
-        physicalSelection: StoredSelection
+        physicalSelection: StoredSelection,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
     ) async -> String? {
         guard request.cfg.rendersFileTree else { return nil }
 
@@ -129,6 +134,7 @@ enum PromptContextPreAssemblyService {
                 showCodeMapMarkers: request.showCodeMapMarkers,
                 rootScope: request.lookupContext.rootScope
             ),
+            codemapSnapshotBundle: codemapSnapshotBundle,
             profile: request.entryResolutionProfile
         )
         let fileTreeSnapshot = request.lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot

@@ -88,7 +88,7 @@ extension PromptViewModel {
         let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
             codeEntries,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             displayPathResolver: displayPathResolver
         )
         let fileBlocks = partitionedBlocks.contentBlocks

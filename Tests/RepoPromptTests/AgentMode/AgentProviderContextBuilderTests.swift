@@ -90,6 +90,62 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         XCTAssertFalse(block.contains(fixture.worktreeRoot.path), block)
     }
 
+    func testForkCodemapCapIncludesRenderedHeaderImportsAndFreezesFallbackBundle() async throws {
+        let fixture = try await makeBoundFixture()
+        let lookupContext = await makeLookupContext(fixture: fixture)
+        let logicalURL = fixture.logicalRoot.appendingPathComponent("Sources/BranchOnly.swift")
+        let worktreeURL = fixture.worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
+        let api = makeFileAPI(
+            path: worktreeURL.path,
+            symbolName: "forkCapCodemapSentinel",
+            imports: ["Foundation", "Combine"]
+        )
+        await fixture.store.applyObservedCodemapResults([
+            WorkspaceObservedCodemapResult(
+                fullPath: worktreeURL.path,
+                modificationDate: Date(),
+                fileAPI: api
+            )
+        ])
+        let selection = StoredSelection(
+            autoCodemapPaths: [logicalURL.path],
+            codemapAutoEnabled: true
+        )
+        let rendered = api.getFullAPIDescription(displayPath: "Sources/BranchOnly.swift")
+        let renderedTokens = TokenCalculationService.estimateTokens(for: rendered)
+
+        let atCap = await AgentProviderContextBuilder.forkFileContentsBlock(
+            selection: selection,
+            tokenCap: renderedTokens,
+            store: fixture.store,
+            lookupContext: lookupContext
+        )
+        XCTAssertTrue(atCap.contains("forkCapCodemapSentinel"), atCap)
+        XCTAssertTrue(atCap.contains("  - Foundation"), atCap)
+        XCTAssertFalse(atCap.contains(fixture.worktreeRoot.path), atCap)
+
+        let overCap = await AgentProviderContextBuilder.forkFileContentsBlock(
+            selection: selection,
+            tokenCap: renderedTokens - 1,
+            store: fixture.store,
+            lookupContext: lookupContext,
+            overTokenCapSummaryProvider: { _, _, frozenBundle in
+                await fixture.store.applyObservedCodemapResults([
+                    WorkspaceObservedCodemapResult(
+                        fullPath: worktreeURL.path,
+                        modificationDate: Date(),
+                        fileAPI: nil
+                    )
+                ])
+                let retainedOriginal = frozenBundle.orderedSnapshots.contains { snapshot in
+                    snapshot.fileAPI?.apiDescription.contains("forkCapCodemapSentinel") == true
+                }
+                return retainedOriginal ? "<selection_summary>frozen bundle</selection_summary>" : nil
+            }
+        )
+        XCTAssertEqual(overCap, "<selection_summary>frozen bundle</selection_summary>")
+    }
+
     func testNonWorktreeForkFileContentsPreservesVisibleWorkspaceBehavior() async throws {
         let fixture = try await makeBoundFixture()
         _ = await makeLookupContext(fixture: fixture) // Keep the hidden session worktree loaded.
@@ -177,10 +233,14 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private func makeFileAPI(path: String, symbolName: String) -> FileAPI {
+    private func makeFileAPI(
+        path: String,
+        symbolName: String,
+        imports: [String] = []
+    ) -> FileAPI {
         FileAPI(
             filePath: path,
-            imports: [],
+            imports: imports,
             classes: [],
             functions: [
                 FunctionInfo(

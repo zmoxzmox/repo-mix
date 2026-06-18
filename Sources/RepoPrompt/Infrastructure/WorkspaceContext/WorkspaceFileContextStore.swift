@@ -3693,8 +3693,18 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    func codemapSnapshotBundle(
+        rootScope: WorkspaceLookupRootScope = .allLoaded
+    ) -> WorkspaceCodemapSnapshotBundle {
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let snapshots = codemapSnapshotsByFileID.values.filter {
+            allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.fileID)
+        }
+        return WorkspaceCodemapSnapshotBundle(snapshots: Array(snapshots))
+    }
+
     func codemapSnapshotDictionary() -> [UUID: WorkspaceCodemapSnapshot] {
-        codemapSnapshotsByFileID.filter { isDiscoverableFileID($0.key) }
+        codemapSnapshotBundle().snapshotsByFileID
     }
 
     func codemapSnapshots(inRoot rootID: UUID) -> [WorkspaceCodemapSnapshot] {
@@ -3883,12 +3893,17 @@ actor WorkspaceFileContextStore {
     }
 
     func makeFileTreeSelectionSnapshot(_ request: WorkspaceFileTreeSnapshotRequest) -> FileTreeSelectionSnapshot {
-        makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: request.selectedFileIDs)
+        makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: request.selectedFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle(rootScope: request.rootScope)
+        )
     }
 
     func makeFileTreeSelectionSnapshot(
         selection: StoredSelection,
         request: WorkspaceFileTreeSnapshotRequest,
+        codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
         profile: PathLocateProfile = .uiAssisted
     ) async -> FileTreeSelectionSnapshot {
         var selectedStoreFileIDs = Set<UUID>()
@@ -3909,7 +3924,13 @@ actor WorkspaceFileContextStore {
             else { continue }
             selectedStoreFileIDs.insert(file.id)
         }
-        return await makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, profile: profile)
+        let codemapSnapshotBundle = frozenCodemaps ?? codemapSnapshotBundle(rootScope: request.rootScope)
+        return await makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            profile: profile
+        )
     }
 
     private func lookupSelectionPath(
@@ -3984,11 +4005,13 @@ actor WorkspaceFileContextStore {
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
-        selectedStoreFileIDs: Set<UUID>
+        selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
     ) -> FileTreeSelectionSnapshot {
         makeFileTreeSelectionSnapshot(
             request,
             selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
             startFolder: nil
         )
     }
@@ -3996,19 +4019,31 @@ actor WorkspaceFileContextStore {
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         profile: PathLocateProfile
     ) async -> FileTreeSelectionSnapshot {
         let trimmedStartPath = request.startPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmedStartPath, !trimmedStartPath.isEmpty else {
-            return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: nil)
+            return makeFileTreeSelectionSnapshot(
+                request,
+                selectedStoreFileIDs: selectedStoreFileIDs,
+                codemapSnapshotBundle: codemapSnapshotBundle,
+                startFolder: nil
+            )
         }
         let startFolder = await (lookupSelectionPath(trimmedStartPath, profile: profile, rootScope: request.rootScope))?.folder
-        return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: startFolder)
+        return makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            startFolder: startFolder
+        )
     }
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         startFolder: WorkspaceFolderRecord?
     ) -> FileTreeSelectionSnapshot {
         let selectedFileIDs = selectedStoreFileIDs
@@ -4027,6 +4062,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: root.standardizedFullPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ).map { [$0] } ?? []
@@ -4044,6 +4080,7 @@ actor WorkspaceFileContextStore {
                     rootStandardizedPath: root.standardizedFullPath,
                     state: state,
                     visited: &visited,
+                    codemapSnapshotBundle: codemapSnapshotBundle,
                     explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                     explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
                 )
@@ -7911,6 +7948,7 @@ actor WorkspaceFileContextStore {
         rootStandardizedPath: String,
         state: RootState,
         visited: inout Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         explicitlyIncludedManagedOnlyFileIDs: Set<UUID> = [],
         explicitlyIncludedManagedOnlyFolderIDs: Set<UUID> = []
     ) -> FileTreeFolderSnapshot? {
@@ -7933,6 +7971,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: rootStandardizedPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ) {
@@ -7944,7 +7983,7 @@ actor WorkspaceFileContextStore {
                 id: file.id,
                 name: file.name,
                 fileExtension: (file.name as NSString).pathExtension.isEmpty ? nil : (file.name as NSString).pathExtension,
-                hasCodeMap: codemapSnapshotsByFileID[file.id]?.fullPath == file.standardizedFullPath && codemapSnapshotsByFileID[file.id]?.fileAPI != nil
+                hasCodeMap: codemapSnapshotBundle.hasRenderableCodemap(for: file)
             )))
         }
 

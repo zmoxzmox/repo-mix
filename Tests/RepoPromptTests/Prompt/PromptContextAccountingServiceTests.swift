@@ -352,6 +352,48 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         #endif
     }
 
+    func testCodemapAccountingCountsExactRenderedHeaderAndImports() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingRenderedCodemapTokens")
+        let fileURL = root.appendingPathComponent("Nested/Target.swift")
+        try write("struct Target {}", to: fileURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let api = makeFileAPI(
+            path: fileURL.path,
+            symbolName: "renderedTokenSentinel",
+            imports: ["Foundation", "Combine"]
+        )
+        await store.applyObservedCodemapResults([
+            WorkspaceObservedCodemapResult(
+                fullPath: fileURL.path,
+                modificationDate: Date(),
+                fileAPI: api
+            )
+        ])
+
+        let result = await PromptContextAccountingService().calculatePromptStats(
+            request: PromptContextAccountingRequest(
+                selection: StoredSelection(
+                    autoCodemapPaths: [fileURL.path],
+                    codemapAutoEnabled: true
+                ),
+                codeMapUsage: .auto,
+                filePathDisplay: .relative
+            ),
+            store: store
+        )
+
+        let rendered = api.getFullAPIDescription(displayPath: "Nested/Target.swift")
+        let expectedTokens = TokenCalculationService.estimateTokens(for: rendered)
+        let snapshot = try XCTUnwrap(result.promptFileEntrySnapshots.first)
+        XCTAssertEqual(result.promptFileEntrySnapshots.count, 1)
+        XCTAssertEqual(snapshot.codeMapContent, rendered)
+        XCTAssertEqual(snapshot.availableCodeMapTokenCount, expectedTokens)
+        XCTAssertEqual(result.tokenResult.codeMapTokenCount, expectedTokens)
+        XCTAssertEqual(result.tokenResult.totalTokenCountFilesOnly, 0)
+    }
+
     func testCompleteCodemapResolutionBuildsSingleStaticPathSnapshot() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AccountingCompleteCodemapBatch")
@@ -425,11 +467,12 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         path: String,
         symbolName: String = "codemapOnlySymbol",
         className: String? = nil,
+        imports: [String] = [],
         referencedTypes: [String] = []
     ) -> FileAPI {
         FileAPI(
             filePath: path,
-            imports: [],
+            imports: imports,
             classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
             functions: [
                 FunctionInfo(
