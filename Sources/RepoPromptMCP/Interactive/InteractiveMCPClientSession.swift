@@ -171,6 +171,7 @@ actor InteractiveMCPClientSession {
     private var toolListFetched = false
     private var defaultToolCallTimeout: ToolCallTimeoutPolicy = .default
     private(set) var toolsDirty = false
+    private(set) var toolsChangeNoticePending = false
 
     #if DEBUG
         private let requestSendWillStart: (@Sendable () async -> Void)?
@@ -235,6 +236,7 @@ actor InteractiveMCPClientSession {
         cachedTools = []
         toolListFetched = false
         toolsDirty = false
+        toolsChangeNoticePending = false
 
         // Perform bootstrap handshake and get connected FD
         let connectedFD = try await performBootstrapHandshake()
@@ -309,6 +311,7 @@ actor InteractiveMCPClientSession {
             cachedTools = []
             toolListFetched = false
             toolsDirty = false
+            toolsChangeNoticePending = false
             serverName = nil
             serverVersion = nil
             throw error
@@ -389,6 +392,7 @@ actor InteractiveMCPClientSession {
         cachedTools = []
         toolListFetched = false
         toolsDirty = false
+        toolsChangeNoticePending = false
         logger.debug("Disconnected from MCP server")
     }
 
@@ -405,6 +409,7 @@ actor InteractiveMCPClientSession {
         cachedTools = result.tools
         toolListFetched = true
         toolsDirty = false
+        toolsChangeNoticePending = false
 
         logger.debug("Refreshed tools: \(cachedTools.count) available")
         return cachedTools
@@ -415,6 +420,15 @@ actor InteractiveMCPClientSession {
         cachedTools
     }
 
+    /// Returns the cached tool catalog unless it has never been fetched or the server marked it dirty.
+    @discardableResult
+    func cachedToolsOrRefresh() async throws -> [MCP.Tool] {
+        guard toolListFetched, !toolsDirty else {
+            return try await refreshTools()
+        }
+        return cachedTools
+    }
+
     /// Returns a specific tool by name.
     func tool(named name: String) -> MCP.Tool? {
         cachedTools.first { $0.name == name }
@@ -423,12 +437,13 @@ actor InteractiveMCPClientSession {
     /// Marks the tool list as potentially stale.
     private func markToolsDirty() {
         toolsDirty = true
+        toolsChangeNoticePending = true
         logger.debug("Tool list marked dirty (server sent notification)")
     }
 
-    /// Clears the dirty flag after user acknowledges.
+    /// Clears only the one-shot user notice after acknowledgement; the catalog stays dirty until refreshed.
     func acknowledgeToolsChanged() {
-        toolsDirty = false
+        toolsChangeNoticePending = false
     }
 
     // MARK: - Raw JSON Mode
@@ -708,6 +723,10 @@ actor InteractiveMCPClientSession {
             arguments: [String: Value] = [:]
         ) -> TimeInterval? {
             resolvedTimeout(policy, toolName: toolName, arguments: arguments)
+        }
+
+        func test_markToolsDirty() {
+            markToolsDirty()
         }
     #endif
 

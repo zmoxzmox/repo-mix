@@ -123,10 +123,72 @@ import XCTest
             XCTAssertNil(timeout)
         }
 
+        func testCachedToolsOrRefreshReusesCatalogUntilDirty() async throws {
+            let fixture = try await makeToolCatalogFixture()
+            defer { Task { await fixture.cleanup() } }
+
+            let first = try await fixture.session.cachedToolsOrRefresh()
+            let second = try await fixture.session.cachedToolsOrRefresh()
+
+            XCTAssertEqual(first.map(\.name), ["tool_1"])
+            XCTAssertEqual(second.map(\.name), ["tool_1"])
+            let callCountAfterCachedRead = await fixture.listCounter.count()
+            XCTAssertEqual(callCountAfterCachedRead, 1)
+
+            await fixture.session.test_markToolsDirty()
+            await fixture.session.acknowledgeToolsChanged()
+            let noticePending = await fixture.session.toolsChangeNoticePending
+            let toolsStillDirty = await fixture.session.toolsDirty
+            XCTAssertFalse(noticePending)
+            XCTAssertTrue(toolsStillDirty)
+
+            let refreshed = try await fixture.session.cachedToolsOrRefresh()
+
+            XCTAssertEqual(refreshed.map(\.name), ["tool_2"])
+            let callCountAfterDirtyRefresh = await fixture.listCounter.count()
+            XCTAssertEqual(callCountAfterDirtyRefresh, 2)
+        }
+
         private func makeUnconnectedSession() -> InteractiveMCPClientSession {
             InteractiveMCPClientSession(
                 sessionToken: "timeout-contract-test",
                 clientName: "timeout-contract-test"
+            )
+        }
+
+        private func makeToolCatalogFixture() async throws -> CLIToolCatalogFixture {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let listCounter = CLIToolListCounter()
+            let server = Server(
+                name: "CLI tool catalog cache test server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(ListTools.self) { _ in
+                let callNumber = await listCounter.record()
+                return ListTools.Result(tools: [
+                    Tool(name: "tool_\(callNumber)", description: nil, inputSchema: [:])
+                ])
+            }
+            try await server.start(transport: transports.server)
+
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI tool catalog cache test client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+            return CLIToolCatalogFixture(
+                client: client,
+                server: server,
+                session: session,
+                listCounter: listCounter
             )
         }
 
@@ -278,6 +340,31 @@ import XCTest
             await ignoredCancellationRelease.signal()
             await client.disconnect()
             await server.stop()
+        }
+    }
+
+    private struct CLIToolCatalogFixture {
+        let client: Client
+        let server: Server
+        let session: InteractiveMCPClientSession
+        let listCounter: CLIToolListCounter
+
+        func cleanup() async {
+            await client.disconnect()
+            await server.stop()
+        }
+    }
+
+    private actor CLIToolListCounter {
+        private var value = 0
+
+        func record() -> Int {
+            value += 1
+            return value
+        }
+
+        func count() -> Int {
+            value
         }
     }
 
