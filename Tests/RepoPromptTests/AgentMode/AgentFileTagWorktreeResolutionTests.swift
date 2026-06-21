@@ -161,6 +161,83 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testSameNamedVisibleRootsUseNonAbsoluteResolvableFileTagPaths() async throws {
+        let fixture = try makeSameNamedRootFixture()
+        let selectedFile = fixture.secondRoot.appendingPathComponent("Sources/Target.swift")
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: fixture.firstRoot.path)
+        _ = try await store.loadRoot(path: fixture.secondRoot.path)
+        let host = FileTagSelectionHost(selection: StoredSelection(selectedPaths: [selectedFile.path]))
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: host, store: store)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: coordinator,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: 5
+        )
+
+        let searchSuggestions = await service.suggestions(for: "Target")
+        let searchTokenPaths = Set(searchSuggestions.map(\.relativePath))
+        let fallbackSuggestions = await service.suggestions(for: "")
+        let fallbackSuggestion = try XCTUnwrap(fallbackSuggestions.first)
+        let expectedSecondToken = "B/SharedRoot/Sources/Target.swift"
+
+        XCTAssertEqual(
+            searchTokenPaths,
+            ["A/SharedRoot/Sources/Target.swift", expectedSecondToken],
+            String(describing: searchSuggestions)
+        )
+        XCTAssertEqual(fallbackSuggestion.relativePath, expectedSecondToken)
+        XCTAssertEqual(fallbackSuggestion.commitDisplayText, expectedSecondToken)
+        XCTAssertEqual(
+            FileTagMentionHelper.committedReplacementText(for: fallbackSuggestion),
+            "@B/SharedRoot/Sources/Target.swift "
+        )
+        XCTAssertEqual(AgentFileMentionText.attachmentDisplayName(for: fallbackSuggestion), expectedSecondToken)
+
+        let allTokenText = searchSuggestions.flatMap { [$0.relativePath, $0.commitDisplayText ?? ""] } + [fallbackSuggestion.relativePath, fallbackSuggestion.commitDisplayText ?? ""]
+        XCTAssertFalse(allTokenText.contains { $0.hasPrefix("/") }, allTokenText.joined(separator: "\n"))
+        XCTAssertFalse(allTokenText.contains { $0.contains(fixture.base.path) }, allTokenText.joined(separator: "\n"))
+
+        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+            [expectedSecondToken],
+            tokenBudget: 10000,
+            maxFiles: 10,
+            store: store
+        )
+        let xml = try XCTUnwrap(resolvedXML)
+
+        XCTAssertTrue(xml.contains("File: \(expectedSecondToken)"), xml)
+        XCTAssertTrue(xml.contains("let target = \"b\""), xml)
+        XCTAssertFalse(xml.contains(fixture.base.path), xml)
+    }
+
+    func testSameNamedRootGeneratedAliasTakesPrecedenceOverShadowingRootAlias() async throws {
+        let fixture = try makeSameNamedRootFixture()
+        let shadowRoot = fixture.base.appendingPathComponent("Shadow/B", isDirectory: true)
+        try write("let target = \"shadow\"\n", to: shadowRoot.appendingPathComponent("SharedRoot/Sources/Target.swift"))
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: fixture.firstRoot.path)
+        _ = try await store.loadRoot(path: fixture.secondRoot.path)
+        _ = try await store.loadRoot(path: shadowRoot.path)
+        let generatedToken = "B/SharedRoot/Sources/Target.swift"
+
+        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+            [generatedToken],
+            tokenBudget: 10000,
+            maxFiles: 10,
+            store: store
+        )
+        let xml = try XCTUnwrap(resolvedXML)
+
+        XCTAssertTrue(xml.contains("File: \(generatedToken)"), xml)
+        XCTAssertTrue(xml.contains("let target = \"b\""), xml)
+        XCTAssertFalse(xml.contains("let target = \"shadow\""), xml)
+        XCTAssertFalse(xml.contains(fixture.base.path), xml)
+    }
+
+    @MainActor
     func testSelectedFileFallbackCommitsPathfulSameBasenameFile() async throws {
         let root = try makeTemporaryRoot(name: "AgentFileTagSelectedFallback")
         try write("# first\n", to: root.appendingPathComponent("skills/writing/SKILL.md"))
@@ -359,6 +436,15 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         temporaryRoots.append(url)
         return url
+    }
+
+    private func makeSameNamedRootFixture() throws -> (base: URL, firstRoot: URL, secondRoot: URL) {
+        let base = try makeTemporaryRoot(name: "AgentFileTagSameNamedRoots")
+        let firstRoot = base.appendingPathComponent("A/SharedRoot", isDirectory: true)
+        let secondRoot = base.appendingPathComponent("B/SharedRoot", isDirectory: true)
+        try write("let target = \"a\"\n", to: firstRoot.appendingPathComponent("Sources/Target.swift"))
+        try write("let target = \"b\"\n", to: secondRoot.appendingPathComponent("Sources/Target.swift"))
+        return (base, firstRoot, secondRoot)
     }
 
     private func write(_ content: String, to url: URL) throws {

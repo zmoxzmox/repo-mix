@@ -160,7 +160,7 @@ final class AgentFileTagSuggestionService {
             .mapValues { Set($0.map { $0.rootName.lowercased() }) }
 
         var candidates = filtered.map { entry in
-            let tokenRelativePath = tokenPath(for: entry, hasMultipleRoots: hasMultipleRoots, lookupContext: lookupContext)
+            let tokenRelativePath = tokenPath(for: entry, roots: roots, lookupContext: lookupContext)
             let scoreRelativePath = tokenRelativePath
             let fileNameKey = entry.name.lowercased()
             let isDuplicateName = (countByFileName[fileNameKey] ?? 0) > 1
@@ -217,32 +217,45 @@ final class AgentFileTagSuggestionService {
 
     private func tokenPath(
         for entry: WorkspaceSearchCatalogEntry,
-        hasMultipleRoots: Bool,
+        roots: [WorkspaceRootRef],
         lookupContext: WorkspaceLookupContext
     ) -> String {
-        if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-            forPhysicalPath: entry.standardizedFullPath,
-            display: .relative
+        if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+            forPhysicalPath: entry.standardizedFullPath
         ) {
-            return projected
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: projected.root,
+                relativePath: projected.relativePath,
+                visibleRoots: lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+            )
         }
-        return hasMultipleRoots ? entry.displayPath : entry.standardizedRelativePath
+        if let root = roots.first(where: { $0.id == entry.rootID }) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: root,
+                relativePath: entry.standardizedRelativePath,
+                visibleRoots: roots
+            )
+        }
+        return entry.standardizedRelativePath
     }
 
     private func tokenPath(
         for file: WorkspaceFileRecord,
         roots: [WorkspaceRootRef],
-        hasMultipleRoots: Bool,
+        hasMultipleRoots _: Bool,
         lookupContext: WorkspaceLookupContext
     ) -> String {
-        if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-            forPhysicalPath: file.standardizedFullPath,
-            display: .relative
+        if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+            forPhysicalPath: file.standardizedFullPath
         ) {
-            return projected
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: projected.root,
+                relativePath: projected.relativePath,
+                visibleRoots: lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+            )
         }
-        if hasMultipleRoots, let root = roots.first(where: { $0.id == file.rootID }) {
-            return ClientPathFormatter.displayPath(
+        if let root = roots.first(where: { $0.id == file.rootID }) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
                 root: root,
                 relativePath: file.standardizedRelativePath,
                 visibleRoots: roots
