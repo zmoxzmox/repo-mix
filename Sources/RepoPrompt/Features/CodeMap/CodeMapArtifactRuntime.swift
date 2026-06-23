@@ -8,6 +8,7 @@ import RepoPromptShared
 final class CodeMapArtifactRuntime: @unchecked Sendable {
     let artifactStore: CodeMapArtifactStore
     let locatorStore: GitBlobCodeMapLocatorStore
+    let manifestStore: CodeMapRootManifestStore
     let coordinator: CodeMapArtifactBuildCoordinator
 
     init(
@@ -17,6 +18,8 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         artifactStoreRemovalHooks: CodeMapSecureFileRemovalHooks? = nil,
         locatorStorePolicy: GitBlobCodeMapLocatorStorePolicy = .default,
         locatorStoreHooks: GitBlobCodeMapLocatorStoreHooks = .none,
+        manifestStorePolicy: CodeMapRootManifestStorePolicy = .default,
+        manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
         builder: CodeMapArtifactBuilderClient = CodeMapArtifactBuilderClient(),
         coordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         coordinatorClock: CodeMapArtifactBuildCoordinatorClock = .continuous,
@@ -33,6 +36,11 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
             policy: locatorStorePolicy,
             hooks: locatorStoreHooks
         )
+        let manifestStore = try CodeMapRootManifestStore(
+            rootURL: rootURL,
+            policy: manifestStorePolicy,
+            hooks: manifestStoreHooks
+        )
         let coordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: CodeMapArtifactStoreClient(store: artifactStore),
             locatorStore: GitBlobCodeMapLocatorStoreClient(store: locatorStore),
@@ -44,6 +52,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
 
         self.artifactStore = artifactStore
         self.locatorStore = locatorStore
+        self.manifestStore = manifestStore
         self.coordinator = coordinator
     }
 

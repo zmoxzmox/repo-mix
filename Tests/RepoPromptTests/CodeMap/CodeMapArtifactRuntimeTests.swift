@@ -187,6 +187,22 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         }
     }
 
+    func testRuntimeOwnsExactInertRootManifestStore() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: root,
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+        )
+        let manifestStore = runtime.manifestStore
+
+        XCTAssertTrue(runtime.manifestStore === manifestStore)
+        let accounting = try await manifestStore.accounting()
+        XCTAssertEqual(accounting.manifestCount, 0)
+        XCTAssertEqual(accounting.recordCount, 0)
+        XCTAssertEqual(accounting.manifestByteCount, 0)
+    }
+
     private func makeSecureRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodeMapRuntime-\(UUID().uuidString)", isDirectory: true)
