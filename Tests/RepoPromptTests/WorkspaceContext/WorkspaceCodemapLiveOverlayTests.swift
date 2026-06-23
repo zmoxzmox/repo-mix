@@ -237,7 +237,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         let registration = await fixture.overlay.register(
             capability: .eligible(reboundCapability),
-            namespace: fixture.namespace,
             catalogGeneration: fixture.catalogGeneration + 1
         )
         assertEqualValue(registration, .registered)
@@ -1326,7 +1325,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await assertEqualValue(
             overlay.register(
                 capability: .eligible(fixture.authority.capability),
-                namespace: fixture.namespace,
                 catalogGeneration: fixture.catalogGeneration
             ),
             .registered
@@ -1371,6 +1369,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let wrongCatalog = WorkspaceCodemapLiveManifestAdoptionTicket(
             operationID: ticket.operationID,
             rootEpoch: ticket.rootEpoch,
+            pipelineIdentity: ticket.pipelineIdentity,
             catalogGeneration: ticket.catalogGeneration + 1,
             repositoryAuthority: ticket.repositoryAuthority,
             invalidationGeneration: ticket.invalidationGeneration
@@ -1379,6 +1378,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let wrongAuthority = WorkspaceCodemapLiveManifestAdoptionTicket(
             operationID: ticket.operationID,
             rootEpoch: ticket.rootEpoch,
+            pipelineIdentity: ticket.pipelineIdentity,
             catalogGeneration: ticket.catalogGeneration,
             repositoryAuthority: repositoryAuthority(
                 like: ticket.repositoryAuthority,
@@ -1419,7 +1419,10 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
 
         await assertFalseValue(overlay.isManifestAdoptionTicketCurrent(ticket))
-        await assertNilValue(overlay.beginManifestAdoption(rootEpoch: fixture.rootEpoch))
+        await assertNilValue(overlay.beginManifestAdoption(
+            rootEpoch: fixture.rootEpoch,
+            namespace: fixture.namespace
+        ))
         await assertNilValue(overlay.freeze(rootEpoch: fixture.rootEpoch))
         let snapshot = try await unwrapValue(overlay.snapshot(rootEpoch: fixture.rootEpoch))
         assertFalseValue(snapshot.authorityIsCurrent)
@@ -1510,6 +1513,89 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         assertEqualValue(readyAccounting.readyEntryCount, 1)
         assertEqualValue(readyAccounting.shadowEntryCount, 0)
         assertEqualValue(readyAccounting.leaseCount, 1)
+    }
+
+    func testManifestAdoptionClearsOnlyItsPipelineShadows() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: [
+                "Swift.swift": "struct SwiftValue {}",
+                "TypeScript.ts": "export const value = 1"
+            ]
+        )
+        defer { fixture.cleanup() }
+        let typeScriptPipeline = try SyntaxManager().pipelineIdentity(
+            for: .ts,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let typeScriptNamespace = try CodeMapRootManifestNamespace(
+            capability: fixture.authority.capability,
+            pipelineIdentity: typeScriptPipeline
+        )
+        let swift = try await makeCleanReady(
+            fixture: fixture,
+            path: "Swift.swift",
+            text: "struct SwiftValue {}",
+            fileID: uuid("B2150000-0000-0000-0000-000000000001")
+        )
+        let typeScript = try await makeCleanReady(
+            fixture: fixture,
+            path: "TypeScript.ts",
+            text: "export const value = 1",
+            fileID: uuid("B2150000-0000-0000-0000-000000000002"),
+            namespace: typeScriptNamespace,
+            language: .ts
+        )
+        try await assertEqualValue(
+            fixture.overlay.adoptManifest(
+                ticket: manifestTicket(fixture),
+                snapshot: makeManifest(fixture: fixture, records: [swift.record]),
+                readyEntries: [swift.adoption]
+            ),
+            .adopted(readyEntryCount: 1)
+        )
+        try await assertEqualValue(
+            fixture.overlay.adoptManifest(
+                ticket: manifestTicket(fixture, namespace: typeScriptNamespace),
+                snapshot: makeManifest(
+                    fixture: fixture,
+                    records: [typeScript.record],
+                    namespace: typeScriptNamespace
+                ),
+                readyEntries: [typeScript.adoption]
+            ),
+            .adopted(readyEntryCount: 1)
+        )
+        _ = await fixture.overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Swift.swift", "TypeScript.ts"],
+            reason: .modified
+        )
+        let shadowed = await fixture.overlay.accounting()
+        assertEqualValue(shadowed.shadowEntryCount, 2)
+
+        let freshSwiftLease = try await fixture.artifactStore.lease(handle: swift.handle)
+        try await assertEqualValue(
+            fixture.overlay.adoptManifest(
+                ticket: manifestTicket(fixture),
+                snapshot: makeManifest(fixture: fixture, records: [swift.record], generation: 2),
+                readyEntries: [WorkspaceCodemapLiveManifestAdoptionEntry(
+                    record: swift.record,
+                    binding: swift.binding,
+                    lease: freshSwiftLease
+                )]
+            ),
+            .adopted(readyEntryCount: 1)
+        )
+        let accounting = await fixture.overlay.accounting()
+        assertEqualValue(accounting.readyEntryCount, 1)
+        assertEqualValue(accounting.shadowEntryCount, 1)
+        let snapshotValue = await fixture.overlay.snapshot(rootEpoch: fixture.rootEpoch)
+        let snapshot = try unwrapValue(snapshotValue)
+        assertTrueValue(snapshot.entries.contains(where: {
+            $0.standardizedRelativePath == "TypeScript.ts" &&
+                $0.state == .shadowed(.modified)
+        }))
     }
 
     func testNewerEmptyAndTerminalManifestsRetireObsoleteShadowsAndLeases() async throws {
@@ -2520,7 +2606,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await assertEqualValue(
             fixture.overlay.register(
                 capability: .eligible(fixture.authority.capability),
-                namespace: fixture.namespace,
                 catalogGeneration: fixture.catalogGeneration
             ),
             .exactDuplicate
@@ -2528,7 +2613,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await assertEqualValue(
             fixture.overlay.register(
                 capability: .unresolved,
-                namespace: fixture.namespace,
                 catalogGeneration: fixture.catalogGeneration
             ),
             .rejected(.capabilityUnavailable)
@@ -2537,7 +2621,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await assertEqualValue(
             freshOverlay.register(
                 capability: .eligible(fixture.authority.capability),
-                namespace: fixture.namespace,
                 catalogGeneration: 0
             ),
             .rejected(.catalogGenerationInvalid)
@@ -2690,7 +2773,6 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
         guard await resolvedOverlay.register(
             capability: .eligible(authority.capability),
-            namespace: namespace,
             catalogGeneration: fixture.catalogGeneration
         ) == .registered else {
             throw TestError.registrationFailed
@@ -2758,13 +2840,16 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         path: String,
         text: String,
         fileID: UUID,
-        outcome: CodeMapSyntaxArtifactOutcome? = nil
+        outcome: CodeMapSyntaxArtifactOutcome? = nil,
+        namespace: CodeMapRootManifestNamespace? = nil,
+        language: LanguageType = .swift
     ) async throws -> CleanReadyFixture {
+        let namespace = namespace ?? fixture.namespace
         let source = try await fixture.authority.cleanSource(bytes: Data(text.utf8))
         guard case let .cleanGitBlob(repositoryNamespace, blobOID) = source.provenance else {
             throw TestError.cleanSourceExpected
         }
-        let key = try CodeMapArtifactKey(source: source, pipelineIdentity: fixture.namespace.pipelineIdentity)
+        let key = try CodeMapArtifactKey(source: source, pipelineIdentity: namespace.pipelineIdentity)
         let resolvedOutcome = outcome ?? .ready(makeArtifact(name: "Clean"))
         _ = try await fixture.artifactStore.insert(key: key, deterministicOutcome: resolvedOutcome)
         let handle = try await requireHandle(fixture.artifactStore, key: key)
@@ -2772,7 +2857,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         let locator = GitBlobCodeMapLocatorIdentity(
             repositoryNamespace: repositoryNamespace,
             blobOID: blobOID,
-            pipelineIdentity: fixture.namespace.pipelineIdentity
+            pipelineIdentity: namespace.pipelineIdentity
         )
         let association = try VerifiedGitBlobCodeMapLocatorAssociation.verify(
             source: source,
@@ -2799,7 +2884,7 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         ))
         let completion = try unwrapValue(WorkspaceCodemapArtifactCompletion.cleanGitBlob(
             token: token,
-            language: .swift,
+            language: language,
             association: association
         ))
         var binding = try unwrapValue(WorkspaceCodemapArtifactBinding(pending: token))
@@ -2817,13 +2902,13 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
             nil
         }
         let record = try CodeMapRootManifestRecord.verifiedClean(
-            namespace: fixture.namespace,
+            namespace: namespace,
             repositoryRelativePath: repositoryPath,
             gitMode: .regular,
             association: association,
             contribution: contribution,
             authority: CodeMapRootManifestAuthority(
-                namespace: fixture.namespace,
+                namespace: namespace,
                 token: fixture.authority.capability.repositoryAuthority
             ),
             bindingGeneration: 1
@@ -2845,12 +2930,14 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         fixture: RootFixture,
         records: [CodeMapRootManifestRecord],
         generation: UInt64 = 1,
-        lastAccessEpochSeconds: UInt64 = 0
+        lastAccessEpochSeconds: UInt64 = 0,
+        namespace: CodeMapRootManifestNamespace? = nil
     ) throws -> CodeMapRootManifestSnapshot {
-        try CodeMapRootManifestSnapshot(
-            namespace: fixture.namespace,
+        let namespace = namespace ?? fixture.namespace
+        return try CodeMapRootManifestSnapshot(
+            namespace: namespace,
             authority: CodeMapRootManifestAuthority(
-                namespace: fixture.namespace,
+                namespace: namespace,
                 token: fixture.authority.capability.repositoryAuthority
             ),
             manifestGeneration: generation,
@@ -2920,9 +3007,13 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
     }
 
     private func manifestTicket(
-        _ fixture: RootFixture
+        _ fixture: RootFixture,
+        namespace: CodeMapRootManifestNamespace? = nil
     ) async throws -> WorkspaceCodemapLiveManifestAdoptionTicket {
-        let ticket = await fixture.overlay.beginManifestAdoption(rootEpoch: fixture.rootEpoch)
+        let ticket = await fixture.overlay.beginManifestAdoption(
+            rootEpoch: fixture.rootEpoch,
+            namespace: namespace ?? fixture.namespace
+        )
         return try unwrapValue(ticket)
     }
 

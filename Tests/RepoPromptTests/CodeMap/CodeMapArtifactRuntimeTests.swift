@@ -5,6 +5,73 @@ import RepoPromptShared
 import XCTest
 
 final class CodeMapArtifactRuntimeTests: XCTestCase {
+    func testProcessWideRuntimeDoesNotConstructBeforeFirstCodemapDemand() throws {
+        let applicationSupportRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: applicationSupportRoot) }
+        let namespaceSaltLoadCount = RuntimeProviderTestCounter()
+        let registryConstructionCount = RuntimeProviderTestCounter()
+        let expectedSalt = Data(
+            repeating: 0x3C,
+            count: GitBlobRepositoryNamespace.saltByteCount
+        )
+        let provider = CodeMapArtifactRuntime.makeProcessWideProvider(
+            identity: .repoPromptCE(.debug),
+            applicationSupportRootURL: applicationSupportRoot,
+            namespaceSaltProvider: { _, _ in
+                namespaceSaltLoadCount.increment()
+                return expectedSalt
+            },
+            bindingIntegrationRegistryFactory: {
+                registryConstructionCount.increment()
+                return WorkspaceCodemapBindingIntegrationRegistry()
+            }
+        )
+        let runtimeRoot = CodeMapArtifactRuntime.processWideRootURL(
+            applicationSupportRootURL: applicationSupportRoot,
+            buildFlavor: .debug
+        )
+
+        XCTAssertEqual(namespaceSaltLoadCount.value, 0)
+        XCTAssertEqual(registryConstructionCount.value, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: runtimeRoot.path))
+
+        let runtime = try provider.runtime()
+
+        XCTAssertEqual(namespaceSaltLoadCount.value, 0)
+        XCTAssertEqual(registryConstructionCount.value, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: runtimeRoot.path))
+        let firstEngine = try runtime.bindingEngine()
+        let secondEngine = try runtime.bindingEngine()
+        XCTAssertTrue(firstEngine === secondEngine)
+        XCTAssertEqual(namespaceSaltLoadCount.value, 1)
+    }
+
+    func testProcessWideBindingEngineIsMemoizedAcrossRepeatedProviderAccess() throws {
+        let applicationSupportRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: applicationSupportRoot) }
+        let registry = WorkspaceCodemapBindingIntegrationRegistry()
+        let provider = CodeMapArtifactRuntime.makeProcessWideProvider(
+            identity: .repoPromptCE(.debug),
+            applicationSupportRootURL: applicationSupportRoot,
+            namespaceSaltProvider: { _, _ in
+                Data(repeating: 0x4D, count: GitBlobRepositoryNamespace.saltByteCount)
+            },
+            bindingIntegrationRegistryFactory: { registry }
+        )
+        let firstAccess = { try provider.runtime().bindingEngine() }
+        let secondAccess = { try provider.runtime().bindingEngine() }
+
+        let firstRuntime = try provider.runtime()
+        let firstEngine = try firstAccess()
+        let secondRuntime = try provider.runtime()
+        let secondEngine = try secondAccess()
+
+        XCTAssertTrue(firstRuntime === secondRuntime)
+        XCTAssertTrue(firstEngine === secondEngine)
+        XCTAssertTrue(firstRuntime.bindingIntegrationRegistry === registry)
+        XCTAssertTrue(secondRuntime.bindingIntegrationRegistry === registry)
+    }
+
     func testRuntimeProviderLazilyMemoizesOneInstanceAcrossConcurrentCallers() throws {
         let root = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -297,6 +364,98 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertEqual(accounting.manifestByteCount, 0)
     }
 
+    func testNamespaceSaltSynchronizationRetriesEINTRForFileAndDirectory() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let synchronization = NamespaceSaltSynchronizationProbe(interruptFirstAttempt: true)
+        let hooks = CodeMapRepositoryNamespaceSaltStoreHooks(
+            synchronize: { descriptor, operation in
+                synchronization.synchronize(descriptor, operation: operation)
+            }
+        )
+
+        let salt = try CodeMapRepositoryNamespaceSaltStore.loadOrCreate(
+            rootURL: root,
+            identity: .repoPromptCE(.debug),
+            hooks: hooks
+        )
+
+        XCTAssertEqual(salt.count, GitBlobRepositoryNamespace.saltByteCount)
+        XCTAssertEqual(synchronization.count(for: .temporaryFile), 2)
+        XCTAssertEqual(synchronization.count(for: .rootDirectory), 2)
+    }
+
+    func testNamespaceSaltEEXISTLoserVerifiesWinnerAndSynchronizesDirectory() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let race = NamespaceSaltPublicationRaceGate(expectedCount: 2)
+        let synchronization = NamespaceSaltSynchronizationProbe()
+        let results = NamespaceSaltRaceResults()
+        let hooks = CodeMapRepositoryNamespaceSaltStoreHooks(
+            beforePublish: { race.arriveAndWait() },
+            synchronize: { descriptor, operation in
+                synchronization.synchronize(descriptor, operation: operation)
+            }
+        )
+        let group = DispatchGroup()
+        for _ in 0 ..< 2 {
+            group.enter()
+            Thread.detachNewThread {
+                defer { group.leave() }
+                do {
+                    let salt = try CodeMapRepositoryNamespaceSaltStore.loadOrCreate(
+                        rootURL: root,
+                        identity: .repoPromptCE(.debug),
+                        hooks: hooks
+                    )
+                    results.record(salt: salt)
+                } catch {
+                    results.record(error: error)
+                }
+            }
+        }
+
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+        let snapshot = results.snapshot
+        XCTAssertTrue(snapshot.errors.isEmpty)
+        XCTAssertEqual(snapshot.salts.count, 2)
+        XCTAssertEqual(Set(snapshot.salts).count, 1)
+        XCTAssertEqual(synchronization.count(for: .temporaryFile), 2)
+        XCTAssertEqual(synchronization.count(for: .rootDirectory), 2)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.contains(".tmp.") },
+            []
+        )
+    }
+
+    func testNamespaceSaltSynchronizationPropagatesNonInterruptedFailure() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hooks = CodeMapRepositoryNamespaceSaltStoreHooks(
+            synchronize: { _, _ in
+                errno = EIO
+                return -1
+            }
+        )
+
+        do {
+            _ = try CodeMapRepositoryNamespaceSaltStore.loadOrCreate(
+                rootURL: root,
+                identity: .repoPromptCE(.debug),
+                hooks: hooks
+            )
+            XCTFail("Expected non-interrupted synchronization failure.")
+        } catch let CodeMapRepositoryNamespaceSaltStoreError.ioFailure(operation, code) {
+            XCTAssertEqual(operation, "temporary-fsync")
+            XCTAssertEqual(code, EIO)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains {
+            $0.hasPrefix("repository-namespace-salt-")
+        })
+    }
+
     private func makeSecureRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodeMapRuntime-\(UUID().uuidString)", isDirectory: true)
@@ -417,6 +576,79 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
             language: .swift,
             locatorIdentity: locator
         )
+    }
+}
+
+private final class NamespaceSaltSynchronizationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let interruptFirstAttempt: Bool
+    private var counts: [CodeMapRepositoryNamespaceSaltSynchronizationOperation: Int] = [:]
+
+    init(interruptFirstAttempt: Bool = false) {
+        self.interruptFirstAttempt = interruptFirstAttempt
+    }
+
+    func synchronize(
+        _ descriptor: Int32,
+        operation: CodeMapRepositoryNamespaceSaltSynchronizationOperation
+    ) -> Int32 {
+        let attempt = lock.withLock { () -> Int in
+            let next = (counts[operation] ?? 0) + 1
+            counts[operation] = next
+            return next
+        }
+        if interruptFirstAttempt, attempt == 1 {
+            errno = EINTR
+            return -1
+        }
+        return fsync(descriptor)
+    }
+
+    func count(for operation: CodeMapRepositoryNamespaceSaltSynchronizationOperation) -> Int {
+        lock.withLock { counts[operation] ?? 0 }
+    }
+}
+
+private final class NamespaceSaltPublicationRaceGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private let expectedCount: Int
+    private var count = 0
+
+    init(expectedCount: Int) {
+        self.expectedCount = expectedCount
+    }
+
+    func arriveAndWait(timeout: TimeInterval = 10) {
+        condition.lock()
+        count += 1
+        condition.broadcast()
+        let deadline = Date().addingTimeInterval(timeout)
+        while count < expectedCount, condition.wait(until: deadline) {}
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+private final class NamespaceSaltRaceResults: @unchecked Sendable {
+    struct Snapshot {
+        let salts: [Data]
+        let errors: [Error]
+    }
+
+    private let lock = NSLock()
+    private var salts: [Data] = []
+    private var errors: [Error] = []
+
+    var snapshot: Snapshot {
+        lock.withLock { Snapshot(salts: salts, errors: errors) }
+    }
+
+    func record(salt: Data) {
+        lock.withLock { salts.append(salt) }
+    }
+
+    func record(error: Error) {
+        lock.withLock { errors.append(error) }
     }
 }
 

@@ -218,6 +218,7 @@ enum WorkspaceCodemapLiveUnavailableDisposition: Equatable, Sendable {
 struct WorkspaceCodemapLiveManifestAdoptionTicket: Hashable, Sendable {
     let operationID: UUID
     let rootEpoch: WorkspaceCodemapRootEpoch
+    let pipelineIdentity: CodeMapPipelineIdentity
     let catalogGeneration: UInt64
     let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
     let invalidationGeneration: UInt64

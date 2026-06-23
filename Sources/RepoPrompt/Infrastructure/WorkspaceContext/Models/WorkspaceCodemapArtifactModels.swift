@@ -87,6 +87,10 @@ struct WorkspaceCodemapArtifactRequestToken: Hashable {
         guard case let .validatedWorktree(_, artifactKey, _, _) = sourceExpectation.storage else { return nil }
         return artifactKey
     }
+
+    var pipelineIdentity: CodeMapPipelineIdentity {
+        sourceExpectation.pipelineIdentity
+    }
 }
 
 private enum WorkspaceCodemapSourceExpectationStorage: Hashable {
@@ -170,6 +174,15 @@ struct WorkspaceCodemapSourceExpectation: Hashable {
         switch storage {
         case let .cleanGitBlob(_, authority),
              let .validatedWorktree(_, _, _, authority): authority
+        }
+    }
+
+    var pipelineIdentity: CodeMapPipelineIdentity {
+        switch storage {
+        case let .cleanGitBlob(locatorIdentity, _):
+            locatorIdentity.pipelineIdentity
+        case let .validatedWorktree(_, artifactKey, _, _):
+            artifactKey.pipelineIdentity
         }
     }
 }

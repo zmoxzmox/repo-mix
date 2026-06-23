@@ -320,7 +320,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             namespace: fixture.namespace,
             currentAuthority: staleAuthority
         )
-        XCTAssertEqual(stale, .stale)
+        XCTAssertEqual(stale, .stale(existingAuthority: fixture.authority))
         for namespace in try [
             namespaceLike(fixture.namespace, schemaVersion: 2),
             namespaceLike(fixture.namespace, policyVersion: 2),
@@ -596,6 +596,349 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             return XCTFail("expected final complete snapshot")
         }
         XCTAssertTrue(final.records == firstSnapshot || final.records == alternativeSnapshot)
+    }
+
+    func testIndependentStoresMergeDisjointNamespaceDeltasWithoutClobbering() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let first = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x72,
+            prefix: "",
+            path: "Sources/First.swift",
+            text: "struct First {}"
+        )
+        let second = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: first.namespace,
+            authority: first.authority,
+            path: "Sources/Second.swift",
+            text: "struct Second {}",
+            bindingGeneration: 2
+        )
+        let gate = ManifestLockedMergeGate()
+        let firstStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { gate.firstWriterAcquiredLockAndWait() }
+            )
+        )
+        let secondStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { gate.secondWriterAcquiredLock() },
+                beforeMaintenanceLock: { gate.secondWriterAttemptedLock() }
+            )
+        )
+
+        let firstWrite = Task {
+            try await firstStore.mergeCurrentManifest(
+                namespace: first.namespace,
+                authority: first.authority,
+                replacingPreviouslyObservedAuthority: nil,
+                upserting: [first.record],
+                removing: [],
+                lastAccessEpochSeconds: 1
+            )
+        }
+        XCTAssertTrue(gate.waitUntilFirstWriterAcquiredLock())
+        let secondWrite = Task {
+            try await secondStore.mergeCurrentManifest(
+                namespace: first.namespace,
+                authority: first.authority,
+                replacingPreviouslyObservedAuthority: nil,
+                upserting: [second],
+                removing: [],
+                lastAccessEpochSeconds: 2
+            )
+        }
+        XCTAssertTrue(gate.waitUntilSecondWriterAttemptedLock())
+        XCTAssertFalse(gate.didSecondWriterAcquireLock)
+        gate.releaseFirstWriter()
+        _ = try await (firstWrite.value, secondWrite.value)
+        XCTAssertTrue(gate.didSecondWriterAcquireLock)
+
+        guard case let .hit(snapshot) = try await firstStore.loadCurrentManifest(
+            namespace: first.namespace,
+            currentAuthority: first.authority
+        ) else {
+            return XCTFail("Expected merged namespace manifest.")
+        }
+        XCTAssertEqual(
+            Set(snapshot.records.map(\.repositoryRelativePath)),
+            ["Sources/First.swift", "Sources/Second.swift"]
+        )
+        XCTAssertEqual(snapshot.manifestGeneration, 2)
+    }
+
+    func testDelayedOldWriterCannotReplaceNewerNamespaceAuthority() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let original = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x73,
+            prefix: "",
+            path: "Sources/Original.swift",
+            text: "struct Original {}"
+        )
+        let newerAuthority = try authorityLike(
+            original.authority,
+            generation: original.authority.authorityGeneration + 1,
+            index: "index-new-authority"
+        )
+        let delayedRecord = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: original.namespace,
+            authority: original.authority,
+            path: "Sources/Delayed.swift",
+            text: "struct Delayed {}",
+            bindingGeneration: 2
+        )
+        let newerRecord = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: original.namespace,
+            authority: newerAuthority,
+            path: "Sources/Newer.swift",
+            text: "struct Newer {}",
+            bindingGeneration: 3
+        )
+        let baseline = try CodeMapRootManifestStore(rootURL: root)
+        _ = try await baseline.replaceCurrentManifest(
+            namespace: original.namespace,
+            authority: original.authority,
+            records: [original.record],
+            lastAccessEpochSeconds: 1
+        )
+
+        let delay = ManifestAccessRefreshGate()
+        let oldStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                beforeMaintenanceLock: { await delay.block() }
+            )
+        )
+        let newerStore = try CodeMapRootManifestStore(rootURL: root)
+        let oldWrite = Task {
+            try await oldStore.mergeCurrentManifest(
+                namespace: original.namespace,
+                authority: original.authority,
+                replacingPreviouslyObservedAuthority: original.authority,
+                upserting: [delayedRecord],
+                removing: [],
+                lastAccessEpochSeconds: 2
+            )
+        }
+        await delay.waitUntilBlocked()
+        let newerWrite = try await newerStore.mergeCurrentManifest(
+            namespace: original.namespace,
+            authority: newerAuthority,
+            replacingPreviouslyObservedAuthority: original.authority,
+            upserting: [newerRecord],
+            removing: [],
+            lastAccessEpochSeconds: 3
+        )
+        XCTAssertEqual(newerWrite, .replaced(manifestGeneration: 2))
+        await delay.release()
+        do {
+            _ = try await oldWrite.value
+            XCTFail("Expected the delayed predecessor writer to be rejected.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapRootManifestModelError, .staleAuthority)
+        }
+
+        guard case let .hit(snapshot) = try await baseline.loadCurrentManifest(
+            namespace: original.namespace,
+            currentAuthority: newerAuthority
+        ) else {
+            return XCTFail("Expected the newer namespace authority to remain published.")
+        }
+        XCTAssertEqual(snapshot.authority, newerAuthority)
+        XCTAssertEqual(snapshot.records.map(\.repositoryRelativePath), ["Sources/Newer.swift"])
+        let staleLoad = try await baseline.loadCurrentManifest(
+            namespace: original.namespace,
+            currentAuthority: original.authority
+        )
+        XCTAssertEqual(staleLoad, .stale(existingAuthority: newerAuthority))
+    }
+
+    func testStaleWriterThatObservedCurrentAuthorityCannotRollNamespaceBack() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let stale = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x74,
+            prefix: "",
+            path: "Sources/Stale.swift",
+            text: "struct Stale {}"
+        )
+        let currentAuthority = try authorityLike(
+            stale.authority,
+            generation: stale.authority.authorityGeneration + 1,
+            index: "index-current-authority"
+        )
+        let currentRecord = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: stale.namespace,
+            authority: currentAuthority,
+            path: "Sources/Current.swift",
+            text: "struct Current {}",
+            bindingGeneration: 2
+        )
+        let store = try CodeMapRootManifestStore(rootURL: root)
+        let staleSession = try await store.registerManifestWriterSession()
+        let staleWriterValue = await store.claimManifestWriterAuthority(
+            namespace: stale.namespace,
+            authority: stale.authority,
+            writerSession: staleSession
+        )
+        let staleWriter = try XCTUnwrap(staleWriterValue)
+        let currentSession = try await store.registerManifestWriterSession()
+        let currentWriterValue = await store.claimManifestWriterAuthority(
+            namespace: stale.namespace,
+            authority: currentAuthority,
+            writerSession: currentSession
+        )
+        let currentWriter = try XCTUnwrap(currentWriterValue)
+        _ = try await store.mergeCurrentManifest(
+            namespace: stale.namespace,
+            authority: currentAuthority,
+            writerAuthority: currentWriter,
+            replacingPreviouslyObservedAuthority: nil,
+            upserting: [currentRecord],
+            removing: [],
+            lastAccessEpochSeconds: 1
+        )
+
+        do {
+            _ = try await store.mergeCurrentManifest(
+                namespace: stale.namespace,
+                authority: stale.authority,
+                writerAuthority: staleWriter,
+                replacingPreviouslyObservedAuthority: currentAuthority,
+                upserting: [stale.record],
+                removing: [],
+                lastAccessEpochSeconds: 2
+            )
+            XCTFail("Expected the superseded writer session to be rejected.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapRootManifestStoreError, .staleWriterAuthority)
+        }
+        guard case let .hit(snapshot) = try await store.loadCurrentManifest(
+            namespace: stale.namespace,
+            currentAuthority: currentAuthority
+        ) else {
+            return XCTFail("Expected the current authority to remain published.")
+        }
+        XCTAssertEqual(snapshot.authority, currentAuthority)
+        XCTAssertEqual(snapshot.manifestGeneration, 1)
+        XCTAssertEqual(snapshot.records, [currentRecord])
+    }
+
+    func testNilMissRefreshesInterveningAuthorityAndRetriesDeltaMerge() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let predecessor = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x75,
+            prefix: "",
+            path: "Sources/Predecessor.swift",
+            text: "struct Predecessor {}"
+        )
+        let targetAuthority = try authorityLike(
+            predecessor.authority,
+            generation: predecessor.authority.authorityGeneration + 1,
+            index: "index-target-authority"
+        )
+        let targetRecord = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: predecessor.namespace,
+            authority: targetAuthority,
+            path: "Sources/Target.swift",
+            text: "struct Target {}",
+            bindingGeneration: 2
+        )
+        let store = try CodeMapRootManifestStore(rootURL: root)
+        let writerSession = try await store.registerManifestWriterSession()
+        let writerValue = await store.claimManifestWriterAuthority(
+            namespace: predecessor.namespace,
+            authority: targetAuthority,
+            writerSession: writerSession
+        )
+        let writer = try XCTUnwrap(writerValue)
+        let initialLoad = try await store.loadCurrentManifest(
+            namespace: predecessor.namespace,
+            currentAuthority: targetAuthority
+        )
+        XCTAssertEqual(initialLoad, .miss)
+
+        let interveningStore = try CodeMapRootManifestStore(rootURL: root)
+        _ = try await interveningStore.replaceCurrentManifest(
+            namespace: predecessor.namespace,
+            authority: predecessor.authority,
+            records: [predecessor.record],
+            lastAccessEpochSeconds: 1
+        )
+        do {
+            _ = try await store.mergeCurrentManifest(
+                namespace: predecessor.namespace,
+                authority: targetAuthority,
+                writerAuthority: writer,
+                replacingPreviouslyObservedAuthority: nil,
+                upserting: [targetRecord],
+                removing: [],
+                lastAccessEpochSeconds: 2
+            )
+            XCTFail("Expected the nil predecessor observation to conflict.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapRootManifestModelError, .staleAuthority)
+        }
+        let refreshed = try await store.loadCurrentManifest(
+            namespace: predecessor.namespace,
+            currentAuthority: targetAuthority
+        )
+        guard case let .stale(observedAuthority) = refreshed else {
+            return XCTFail("Expected the intervening authority to be observed.")
+        }
+        XCTAssertEqual(observedAuthority, predecessor.authority)
+        _ = try await store.mergeCurrentManifest(
+            namespace: predecessor.namespace,
+            authority: targetAuthority,
+            writerAuthority: writer,
+            replacingPreviouslyObservedAuthority: observedAuthority,
+            upserting: [targetRecord],
+            removing: [],
+            lastAccessEpochSeconds: 3
+        )
+        guard case let .hit(snapshot) = try await store.loadCurrentManifest(
+            namespace: predecessor.namespace,
+            currentAuthority: targetAuthority
+        ) else {
+            return XCTFail("Expected refreshed delta merge to publish.")
+        }
+        XCTAssertEqual(snapshot.authority, targetAuthority)
+        XCTAssertEqual(snapshot.records, [targetRecord])
     }
 
     func testMaintenanceRecoversInterruptedTemporaryPublication() async throws {
@@ -2405,6 +2748,67 @@ private final class ManifestAccessClock: @unchecked Sendable {
 
     init(_ value: UInt64) {
         self.value = value
+    }
+}
+
+private final class ManifestLockedMergeGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var firstWriterAcquired = false
+    private var firstWriterReleased = false
+    private var secondWriterAttempted = false
+    private var secondWriterAcquired = false
+
+    var didSecondWriterAcquireLock: Bool {
+        condition.withLock { secondWriterAcquired }
+    }
+
+    func firstWriterAcquiredLockAndWait() {
+        condition.lock()
+        firstWriterAcquired = true
+        condition.broadcast()
+        while !firstWriterReleased {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    func secondWriterAttemptedLock() {
+        condition.withLock {
+            secondWriterAttempted = true
+            condition.broadcast()
+        }
+    }
+
+    func secondWriterAcquiredLock() {
+        condition.withLock {
+            secondWriterAcquired = true
+            condition.broadcast()
+        }
+    }
+
+    func waitUntilFirstWriterAcquiredLock(timeout: TimeInterval = 10) -> Bool {
+        wait(timeout: timeout) { firstWriterAcquired }
+    }
+
+    func waitUntilSecondWriterAttemptedLock(timeout: TimeInterval = 10) -> Bool {
+        wait(timeout: timeout) { secondWriterAttempted }
+    }
+
+    func releaseFirstWriter() {
+        condition.withLock {
+            firstWriterReleased = true
+            condition.broadcast()
+        }
+    }
+
+    private func wait(timeout: TimeInterval, condition predicate: () -> Bool) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !predicate() {
+            guard condition.wait(until: deadline) else { return predicate() }
+        }
+        return true
     }
 }
 

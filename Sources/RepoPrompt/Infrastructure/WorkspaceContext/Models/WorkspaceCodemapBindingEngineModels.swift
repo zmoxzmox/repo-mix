@@ -121,15 +121,13 @@ struct WorkspaceCodemapBindingRootRegistration: Equatable {
     let capabilityRequest: WorkspaceCodemapGitCapabilityRequest
     let catalogGeneration: UInt64
     let ingressGeneration: UInt64
-    let language: LanguageType
 
     init(
         rootID: UUID,
         rootLifetimeID: UUID,
         loadedRootURL: URL,
         catalogGeneration: UInt64,
-        ingressGeneration: UInt64,
-        language: LanguageType
+        ingressGeneration: UInt64
     ) {
         capabilityRequest = WorkspaceCodemapGitCapabilityRequest(
             rootID: rootID,
@@ -138,7 +136,6 @@ struct WorkspaceCodemapBindingRootRegistration: Equatable {
         )
         self.catalogGeneration = catalogGeneration
         self.ingressGeneration = ingressGeneration
-        self.language = language
     }
 }
 

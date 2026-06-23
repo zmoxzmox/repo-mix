@@ -3,9 +3,17 @@ import Foundation
 actor WorkspaceCodemapLiveOverlay {
     private struct Registration: Equatable {
         let capability: GitCodemapRootCapability
+        let catalogGeneration: UInt64
+    }
+
+    private struct PipelineManifestState {
         let namespace: CodeMapRootManifestNamespace
         let authority: CodeMapRootManifestAuthority
-        let catalogGeneration: UInt64
+        var manifest: CodeMapRootManifestSnapshot?
+        var invalidationGeneration: UInt64
+        var adoptedInvalidationGeneration: UInt64?
+        var adoptionOperationID: UUID?
+        var cleanRelativePaths: Set<String>
     }
 
     private struct StoredReady {
@@ -53,6 +61,19 @@ actor WorkspaceCodemapLiveOverlay {
             case let .unavailable(ticket, _, _): ticket.token.requestGeneration
             }
         }
+
+        var pipelineIdentity: CodeMapPipelineIdentity {
+            switch self {
+            case let .pending(pending): pending.ticket.token.pipelineIdentity
+            case let .ready(ready): ready.completion.token.pipelineIdentity
+            case let .unavailable(ticket, _, _): ticket.token.pipelineIdentity
+            }
+        }
+    }
+
+    private struct ShadowKey: Hashable {
+        let pipelineIdentity: CodeMapPipelineIdentity
+        let relativePath: String
     }
 
     private struct Shadow {
@@ -63,14 +84,12 @@ actor WorkspaceCodemapLiveOverlay {
     private struct RootState {
         var registration: Registration
         var authorityIsCurrent: Bool
-        var manifest: CodeMapRootManifestSnapshot?
-        var manifestInvalidationGeneration: UInt64
-        var manifestAdoptedInvalidationGeneration: UInt64?
-        var manifestAdoptionOperationID: UUID?
+        var pipelines: [CodeMapPipelineIdentity: PipelineManifestState]
         var cleanByRelativePath: [String: StoredReady]
+        var cleanPipelineByRelativePath: [String: CodeMapPipelineIdentity]
         var liveByFileID: [UUID: LiveEntry]
         var liveFileIDByRelativePath: [String: UUID]
-        var shadows: [String: Shadow]
+        var shadows: [ShadowKey: Shadow]
         var contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     }
 
@@ -78,7 +97,7 @@ actor WorkspaceCodemapLiveOverlay {
         case clean(rootEpoch: WorkspaceCodemapRootEpoch, path: String)
         case live(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID)
         case unavailable(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID)
-        case shadow(rootEpoch: WorkspaceCodemapRootEpoch, path: String)
+        case shadow(rootEpoch: WorkspaceCodemapRootEpoch, key: ShadowKey)
     }
 
     private struct AccessItem {
@@ -92,6 +111,7 @@ actor WorkspaceCodemapLiveOverlay {
     private struct DemandPreflight {
         let ticket: WorkspaceCodemapLiveDemandPreflightTicket
         let identity: WorkspaceCodemapArtifactBindingIdentity
+        let pipelineIdentity: CodeMapPipelineIdentity
         let requestGeneration: UInt64
         let catalogGeneration: UInt64
     }
@@ -132,7 +152,6 @@ actor WorkspaceCodemapLiveOverlay {
 
     func register(
         capability state: WorkspaceCodemapGitCapabilityState,
-        namespace: CodeMapRootManifestNamespace,
         catalogGeneration: UInt64
     ) -> WorkspaceCodemapLiveOverlayRegistrationDisposition {
         guard case let .eligible(capability) = state else {
@@ -141,31 +160,8 @@ actor WorkspaceCodemapLiveOverlay {
         guard catalogGeneration > 0 else {
             return .rejected(.catalogGenerationInvalid)
         }
-        guard namespace.isCurrent else {
-            return .rejected(.staleNamespace)
-        }
-        let expectedNamespace: CodeMapRootManifestNamespace
-        let authority: CodeMapRootManifestAuthority
-        do {
-            expectedNamespace = try CodeMapRootManifestNamespace(
-                capability: capability,
-                pipelineIdentity: namespace.pipelineIdentity
-            )
-            authority = try CodeMapRootManifestAuthority(
-                namespace: namespace,
-                token: capability.repositoryAuthority
-            )
-        } catch {
-            return .rejected(.authorityMismatch)
-        }
-        guard expectedNamespace == namespace else {
-            return .rejected(.namespaceMismatch)
-        }
-
         let registration = Registration(
             capability: capability,
-            namespace: namespace,
-            authority: authority,
             catalogGeneration: catalogGeneration
         )
         if let current = roots[capability.rootEpoch] {
@@ -183,11 +179,9 @@ actor WorkspaceCodemapLiveOverlay {
         roots[capability.rootEpoch] = RootState(
             registration: registration,
             authorityIsCurrent: true,
-            manifest: nil,
-            manifestInvalidationGeneration: initialManifestInvalidationGeneration,
-            manifestAdoptedInvalidationGeneration: nil,
-            manifestAdoptionOperationID: nil,
+            pipelines: [:],
             cleanByRelativePath: [:],
+            cleanPipelineByRelativePath: [:],
             liveByFileID: [:],
             liveFileIDByRelativePath: [:],
             shadows: [:],
@@ -204,25 +198,53 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     func beginManifestAdoption(
-        rootEpoch: WorkspaceCodemapRootEpoch
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        namespace: CodeMapRootManifestNamespace
     ) -> WorkspaceCodemapLiveManifestAdoptionTicket? {
-        guard let root = roots[rootEpoch], root.authorityIsCurrent else { return nil }
+        guard var root = roots[rootEpoch], root.authorityIsCurrent, namespace.isCurrent else { return nil }
+        let expectedNamespace = try? CodeMapRootManifestNamespace(
+            capability: root.registration.capability,
+            pipelineIdentity: namespace.pipelineIdentity
+        )
+        guard expectedNamespace == namespace else { return nil }
+        if let current = root.pipelines[namespace.pipelineIdentity] {
+            guard current.namespace == namespace else { return nil }
+        } else {
+            guard let authority = try? CodeMapRootManifestAuthority(
+                namespace: namespace,
+                token: root.registration.capability.repositoryAuthority
+            ) else { return nil }
+            root.pipelines[namespace.pipelineIdentity] = PipelineManifestState(
+                namespace: namespace,
+                authority: authority,
+                manifest: nil,
+                invalidationGeneration: initialManifestInvalidationGeneration,
+                adoptedInvalidationGeneration: nil,
+                adoptionOperationID: nil,
+                cleanRelativePaths: []
+            )
+            roots[rootEpoch] = root
+        }
+        guard let pipeline = root.pipelines[namespace.pipelineIdentity] else { return nil }
         return WorkspaceCodemapLiveManifestAdoptionTicket(
             operationID: UUID(),
             rootEpoch: rootEpoch,
+            pipelineIdentity: namespace.pipelineIdentity,
             catalogGeneration: root.registration.catalogGeneration,
             repositoryAuthority: root.registration.capability.repositoryAuthority,
-            invalidationGeneration: root.manifestInvalidationGeneration
+            invalidationGeneration: pipeline.invalidationGeneration
         )
     }
 
     func isManifestAdoptionTicketCurrent(
         _ ticket: WorkspaceCodemapLiveManifestAdoptionTicket
     ) -> Bool {
-        guard let root = roots[ticket.rootEpoch], root.authorityIsCurrent else { return false }
+        guard let root = roots[ticket.rootEpoch], root.authorityIsCurrent,
+              let pipeline = root.pipelines[ticket.pipelineIdentity]
+        else { return false }
         return ticket.catalogGeneration == root.registration.catalogGeneration &&
             ticket.repositoryAuthority == root.registration.capability.repositoryAuthority &&
-            ticket.invalidationGeneration == root.manifestInvalidationGeneration
+            ticket.invalidationGeneration == pipeline.invalidationGeneration
     }
 
     func adoptManifest(
@@ -237,19 +259,22 @@ actor WorkspaceCodemapLiveOverlay {
         guard root.authorityIsCurrent else {
             return .rejected(.rootAuthorityInvalid)
         }
+        guard var pipeline = root.pipelines[ticket.pipelineIdentity] else {
+            return .rejected(.namespaceMismatch)
+        }
         guard ticket.catalogGeneration == root.registration.catalogGeneration,
               ticket.repositoryAuthority == root.registration.capability.repositoryAuthority,
-              ticket.invalidationGeneration == root.manifestInvalidationGeneration
+              ticket.invalidationGeneration == pipeline.invalidationGeneration
         else {
             return .rejected(.staleLoad)
         }
-        guard snapshot.namespace == root.registration.namespace else {
+        guard snapshot.namespace == pipeline.namespace else {
             return .rejected(.namespaceMismatch)
         }
-        guard snapshot.authority == root.registration.authority else {
+        guard snapshot.authority == pipeline.authority else {
             return .rejected(.authorityMismatch)
         }
-        if let currentManifest = root.manifest {
+        if let currentManifest = pipeline.manifest {
             guard snapshot.manifestGeneration >= currentManifest.manifestGeneration else {
                 return .rejected(.staleManifestGeneration)
             }
@@ -262,12 +287,26 @@ actor WorkspaceCodemapLiveOverlay {
             return .busy(.manifestLimit)
         }
 
-        let usage = usage(excludingCleanEntriesFor: rootEpoch)
+        let replacedPaths = pipeline.cleanRelativePaths
+        let replacedEntryCount = replacedPaths.count
+        let retiredShadowCount = root.shadows.keys.count(where: {
+            $0.pipelineIdentity == ticket.pipelineIdentity
+        })
+        let usage = usage(excludingCleanEntriesFor: rootEpoch, pipelineIdentity: ticket.pipelineIdentity)
         guard let projectedRootEntryCount = addingChecked(
             readyEntries.count,
-            root.liveByFileID.count
+            addingSaturating(
+                addingSaturating(
+                    subtractingFloor(root.cleanByRelativePath.count, replacedEntryCount),
+                    root.liveByFileID.count
+                ),
+                subtractingFloor(root.shadows.count, retiredShadowCount)
+            )
         ), let projectedProcessEntryCount = addingChecked(
-            subtractingFloor(usage.entryCount, root.shadows.count),
+            subtractingFloor(
+                usage.entryCount,
+                root.shadows.keys.count(where: { $0.pipelineIdentity == ticket.pipelineIdentity })
+            ),
             readyEntries.count
         ), projectedRootEntryCount <= policy.maximumEntryCountPerRoot,
         projectedProcessEntryCount <= policy.maximumEntryCount
@@ -277,7 +316,7 @@ actor WorkspaceCodemapLiveOverlay {
         }
         guard let projectedRootLeaseCount = addingChecked(
             readyEntries.count,
-            liveLeaseCount(root)
+            subtractingFloor(rootLeaseCount(root), replacedEntryCount)
         ), let projectedProcessLeaseCount = addingChecked(usage.leaseCount, readyEntries.count),
         projectedRootLeaseCount <= policy.maximumLeaseCountPerRoot,
         projectedProcessLeaseCount <= policy.maximumLeaseCount
@@ -290,10 +329,13 @@ actor WorkspaceCodemapLiveOverlay {
             guard let nextByteCount = addingChecked(
                 byteCount,
                 entry.lease.handle.estimatedResidentByteCount
-            ), let projectedRootBytes = addingChecked(liveArtifactBytes(root), nextByteCount),
-            let projectedProcessBytes = addingChecked(usage.artifactByteCount, nextByteCount),
-            projectedRootBytes <= policy.maximumArtifactByteCountPerRoot,
-            projectedProcessBytes <= policy.maximumArtifactByteCount
+            ), let projectedRootBytes = addingChecked(
+                subtractingFloor(rootArtifactBytes(root), cleanArtifactBytes(root, paths: replacedPaths)),
+                nextByteCount
+            ),
+                let projectedProcessBytes = addingChecked(usage.artifactByteCount, nextByteCount),
+                projectedRootBytes <= policy.maximumArtifactByteCountPerRoot,
+                projectedProcessBytes <= policy.maximumArtifactByteCount
             else {
                 recordBusyDrop()
                 return .busy(.artifactByteLimit)
@@ -301,14 +343,14 @@ actor WorkspaceCodemapLiveOverlay {
             byteCount = nextByteCount
         }
 
-        if let currentManifest = root.manifest,
+        if let currentManifest = pipeline.manifest,
            snapshot.manifestGeneration == currentManifest.manifestGeneration
         {
             guard manifestContentsEqual(snapshot, currentManifest) else {
                 return .rejected(.manifestGenerationConflict)
             }
-            if root.manifestAdoptedInvalidationGeneration == root.manifestInvalidationGeneration {
-                return .exactDuplicate(readyEntryCount: root.cleanByRelativePath.count)
+            if pipeline.adoptedInvalidationGeneration == pipeline.invalidationGeneration {
+                return .exactDuplicate(readyEntryCount: pipeline.cleanRelativePaths.count)
             }
         }
 
@@ -361,19 +403,29 @@ actor WorkspaceCodemapLiveOverlay {
         }
 
         ensureAccessOrdinalCapacity(requiredCount: validatedEntries.count)
-        root.manifest = snapshot
-        root.manifestAdoptedInvalidationGeneration = root.manifestInvalidationGeneration
-        root.manifestAdoptionOperationID = ticket.operationID
-        root.cleanByRelativePath = Dictionary(uniqueKeysWithValues: validatedEntries.map { relativePath, entry in
-            (relativePath, StoredReady(
+        for path in pipeline.cleanRelativePaths {
+            root.cleanByRelativePath.removeValue(forKey: path)
+            root.cleanPipelineByRelativePath.removeValue(forKey: path)
+        }
+        pipeline.manifest = snapshot
+        pipeline.adoptedInvalidationGeneration = pipeline.invalidationGeneration
+        pipeline.adoptionOperationID = ticket.operationID
+        pipeline.cleanRelativePaths = Set(validatedEntries.map(\.0))
+        for (relativePath, entry) in validatedEntries {
+            guard root.cleanByRelativePath[relativePath] == nil else {
+                return .rejected(.duplicateEntry)
+            }
+            root.cleanByRelativePath[relativePath] = StoredReady(
                 binding: entry.binding,
                 leaseOwner: WorkspaceCodemapSharedArtifactLease(entry.lease),
                 source: .cleanManifest,
                 completionTicket: nil,
                 accessOrdinal: takeAccessOrdinal()
-            ))
-        })
-        root.shadows.removeAll()
+            )
+            root.cleanPipelineByRelativePath[relativePath] = ticket.pipelineIdentity
+        }
+        root.pipelines[ticket.pipelineIdentity] = pipeline
+        root.shadows = root.shadows.filter { $0.key.pipelineIdentity != ticket.pipelineIdentity }
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         await manifestAdoptionCommitHook()
@@ -387,18 +439,28 @@ actor WorkspaceCodemapLiveOverlay {
     ) -> Bool {
         guard var root = roots[ticket.rootEpoch],
               root.authorityIsCurrent,
+              var pipeline = root.pipelines[ticket.pipelineIdentity],
               ticket.catalogGeneration == root.registration.catalogGeneration,
               ticket.repositoryAuthority == root.registration.capability.repositoryAuthority,
-              ticket.invalidationGeneration == root.manifestInvalidationGeneration,
-              root.manifestAdoptedInvalidationGeneration == ticket.invalidationGeneration,
-              root.manifestAdoptionOperationID == ticket.operationID,
-              root.manifest?.manifestGeneration == manifestGeneration
+              ticket.invalidationGeneration == pipeline.invalidationGeneration,
+              pipeline.adoptedInvalidationGeneration == ticket.invalidationGeneration,
+              pipeline.adoptionOperationID == ticket.operationID,
+              pipeline.manifest?.manifestGeneration == manifestGeneration
         else { return false }
-        root.manifest = nil
-        root.manifestAdoptedInvalidationGeneration = nil
-        root.manifestAdoptionOperationID = nil
-        root.cleanByRelativePath.removeAll()
-        advanceManifestInvalidationGeneration(&root, rootEpoch: ticket.rootEpoch)
+        for path in pipeline.cleanRelativePaths {
+            root.cleanByRelativePath.removeValue(forKey: path)
+            root.cleanPipelineByRelativePath.removeValue(forKey: path)
+        }
+        pipeline.manifest = nil
+        pipeline.adoptedInvalidationGeneration = nil
+        pipeline.adoptionOperationID = nil
+        pipeline.cleanRelativePaths.removeAll()
+        guard advanceManifestInvalidationGeneration(
+            &pipeline,
+            root: &root,
+            rootEpoch: ticket.rootEpoch
+        ) else { return false }
+        root.pipelines[ticket.pipelineIdentity] = pipeline
         if root.authorityIsCurrent {
             advanceContributionGeneration(&root, rootEpoch: ticket.rootEpoch)
         }
@@ -409,6 +471,7 @@ actor WorkspaceCodemapLiveOverlay {
     func preflightDemand(
         owner: WorkspaceCodemapLiveDemandOwner,
         identity: WorkspaceCodemapArtifactBindingIdentity,
+        pipelineIdentity: CodeMapPipelineIdentity,
         requestGeneration: UInt64,
         catalogGeneration: UInt64
     ) -> WorkspaceCodemapLiveDemandPreflightDisposition {
@@ -430,8 +493,16 @@ actor WorkspaceCodemapLiveOverlay {
         else {
             return .rejected(.invalidToken)
         }
+        if let existing = root.cleanByRelativePath[identity.standardizedRelativePath],
+           existing.binding.identity == identity,
+           existing.completion.token.pipelineIdentity == pipelineIdentity,
+           existing.completion.token.requestGeneration == requestGeneration
+        {
+            return .ready(readySnapshot(rootEpoch: rootEpoch, ready: existing))
+        }
         if let existing = root.liveByFileID[identity.fileID],
            existing.identity == identity,
+           existing.pipelineIdentity == pipelineIdentity,
            existing.requestGeneration == requestGeneration,
            case let .ready(ready) = existing
         {
@@ -465,6 +536,7 @@ actor WorkspaceCodemapLiveOverlay {
         demandPreflights[ticket.reservationID] = DemandPreflight(
             ticket: ticket,
             identity: identity,
+            pipelineIdentity: pipelineIdentity,
             requestGeneration: requestGeneration,
             catalogGeneration: catalogGeneration
         )
@@ -490,6 +562,7 @@ actor WorkspaceCodemapLiveOverlay {
                   reservation.ticket == preflight,
                   reservation.ticket.owner == owner,
                   reservation.identity == token.identity,
+                  reservation.pipelineIdentity == token.pipelineIdentity,
                   reservation.requestGeneration == token.requestGeneration,
                   reservation.catalogGeneration == token.catalogGeneration
             else {
@@ -591,7 +664,11 @@ actor WorkspaceCodemapLiveOverlay {
             guard case let .pending(pending)? = root.liveByFileID[fileID] else { return partial }
             return partial + pending.owners.count
         }
-        let removesShadow = root.shadows[relativePath] != nil
+        let shadowKey = ShadowKey(
+            pipelineIdentity: token.pipelineIdentity,
+            relativePath: relativePath
+        )
+        let removesShadow = root.shadows[shadowKey] != nil
         let rootPreflightCount = demandPreflights.values.count(where: {
             $0.ticket.rootEpoch == rootEpoch
         })
@@ -619,7 +696,7 @@ actor WorkspaceCodemapLiveOverlay {
             let removedEntries = removalFileIDs.reduce(0) {
                 addingSaturating($0, currentRoot.liveByFileID[$1] == nil ? 0 : 1)
             }
-            let shadowEntries = removesShadow && currentRoot.shadows[relativePath] != nil ? 1 : 0
+            let shadowEntries = removesShadow && currentRoot.shadows[shadowKey] != nil ? 1 : 0
             return (
                 addingSaturating(
                     addingSaturating(
@@ -666,7 +743,7 @@ actor WorkspaceCodemapLiveOverlay {
         for fileID in removalFileIDs {
             removeLiveEntry(fileID: fileID, from: &root)
         }
-        root.shadows.removeValue(forKey: relativePath)
+        root.shadows.removeValue(forKey: shadowKey)
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         let ticket = WorkspaceCodemapLiveDemandTicket(
             token: token,
@@ -740,8 +817,11 @@ actor WorkspaceCodemapLiveOverlay {
         if pending.owners.isEmpty {
             let path = pending.binding.identity.standardizedRelativePath
             removeLiveEntry(fileID: pending.binding.identity.fileID, from: &root)
-            root.shadows[path] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
-            advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
+            root.shadows[ShadowKey(
+                pipelineIdentity: pending.ticket.token.pipelineIdentity,
+                relativePath: path
+            )] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
+            advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
             advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         } else {
             root.liveByFileID[ticket.token.identity.fileID] = .pending(pending)
@@ -779,8 +859,11 @@ actor WorkspaceCodemapLiveOverlay {
                 if pending.owners.isEmpty {
                     let path = pending.binding.identity.standardizedRelativePath
                     removeLiveEntry(fileID: fileID, from: &root)
-                    root.shadows[path] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
-                    advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
+                    root.shadows[ShadowKey(
+                        pipelineIdentity: pending.ticket.token.pipelineIdentity,
+                        relativePath: path
+                    )] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
+                    advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
                 } else {
                     root.liveByFileID[fileID] = .pending(pending)
                 }
@@ -992,24 +1075,40 @@ actor WorkspaceCodemapLiveOverlay {
         for path in standardizedRelativePaths {
             guard let relativePath = validatedRelativePath(path) else { continue }
             observedValidPath = true
+            var affectedPipelines: Set<CodeMapPipelineIdentity> = []
             let removedClean = root.cleanByRelativePath.removeValue(forKey: relativePath) != nil
+            if let pipelineIdentity = root.cleanPipelineByRelativePath.removeValue(forKey: relativePath),
+               var pipeline = root.pipelines[pipelineIdentity]
+            {
+                affectedPipelines.insert(pipelineIdentity)
+                pipeline.cleanRelativePaths.remove(relativePath)
+                root.pipelines[pipelineIdentity] = pipeline
+            }
             let liveFileID = root.liveFileIDByRelativePath[relativePath]
-            if let liveFileID {
+            if let liveFileID, let live = root.liveByFileID[liveFileID] {
+                affectedPipelines.insert(live.pipelineIdentity)
                 removeLiveEntry(fileID: liveFileID, from: &root)
             }
-            let manifestContainsPath = root.manifest?.records.contains(where: {
+            for (pipelineIdentity, pipeline) in root.pipelines where pipeline.manifest?.records.contains(where: {
                 loadedRootRelativePath(
                     repositoryRelativePath: $0.repositoryRelativePath,
                     prefix: root.registration.capability.repositoryRelativeLoadedRootPrefix
                 ) == relativePath
-            }) == true
-            if removedClean || liveFileID != nil || manifestContainsPath {
+            }) == true {
+                affectedPipelines.insert(pipelineIdentity)
+            }
+            if removedClean || liveFileID != nil || !affectedPipelines.isEmpty {
                 invalidated = addingSaturating(invalidated, 1)
-                root.shadows[relativePath] = Shadow(reason: reason, accessOrdinal: takeAccessOrdinal())
+                for pipelineIdentity in affectedPipelines {
+                    root.shadows[ShadowKey(
+                        pipelineIdentity: pipelineIdentity,
+                        relativePath: relativePath
+                    )] = Shadow(reason: reason, accessOrdinal: takeAccessOrdinal())
+                }
             }
         }
         if observedValidPath {
-            advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
+            advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
             advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         }
         roots[rootEpoch] = root
@@ -1027,11 +1126,10 @@ actor WorkspaceCodemapLiveOverlay {
         else { return false }
         root.authorityIsCurrent = false
         removeAdmissionReservations(rootEpoch: rootEpoch)
-        advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
-        root.manifest = nil
-        root.manifestAdoptedInvalidationGeneration = nil
-        root.manifestAdoptionOperationID = nil
+        advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
+        root.pipelines.removeAll()
         root.cleanByRelativePath.removeAll()
+        root.cleanPipelineByRelativePath.removeAll()
         root.liveByFileID.removeAll()
         root.liveFileIDByRelativePath.removeAll()
         root.shadows.removeAll()
@@ -1053,7 +1151,9 @@ actor WorkspaceCodemapLiveOverlay {
             repositoryAuthority: root.registration.capability.repositoryAuthority,
             contributionGeneration: root.contributionGeneration,
             authorityIsCurrent: root.authorityIsCurrent,
-            manifestGeneration: root.manifest?.manifestGeneration,
+            manifestGeneration: root.pipelines.count == 1
+                ? root.pipelines.values.first?.manifest?.manifestGeneration
+                : nil,
             entries: entrySnapshots(rootEpoch: rootEpoch, root: root)
         )
     }
@@ -1173,10 +1273,10 @@ actor WorkspaceCodemapLiveOverlay {
                 ))
             }
         }
-        for (relativePath, shadow) in root.shadows {
+        for (key, shadow) in root.shadows {
             result.append(WorkspaceCodemapLiveEntrySnapshot(
                 fileID: nil,
-                standardizedRelativePath: relativePath,
+                standardizedRelativePath: key.relativePath,
                 requestGeneration: nil,
                 state: .shadowed(shadow.reason)
             ))
@@ -1190,8 +1290,13 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     private func visibleReadyEntries(_ root: RootState) -> [StoredReady] {
-        var result = root.cleanByRelativePath.compactMap { path, entry in
-            root.liveFileIDByRelativePath[path] == nil && root.shadows[path] == nil ? entry : nil
+        var result: [StoredReady] = root.cleanByRelativePath.compactMap { path, entry in
+            guard let pipelineIdentity = root.cleanPipelineByRelativePath[path] else { return nil }
+            let shadowKey = ShadowKey(
+                pipelineIdentity: pipelineIdentity,
+                relativePath: path
+            )
+            return root.liveFileIDByRelativePath[path] == nil && root.shadows[shadowKey] == nil ? entry : nil
         }
         result.append(contentsOf: root.liveByFileID.values.compactMap {
             guard case let .ready(ready) = $0 else { return nil }
@@ -1215,10 +1320,15 @@ actor WorkspaceCodemapLiveOverlay {
         let cleanPaths = root.cleanByRelativePath.keys.sorted {
             $0.utf8.lexicographicallyPrecedes($1.utf8)
         }
-        for path in cleanPaths
-            where root.liveFileIDByRelativePath[path] == nil && root.shadows[path] == nil
-        {
-            guard var ready = root.cleanByRelativePath[path] else { continue }
+        for path in cleanPaths {
+            guard let pipelineIdentity = root.cleanPipelineByRelativePath[path],
+                  root.liveFileIDByRelativePath[path] == nil,
+                  root.shadows[ShadowKey(
+                      pipelineIdentity: pipelineIdentity,
+                      relativePath: path
+                  )] == nil,
+                  var ready = root.cleanByRelativePath[path]
+            else { continue }
             ready.accessOrdinal = takeAccessOrdinal()
             root.cleanByRelativePath[path] = ready
         }
@@ -1288,7 +1398,10 @@ actor WorkspaceCodemapLiveOverlay {
         )
     }
 
-    private func usage(excludingCleanEntriesFor rootEpoch: WorkspaceCodemapRootEpoch? = nil) -> (
+    private func usage(
+        excludingCleanEntriesFor rootEpoch: WorkspaceCodemapRootEpoch? = nil,
+        pipelineIdentity: CodeMapPipelineIdentity? = nil
+    ) -> (
         entryCount: Int,
         waiterCount: Int,
         leaseCount: Int,
@@ -1296,11 +1409,16 @@ actor WorkspaceCodemapLiveOverlay {
     ) {
         roots.reduce(into: (0, 0, 0, UInt64(0))) { partial, element in
             let accounting = rootAccounting(rootEpoch: element.key, root: element.value)
-            let cleanCount = element.key == rootEpoch ? element.value.cleanByRelativePath.count : 0
+            let excludedPaths: Set<String> = if element.key == rootEpoch, let pipelineIdentity {
+                element.value.pipelines[pipelineIdentity]?.cleanRelativePaths ?? []
+            } else if element.key == rootEpoch {
+                Set(element.value.cleanByRelativePath.keys)
+            } else {
+                []
+            }
+            let cleanCount = excludedPaths.count
             let cleanBytes: UInt64 = element.key == rootEpoch
-                ? element.value.cleanByRelativePath.values.reduce(0) {
-                    addingSaturating($0, $1.leaseOwner.lease.handle.estimatedResidentByteCount)
-                }
+                ? cleanArtifactBytes(element.value, paths: excludedPaths)
                 : 0
             partial.0 = addingSaturating(partial.0, subtractingFloor(accounting.entryCount, cleanCount))
             partial.1 = addingSaturating(partial.1, accounting.waiterCount)
@@ -1358,6 +1476,13 @@ actor WorkspaceCodemapLiveOverlay {
         )
     }
 
+    private func cleanArtifactBytes(_ root: RootState, paths: Set<String>) -> UInt64 {
+        paths.reduce(UInt64(0)) { partial, path in
+            guard let ready = root.cleanByRelativePath[path] else { return partial }
+            return addingSaturating(partial, ready.leaseOwner.lease.handle.estimatedResidentByteCount)
+        }
+    }
+
     private func liveArtifactBytes(_ root: RootState) -> UInt64 {
         root.liveByFileID.values.reduce(0) {
             guard case let .ready(ready) = $1 else { return $0 }
@@ -1380,17 +1505,19 @@ actor WorkspaceCodemapLiveOverlay {
             let rootEpoch: WorkspaceCodemapRootEpoch
             let relativePath: String
             let fileID: UUID?
+            let shadowKey: ShadowKey?
             let isShadow: Bool
             let isNegative: Bool
             let accessOrdinal: UInt64
         }
         var candidates: [Candidate] = []
         for (rootEpoch, root) in roots where requiredRootEpoch == nil || requiredRootEpoch == rootEpoch {
-            for (path, shadow) in root.shadows {
+            for (key, shadow) in root.shadows {
                 candidates.append(Candidate(
                     rootEpoch: rootEpoch,
-                    relativePath: path,
+                    relativePath: key.relativePath,
                     fileID: nil,
+                    shadowKey: key,
                     isShadow: true,
                     isNegative: true,
                     accessOrdinal: shadow.accessOrdinal
@@ -1401,6 +1528,7 @@ actor WorkspaceCodemapLiveOverlay {
                     rootEpoch: rootEpoch,
                     relativePath: path,
                     fileID: nil,
+                    shadowKey: nil,
                     isShadow: false,
                     isNegative: false,
                     accessOrdinal: ready.accessOrdinal
@@ -1413,6 +1541,7 @@ actor WorkspaceCodemapLiveOverlay {
                         rootEpoch: rootEpoch,
                         relativePath: ready.binding.identity.standardizedRelativePath,
                         fileID: fileID,
+                        shadowKey: nil,
                         isShadow: false,
                         isNegative: false,
                         accessOrdinal: ready.accessOrdinal
@@ -1422,6 +1551,7 @@ actor WorkspaceCodemapLiveOverlay {
                         rootEpoch: rootEpoch,
                         relativePath: ticket.token.identity.standardizedRelativePath,
                         fileID: fileID,
+                        shadowKey: nil,
                         isShadow: false,
                         isNegative: true,
                         accessOrdinal: accessOrdinal
@@ -1448,17 +1578,19 @@ actor WorkspaceCodemapLiveOverlay {
         }), var root = roots[candidate.rootEpoch]
         else { return false }
 
-        if candidate.isShadow {
-            root.shadows.removeValue(forKey: candidate.relativePath)
-            root.cleanByRelativePath.removeValue(forKey: candidate.relativePath)
+        if let shadowKey = candidate.shadowKey {
+            root.shadows.removeValue(forKey: shadowKey)
+            if root.cleanPipelineByRelativePath[shadowKey.relativePath] == shadowKey.pipelineIdentity {
+                removeCleanEntry(path: shadowKey.relativePath, from: &root)
+            }
         } else if let fileID = candidate.fileID {
             removeLiveEntry(fileID: fileID, from: &root)
-            root.cleanByRelativePath.removeValue(forKey: candidate.relativePath)
+            removeCleanEntry(path: candidate.relativePath, from: &root)
         } else {
-            root.cleanByRelativePath.removeValue(forKey: candidate.relativePath)
+            removeCleanEntry(path: candidate.relativePath, from: &root)
         }
         if candidate.isNegative {
-            advanceManifestInvalidationGeneration(&root, rootEpoch: candidate.rootEpoch)
+            advanceAllManifestInvalidationGenerations(&root, rootEpoch: candidate.rootEpoch)
         }
         advanceContributionGeneration(&root, rootEpoch: candidate.rootEpoch)
         roots[candidate.rootEpoch] = root
@@ -1478,16 +1610,44 @@ actor WorkspaceCodemapLiveOverlay {
         root.contributionGeneration = .init(rawValue: next)
     }
 
+    @discardableResult
     private func advanceManifestInvalidationGeneration(
+        _ pipeline: inout PipelineManifestState,
+        root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        let (next, overflow) = pipeline.invalidationGeneration.addingReportingOverflow(1)
+        guard !overflow else {
+            failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
+            return false
+        }
+        pipeline.invalidationGeneration = next
+        return true
+    }
+
+    private func advanceAllManifestInvalidationGenerations(
         _ root: inout RootState,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        let (next, overflow) = root.manifestInvalidationGeneration.addingReportingOverflow(1)
-        guard !overflow else {
-            failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
-            return
+        for identity in root.pipelines.keys {
+            guard var pipeline = root.pipelines[identity],
+                  advanceManifestInvalidationGeneration(
+                      &pipeline,
+                      root: &root,
+                      rootEpoch: rootEpoch
+                  )
+            else { return }
+            root.pipelines[identity] = pipeline
         }
-        root.manifestInvalidationGeneration = next
+    }
+
+    private func removeCleanEntry(path: String, from root: inout RootState) {
+        root.cleanByRelativePath.removeValue(forKey: path)
+        guard let identity = root.cleanPipelineByRelativePath.removeValue(forKey: path),
+              var pipeline = root.pipelines[identity]
+        else { return }
+        pipeline.cleanRelativePaths.remove(path)
+        root.pipelines[identity] = pipeline
     }
 
     private func failClosedGenerationExhaustion(
@@ -1548,12 +1708,12 @@ actor WorkspaceCodemapLiveOverlay {
                     break
                 }
             }
-            for (path, shadow) in root.shadows {
+            for (key, shadow) in root.shadows {
                 items.append(AccessItem(
-                    location: .shadow(rootEpoch: rootEpoch, path: path),
+                    location: .shadow(rootEpoch: rootEpoch, key: key),
                     ordinal: shadow.accessOrdinal,
                     rootEpoch: rootEpoch,
-                    path: path,
+                    path: key.relativePath,
                     fileID: nil
                 ))
             }
@@ -1589,10 +1749,10 @@ actor WorkspaceCodemapLiveOverlay {
                         accessOrdinal: ordinal
                     )
                 }
-            case let .shadow(_, path):
-                if var shadow = root.shadows[path] {
+            case let .shadow(_, key):
+                if var shadow = root.shadows[key] {
                     shadow.accessOrdinal = ordinal
-                    root.shadows[path] = shadow
+                    root.shadows[key] = shadow
                 }
             }
             roots[item.rootEpoch] = root

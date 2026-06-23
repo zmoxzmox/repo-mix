@@ -29,20 +29,62 @@ actor WorkspaceCodemapBindingEngine {
         let state: WorkspaceCodemapGitCapabilityState
     }
 
+    private struct PipelineSession {
+        let id: UUID
+        let language: LanguageType
+        let pipelineIdentity: CodeMapPipelineIdentity
+        let namespace: CodeMapRootManifestNamespace
+        let authority: CodeMapRootManifestAuthority
+        var previouslyObservedManifestAuthority: CodeMapRootManifestAuthority?
+        var manifestRecords: [String: CodeMapRootManifestRecord]
+        var manifestState: WorkspaceCodemapBindingManifestState
+        var manifestLoadStarted: Bool
+        var manifestLoadFinished: Bool
+        var manifestRevision: UInt64
+        var persistedManifestRevision: UInt64
+        var pendingManifestChanges: [String: PendingManifestChange]
+    }
+
     private struct Session {
         let id: UUID
         let registration: WorkspaceCodemapBindingRootRegistration
         let capability: GitCodemapRootCapability
-        let namespace: CodeMapRootManifestNamespace
-        let authority: CodeMapRootManifestAuthority
-        let pipelineIdentity: CodeMapPipelineIdentity
-        var manifestRecords: [String: CodeMapRootManifestRecord]
-        var manifestState: WorkspaceCodemapBindingManifestState
+        let manifestWriterSession: CodeMapRootManifestWriterSessionToken
+        var pipelines: [CodeMapPipelineIdentity: PipelineSession]
         var pathGenerations: [String: UInt64]
         var generation: UInt64
         var invalidationGeneration: UInt64
-        var manifestRevision: UInt64
-        var persistedManifestRevision: UInt64
+    }
+
+    private struct PipelineScope: Hashable {
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let pipelineIdentity: CodeMapPipelineIdentity
+    }
+
+    private enum ManifestAdoptionOutcome {
+        case terminal(adoptedReadyCount: Int)
+        case retryable
+        case superseded
+    }
+
+    private struct ManifestAdoptionAttempt {
+        let operationID: UUID
+        let scope: PipelineScope
+        let sessionID: UUID
+        let sessionGeneration: UInt64
+        let invalidationGeneration: UInt64
+        let pipelineSessionID: UUID
+        let catalogGeneration: UInt64
+        let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        let namespace: CodeMapRootManifestNamespace
+        let authority: CodeMapRootManifestAuthority
+        let manifestRevision: UInt64
+    }
+
+    private struct ManifestAdoptionOperation {
+        let attempt: ManifestAdoptionAttempt
+        let task: Task<ManifestAdoptionOutcome, Never>
+        var waiters: [UUID: CheckedContinuation<Void, Never>]
     }
 
     private struct ActiveRequest {
@@ -53,7 +95,8 @@ actor WorkspaceCodemapBindingEngine {
         let relativePath: String
         let sessionID: UUID
         let sessionGeneration: UInt64
-        let invalidationGeneration: UInt64
+        let pipelineIdentity: CodeMapPipelineIdentity
+        let pipelineSessionID: UUID
         let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
         let reservedSourceBytes: UInt64
         var overlayOwner: WorkspaceCodemapLiveDemandOwner?
@@ -78,9 +121,12 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     private struct ManifestAdoptionContext {
+        let operationID: UUID
         let sessionID: UUID
         let sessionGeneration: UInt64
         let invalidationGeneration: UInt64
+        let pipelineIdentity: CodeMapPipelineIdentity
+        let pipelineSessionID: UUID
         let catalogGeneration: UInt64
         let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
         let namespace: CodeMapRootManifestNamespace
@@ -97,7 +143,20 @@ actor WorkspaceCodemapBindingEngine {
         let lease: CodeMapArtifactLease?
     }
 
+    private struct PendingManifestChange {
+        let revision: UInt64
+        let record: CodeMapRootManifestRecord?
+    }
+
+    private struct ManifestWriterWorkKey: Hashable {
+        let scope: PipelineScope
+        let sessionID: UUID
+        let pipelineSessionID: UUID
+    }
+
     private struct ManifestWriteWaiter {
+        let id: UUID
+        let workKey: ManifestWriterWorkKey
         let revision: UInt64
         let continuation: CheckedContinuation<Bool, Never>
     }
@@ -105,6 +164,10 @@ actor WorkspaceCodemapBindingEngine {
     private struct ManifestWriterState {
         var writerID: UUID?
         var task: Task<Void, Never>?
+        var queuedWork: [ManifestWriterWorkKey] = []
+        var queuedWorkSet: Set<ManifestWriterWorkKey> = []
+        var inFlightWork: ManifestWriterWorkKey?
+        var inFlightRevision: UInt64?
         var waiters: [ManifestWriteWaiter] = []
     }
 
@@ -139,6 +202,7 @@ actor WorkspaceCodemapBindingEngine {
     private struct ValidatedDemandContext {
         let rootEpoch: WorkspaceCodemapRootEpoch
         let session: Session
+        let pipelineIdentity: CodeMapPipelineIdentity
         let pathGeneration: UInt64
     }
 
@@ -174,6 +238,7 @@ actor WorkspaceCodemapBindingEngine {
     private let accessEpochSeconds: @Sendable () -> UInt64
     private var roots: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
     private var activeRequests: [UUID: ActiveRequest] = [:]
+    private var drainingRequestTasks: [UUID: Task<Void, Never>] = [:]
     private var queuedRequests: [UUID: QueuedRequest] = [:]
     private var queueOrder: [UUID] = []
     private var nextQueueOrdinal: UInt64 = 1
@@ -181,9 +246,11 @@ actor WorkspaceCodemapBindingEngine {
     private var rootLastAdmission: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     private var ownerLastAdmission: [OwnerKey: UInt64] = [:]
     private var consecutiveDemandAdmissions = 0
-    private var manifestWriters: [WorkspaceCodemapRootEpoch: ManifestWriterState] = [:]
-    private var adoptionReservations: [WorkspaceCodemapRootEpoch: AdoptionReservation] = [:]
-    private var retainedAdoptions: [WorkspaceCodemapRootEpoch: AdoptionReservation] = [:]
+    private var manifestWriters: [CodeMapRootManifestNamespace: ManifestWriterState] = [:]
+    private var adoptionReservations: [PipelineScope: AdoptionReservation] = [:]
+    private var retainedAdoptions: [PipelineScope: AdoptionReservation] = [:]
+    private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
+    private var drainingManifestAdoptionTasks: [UUID: Task<ManifestAdoptionOutcome, Never>] = [:]
     private var registrationOperations: Set<UUID> = []
     private var registrationDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var isShuttingDown = false
@@ -296,77 +363,60 @@ actor WorkspaceCodemapBindingEngine {
             return .unavailable(capabilityState)
         }
 
-        do {
-            let pipeline = try SyntaxManager.shared.pipelineIdentity(
-                for: registration.language,
-                decoderPolicy: .workspaceAutomaticV1
-            )
-            let namespace = try CodeMapRootManifestNamespace(
-                capability: capability,
-                pipelineIdentity: pipeline
-            )
-            let authority = try CodeMapRootManifestAuthority(
-                namespace: namespace,
-                token: capability.repositoryAuthority
-            )
-            let registrationDisposition = await overlay.register(
-                capability: capabilityState,
-                namespace: namespace,
-                catalogGeneration: registration.catalogGeneration
-            )
-            guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
-                _ = await overlay.unregister(rootEpoch: rootEpoch)
-                await capabilityService.release(rootEpoch: rootEpoch)
-                finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
-                return .failed
-            }
-            switch registrationDisposition {
-            case .registered, .exactDuplicate:
-                break
-            case .busy:
-                await capabilityService.release(rootEpoch: rootEpoch)
-                finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
-                recordBusy(rootEpoch)
-                return .busy
-            case .rejected:
-                await capabilityService.release(rootEpoch: rootEpoch)
-                finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
-                recordFailure(rootEpoch)
-                return .failed
-            }
-
-            let sessionID = UUID()
-            roots[rootEpoch] = .eligible(Session(
-                id: sessionID,
-                registration: registration,
-                capability: capability,
-                namespace: namespace,
-                authority: authority,
-                pipelineIdentity: pipeline,
-                manifestRecords: [:],
-                manifestState: .miss,
-                pathGenerations: [:],
-                generation: 1,
-                invalidationGeneration: 1,
-                manifestRevision: 0,
-                persistedManifestRevision: 0
-            ))
-            emit(.capabilityEligible, rootEpoch: rootEpoch)
-            let adopted = await loadAndAdoptManifest(rootEpoch: rootEpoch)
-            guard case let .eligible(current)? = roots[rootEpoch],
-                  current.id == sessionID,
-                  current.registration == registration
-            else { return .failed }
-            return .registered(adoptedReadyCount: adopted)
-        } catch {
-            if registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) {
-                _ = await overlay.unregister(rootEpoch: rootEpoch)
-            }
+        let registrationDisposition = await overlay.register(
+            capability: capabilityState,
+            catalogGeneration: registration.catalogGeneration
+        )
+        guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
+            _ = await overlay.unregister(rootEpoch: rootEpoch)
+            await capabilityService.release(rootEpoch: rootEpoch)
+            finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
+            return .failed
+        }
+        switch registrationDisposition {
+        case .registered, .exactDuplicate:
+            break
+        case .busy:
+            await capabilityService.release(rootEpoch: rootEpoch)
+            finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
+            recordBusy(rootEpoch)
+            return .busy
+        case .rejected:
             await capabilityService.release(rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             recordFailure(rootEpoch)
             return .failed
         }
+
+        let manifestWriterSession: CodeMapRootManifestWriterSessionToken
+        do {
+            manifestWriterSession = try await runtime.manifestStore.registerManifestWriterSession()
+        } catch {
+            _ = await overlay.unregister(rootEpoch: rootEpoch)
+            await capabilityService.release(rootEpoch: rootEpoch)
+            finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
+            recordFailure(rootEpoch)
+            return .failed
+        }
+        guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
+            await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
+            _ = await overlay.unregister(rootEpoch: rootEpoch)
+            await capabilityService.release(rootEpoch: rootEpoch)
+            finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
+            return .failed
+        }
+        roots[rootEpoch] = .eligible(Session(
+            id: UUID(),
+            registration: registration,
+            capability: capability,
+            manifestWriterSession: manifestWriterSession,
+            pipelines: [:],
+            pathGenerations: [:],
+            generation: 1,
+            invalidationGeneration: 1
+        ))
+        emit(.capabilityEligible, rootEpoch: rootEpoch)
+        return .registered(adoptedReadyCount: 0)
     }
 
     func demand(_ demand: WorkspaceCodemapBindingDemand) async -> WorkspaceCodemapBindingDemandResult {
@@ -405,31 +455,9 @@ actor WorkspaceCodemapBindingEngine {
 
     @discardableResult
     private func cancelRequest(requestID: UUID) async -> Bool {
-        if let queued = queuedRequests.removeValue(forKey: requestID) {
-            queueOrder.removeAll { $0 == requestID }
-            queued.continuation?.resume(returning: .cancelled)
-            scheduleQueuedRequests()
-            return true
-        }
-        guard var request = activeRequests[requestID], !request.cancelled else { return false }
-        request.cancelled = true
-        request.task?.cancel()
-        let owner = request.overlayOwner
-        let ticket = request.ticket
-        let preflight = request.preflight
-        request.ticket = nil
-        request.preflight = nil
-        let continuation = request.continuation
-        request.continuation = nil
-        activeRequests[requestID] = request
-        continuation?.resume(returning: .cancelled)
-        if let owner, let ticket {
-            _ = await overlay.cancelDemand(owner: owner, ticket: ticket)
-        }
-        if let preflight {
-            _ = await overlay.cancelDemandPreflight(preflight)
-        }
-        return true
+        let cancellationBatch = synchronouslyCancelRequests([requestID])
+        await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
+        return cancellationBatch.cancelledRequestCount == 1
     }
 
     func invalidateModified(
@@ -481,14 +509,26 @@ actor WorkspaceCodemapBindingEngine {
             emit(.rootUnload, rootEpoch: rootEpoch)
             return
         }
+        let manifestWriterSession: CodeMapRootManifestWriterSessionToken? = if case let .eligible(session)? =
+            roots[rootEpoch]
+        {
+            session.manifestWriterSession
+        } else {
+            nil
+        }
         let requestIDs = queuedRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id) +
             activeRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
         roots.removeValue(forKey: rootEpoch)
-        cancelManifestWriter(rootEpoch: rootEpoch)
+        detachManifestWriters(rootEpoch: rootEpoch)
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs)
+        if let manifestWriterSession {
+            await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
+        }
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         _ = await overlay.unregister(rootEpoch: rootEpoch)
-        retainedAdoptions.removeValue(forKey: rootEpoch)
+        adoptionReservations = adoptionReservations.filter { $0.key.rootEpoch != rootEpoch }
+        retainedAdoptions = retainedAdoptions.filter { $0.key.rootEpoch != rootEpoch }
         pruneAdmissionHistory()
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         await capabilityService.release(rootEpoch: rootEpoch)
@@ -504,18 +544,35 @@ actor WorkspaceCodemapBindingEngine {
 
         isShuttingDown = true
         let rootEpochs = Array(roots.keys)
+        let manifestWriterSessions = roots.values.compactMap { record -> CodeMapRootManifestWriterSessionToken? in
+            guard case let .eligible(session) = record else { return nil }
+            return session.manifestWriterSession
+        }
         let requestIDs = Array(queuedRequests.keys) + Array(activeRequests.keys)
-        let requestTasks = activeRequests.values.compactMap(\.task)
         roots.removeAll()
-        let writerTasks = Array(manifestWriters.keys).compactMap { cancelManifestWriter(rootEpoch: $0) }
+        let writerTasks = cancelAllManifestWriters()
         let cancellationBatch = synchronouslyCancelRequests(requestIDs)
         adoptionReservations.removeAll()
         retainedAdoptions.removeAll()
+        let adoptionOperations = Array(manifestAdoptionOperations.values)
+        manifestAdoptionOperations.removeAll()
+        for operation in adoptionOperations {
+            operation.task.cancel()
+            drainingManifestAdoptionTasks[operation.attempt.operationID] = operation.task
+            for waiter in operation.waiters.values {
+                waiter.resume()
+            }
+        }
+        let adoptionTasks = Array(drainingManifestAdoptionTasks.values)
         rootLastAdmission.removeAll()
         ownerLastAdmission.removeAll()
         consecutiveDemandAdmissions = 0
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
+        let requestTasks = Array(drainingRequestTasks.values)
 
+        for writerSession in manifestWriterSessions {
+            await runtime.manifestStore.endManifestWriterSession(writerSession)
+        }
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         for rootEpoch in rootEpochs {
             _ = await overlay.unregister(rootEpoch: rootEpoch)
@@ -527,11 +584,16 @@ actor WorkspaceCodemapBindingEngine {
         for task in writerTasks {
             await task.value
         }
+        for task in adoptionTasks {
+            _ = await task.value
+        }
         await waitForRegistrationOperationsToDrain()
         await capabilityService.drain()
 
         adoptionReservations.removeAll()
         retainedAdoptions.removeAll()
+        drainingManifestAdoptionTasks.removeAll()
+        drainingRequestTasks.removeAll()
         pruneAdmissionHistory()
         shutdownComplete = true
         let waiters = shutdownWaiters
@@ -563,7 +625,9 @@ actor WorkspaceCodemapBindingEngine {
                 unavailable += 1
             case let .eligible(session):
                 eligible += 1
-                if session.manifestState == .dirtyRetryRequired { dirty += 1 }
+                dirty += session.pipelines.values.count(where: {
+                    $0.manifestState == .dirtyRetryRequired
+                })
             }
         }
         active = activeRequests.count
@@ -590,57 +654,95 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    private func loadAndAdoptManifest(rootEpoch: WorkspaceCodemapRootEpoch) async -> Int {
-        guard case let .eligible(initial)? = roots[rootEpoch] else { return 0 }
-        let capturedSessionID = initial.id
-        let capturedSessionGeneration = initial.generation
-        let capturedInvalidationGeneration = initial.invalidationGeneration
-        guard let ticket = await overlay.beginManifestAdoption(rootEpoch: rootEpoch),
-              case let .eligible(afterTicket)? = roots[rootEpoch],
-              afterTicket.id == capturedSessionID,
-              afterTicket.generation == capturedSessionGeneration,
-              afterTicket.invalidationGeneration == capturedInvalidationGeneration
-        else { return 0 }
+    private func loadAndAdoptManifest(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        attempt: ManifestAdoptionAttempt
+    ) async -> ManifestAdoptionOutcome {
+        let pipelineIdentity = attempt.scope.pipelineIdentity
+        guard attempt.scope.rootEpoch == rootEpoch,
+              manifestAdoptionOperations[attempt.scope]?.attempt.operationID == attempt.operationID,
+              case let .eligible(initial)? = roots[rootEpoch],
+              initial.id == attempt.sessionID,
+              initial.generation == attempt.sessionGeneration,
+              initial.invalidationGeneration == attempt.invalidationGeneration,
+              initial.registration.catalogGeneration == attempt.catalogGeneration,
+              initial.capability.repositoryAuthority == attempt.repositoryAuthority,
+              let initialPipeline = initial.pipelines[pipelineIdentity],
+              initialPipeline.id == attempt.pipelineSessionID,
+              initialPipeline.namespace == attempt.namespace,
+              initialPipeline.authority == attempt.authority,
+              initialPipeline.manifestRevision == attempt.manifestRevision
+        else { return .superseded }
+        let pipelineScope = attempt.scope
+        guard let ticket = await overlay.beginManifestAdoption(
+            rootEpoch: rootEpoch,
+            namespace: attempt.namespace
+        ),
+            case let .eligible(afterTicket)? = roots[rootEpoch],
+            afterTicket.id == attempt.sessionID,
+            afterTicket.pipelines[pipelineIdentity]?.id == attempt.pipelineSessionID,
+            afterTicket.generation == attempt.sessionGeneration,
+            afterTicket.invalidationGeneration == attempt.invalidationGeneration
+        else { return .retryable }
         let context = ManifestAdoptionContext(
-            sessionID: capturedSessionID,
-            sessionGeneration: capturedSessionGeneration,
-            invalidationGeneration: capturedInvalidationGeneration,
-            catalogGeneration: initial.registration.catalogGeneration,
-            repositoryAuthority: initial.capability.repositoryAuthority,
-            namespace: initial.namespace,
-            authority: initial.authority,
-            manifestRevision: initial.manifestRevision,
+            operationID: attempt.operationID,
+            sessionID: attempt.sessionID,
+            sessionGeneration: attempt.sessionGeneration,
+            invalidationGeneration: attempt.invalidationGeneration,
+            pipelineIdentity: pipelineIdentity,
+            pipelineSessionID: attempt.pipelineSessionID,
+            catalogGeneration: attempt.catalogGeneration,
+            repositoryAuthority: attempt.repositoryAuthority,
+            namespace: attempt.namespace,
+            authority: attempt.authority,
+            manifestRevision: attempt.manifestRevision,
             ticket: ticket
         )
-        guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return 0 }
+        guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
         incrementCounter(\.manifestLoads)
         let load: CodeMapRootManifestLoadResult
         do {
             load = try await runtime.manifestStore.loadCurrentManifest(
-                namespace: initial.namespace,
-                currentAuthority: initial.authority
+                namespace: initialPipeline.namespace,
+                currentAuthority: initialPipeline.authority
             )
         } catch {
-            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return 0 }
+            guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
             updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
             incrementCounter(\.manifestFailures)
             emit(.manifestFailure, rootEpoch: rootEpoch)
-            return 0
+            return .retryable
         }
-        guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return 0 }
+        guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else { return .superseded }
+        switch load {
+        case .miss:
+            updatePreviouslyObservedManifestAuthority(nil, context: context, rootEpoch: rootEpoch)
+        case let .stale(existingAuthority):
+            updatePreviouslyObservedManifestAuthority(
+                existingAuthority,
+                context: context,
+                rootEpoch: rootEpoch
+            )
+        case let .hit(snapshot):
+            updatePreviouslyObservedManifestAuthority(
+                snapshot.authority,
+                context: context,
+                rootEpoch: rootEpoch
+            )
+        }
         guard case let .hit(snapshot) = load,
               snapshot.records.count <= policy.maximumManifestAdoptionRecordCount
         else {
             updateManifestState(.miss, context: context, rootEpoch: rootEpoch)
             emit(.manifestLoadMiss, rootEpoch: rootEpoch)
-            return 0
+            return .terminal(adoptedReadyCount: 0)
         }
         guard let adoptionID = reserveAdoptionRecords(
             snapshot.records.count,
-            rootEpoch: rootEpoch
+            scope: pipelineScope
         ) else {
             recordBusy(rootEpoch)
-            return 0
+            return .retryable
         }
         emit(.manifestLoadHit, rootEpoch: rootEpoch, numericValue: UInt64(snapshot.records.count))
 
@@ -648,12 +750,12 @@ actor WorkspaceCodemapBindingEngine {
         for record in snapshot.records {
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
                   record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
-                  record.locatorIdentity.pipelineIdentity == initial.pipelineIdentity,
+                  record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
                   let loadedPath = loadedRootPath(
                       repositoryRelativePath: record.repositoryRelativePath,
                       prefix: initial.capability.repositoryRelativeLoadedRootPrefix
@@ -662,8 +764,8 @@ actor WorkspaceCodemapBindingEngine {
             let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             guard let candidate,
                   candidate.identity.rootID == rootEpoch.rootID,
@@ -680,8 +782,8 @@ actor WorkspaceCodemapBindingEngine {
             )
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             guard classificationBatch.failure == nil,
                   classificationBatch.classifications.count == 1,
@@ -706,8 +808,8 @@ actor WorkspaceCodemapBindingEngine {
             )
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             guard let sourceAuthority else { continue }
 
@@ -720,8 +822,8 @@ actor WorkspaceCodemapBindingEngine {
             )
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             guard case let .ready(resolution) = coordinatorResult,
                   let association = try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
@@ -730,6 +832,7 @@ actor WorkspaceCodemapBindingEngine {
                       casHandle: resolution.handle
                   ), let verifiedRecord = try? makeManifestRecord(
                       session: initial,
+                      pipeline: initialPipeline,
                       repositoryRelativePath: record.repositoryRelativePath,
                       gitMode: record.gitMode,
                       association: association,
@@ -750,22 +853,29 @@ actor WorkspaceCodemapBindingEngine {
             guard reserveAdoptionLease(
                 relativePath: candidate.identity.standardizedRelativePath,
                 bytes: resolution.handle.estimatedResidentByteCount,
-                rootEpoch: rootEpoch,
+                scope: pipelineScope,
                 adoptionID: adoptionID
-            ) else { continue }
+            ) else {
+                await closePreparedManifestAdoptions(prepared)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                recordBusy(rootEpoch)
+                return .retryable
+            }
             guard let lease = try? await runtime.coordinator.acquireLease(for: resolution) else {
                 releaseAdoptionLeaseReservation(
                     relativePath: candidate.identity.standardizedRelativePath,
-                    rootEpoch: rootEpoch,
+                    scope: pipelineScope,
                     adoptionID: adoptionID
                 )
-                continue
+                await closePreparedManifestAdoptions(prepared)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .retryable
             }
             guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
                 await lease.close()
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
             prepared.append(PreparedManifestAdoption(
                 record: verifiedRecord,
@@ -778,8 +888,8 @@ actor WorkspaceCodemapBindingEngine {
 
         guard await manifestAdoptionIsCurrent(context, rootEpoch: rootEpoch) else {
             await closePreparedManifestAdoptions(prepared)
-            releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-            return 0
+            releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+            return .superseded
         }
 
         for item in prepared {
@@ -792,11 +902,11 @@ actor WorkspaceCodemapBindingEngine {
                   manifestBindingCandidateMatches(refreshed, item.candidate)
             else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 if adoptionContextIsCurrent(context, rootEpoch: rootEpoch) {
                     updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
                 }
-                return 0
+                return .retryable
             }
         }
 
@@ -818,11 +928,11 @@ actor WorkspaceCodemapBindingEngine {
                   })
             else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 if adoptionContextIsCurrent(context, rootEpoch: rootEpoch) {
                     updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
                 }
-                return 0
+                return .retryable
             }
         }
 
@@ -834,22 +944,22 @@ actor WorkspaceCodemapBindingEngine {
               adoptionContextIsCurrent(context, rootEpoch: rootEpoch)
         else {
             await closePreparedManifestAdoptions(prepared)
-            releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+            releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
             if adoptionContextIsCurrent(context, rootEpoch: rootEpoch) {
                 updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
             }
-            return 0
+            return .retryable
         }
 
         guard finalizeAdoptionRecordReservation(
             prepared.count,
-            rootEpoch: rootEpoch,
+            scope: pipelineScope,
             adoptionID: adoptionID
         ) else {
             await closePreparedManifestAdoptions(prepared)
-            releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+            releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
             recordBusy(rootEpoch)
-            return 0
+            return .retryable
         }
 
         var verifiedRecords: [String: CodeMapRootManifestRecord] = [:]
@@ -870,15 +980,15 @@ actor WorkspaceCodemapBindingEngine {
                 sourceExpectation: expectation
             ), let completion = WorkspaceCodemapArtifactCompletion.cleanGitBlob(
                 token: token,
-                language: initial.registration.language,
+                language: initialPipeline.language,
                 association: item.association
             ), var binding = WorkspaceCodemapArtifactBinding(pending: token),
             binding.apply(completion) == .accepted
             else {
                 await closePreparedManifestAdoptions(prepared)
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
-                return 0
+                return .retryable
             }
             entries.append(WorkspaceCodemapLiveManifestAdoptionEntry(
                 record: item.record,
@@ -896,39 +1006,170 @@ actor WorkspaceCodemapBindingEngine {
         case let .adopted(count):
             guard stillCurrent,
                   case var .eligible(session)? = roots[rootEpoch],
-                  adoptionReservations[rootEpoch]?.id == adoptionID,
-                  let reservation = adoptionReservations.removeValue(forKey: rootEpoch)
+                  var pipeline = session.pipelines[pipelineIdentity],
+                  adoptionReservations[pipelineScope]?.id == adoptionID,
+                  let reservation = adoptionReservations.removeValue(forKey: pipelineScope)
             else {
                 _ = await overlay.rollbackManifestAdoption(
                     ticket: ticket,
                     manifestGeneration: snapshot.manifestGeneration
                 )
-                releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-                return 0
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                return .superseded
             }
-            session.manifestRecords = verifiedRecords
+            pipeline.manifestRecords = verifiedRecords
             for (path, generation) in pathGenerations {
                 session.pathGenerations[path] = generation
             }
-            session.manifestState = .clean(generation: snapshot.manifestGeneration)
-            session.persistedManifestRevision = session.manifestRevision
+            pipeline.manifestState = .clean(generation: snapshot.manifestGeneration)
+            pipeline.persistedManifestRevision = pipeline.manifestRevision
+            session.pipelines[pipelineIdentity] = pipeline
             roots[rootEpoch] = .eligible(session)
-            retainedAdoptions[rootEpoch] = reservation
+            retainedAdoptions[pipelineScope] = reservation
             pruneAdmissionHistory()
             incrementCounter(\.manifestAdoptions)
             emit(.manifestAdopted, rootEpoch: rootEpoch, numericValue: UInt64(count))
-            return count
+            return .terminal(adoptedReadyCount: count)
         case .exactDuplicate:
             await closeAdoptionEntries(entries)
-            releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
-            return 0
+            releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+            return .terminal(adoptedReadyCount: 0)
         case .busy, .rejected:
             await closeAdoptionEntries(entries)
-            releaseAdoptionReservation(rootEpoch: rootEpoch, adoptionID: adoptionID)
+            releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
             if stillCurrent {
                 updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
             }
-            return 0
+            return .retryable
+        }
+    }
+
+    private func ensureManifestAdoption(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity
+    ) async {
+        let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
+        guard case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity]
+        else { return }
+        if pipeline.manifestLoadFinished { return }
+        if let operation = manifestAdoptionOperations[scope] {
+            await waitForManifestAdoption(
+                scope: scope,
+                operationID: operation.attempt.operationID
+            )
+            return
+        }
+        let attempt = ManifestAdoptionAttempt(
+            operationID: UUID(),
+            scope: scope,
+            sessionID: session.id,
+            sessionGeneration: session.generation,
+            invalidationGeneration: session.invalidationGeneration,
+            pipelineSessionID: pipeline.id,
+            catalogGeneration: session.registration.catalogGeneration,
+            repositoryAuthority: session.capability.repositoryAuthority,
+            namespace: pipeline.namespace,
+            authority: pipeline.authority,
+            manifestRevision: pipeline.manifestRevision
+        )
+        pipeline.manifestLoadStarted = true
+        session.pipelines[pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+        let task = Task {
+            await self.loadAndAdoptManifest(rootEpoch: rootEpoch, attempt: attempt)
+        }
+        manifestAdoptionOperations[scope] = ManifestAdoptionOperation(
+            attempt: attempt,
+            task: task,
+            waiters: [:]
+        )
+        Task { [weak self] in
+            let outcome = await task.value
+            await self?.completeManifestAdoption(
+                scope: scope,
+                operationID: attempt.operationID,
+                outcome: outcome
+            )
+        }
+        await waitForManifestAdoption(scope: scope, operationID: attempt.operationID)
+    }
+
+    private func waitForManifestAdoption(
+        scope: PipelineScope,
+        operationID: UUID
+    ) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled,
+                      var operation = manifestAdoptionOperations[scope],
+                      operation.attempt.operationID == operationID
+                else {
+                    continuation.resume()
+                    return
+                }
+                operation.waiters[waiterID] = continuation
+                manifestAdoptionOperations[scope] = operation
+            }
+        } onCancel: {
+            Task {
+                await self.detachManifestAdoptionWaiter(
+                    scope: scope,
+                    operationID: operationID,
+                    waiterID: waiterID
+                )
+            }
+        }
+    }
+
+    private func detachManifestAdoptionWaiter(
+        scope: PipelineScope,
+        operationID: UUID,
+        waiterID: UUID
+    ) {
+        guard var operation = manifestAdoptionOperations[scope],
+              operation.attempt.operationID == operationID,
+              let waiter = operation.waiters.removeValue(forKey: waiterID)
+        else { return }
+        manifestAdoptionOperations[scope] = operation
+        waiter.resume()
+    }
+
+    private func completeManifestAdoption(
+        scope: PipelineScope,
+        operationID: UUID,
+        outcome: ManifestAdoptionOutcome
+    ) {
+        drainingManifestAdoptionTasks.removeValue(forKey: operationID)
+        guard let operation = manifestAdoptionOperations[scope],
+              operation.attempt.operationID == operationID
+        else { return }
+        manifestAdoptionOperations.removeValue(forKey: scope)
+        let attempt = operation.attempt
+        if case var .eligible(current)? = roots[scope.rootEpoch],
+           current.id == attempt.sessionID,
+           current.generation == attempt.sessionGeneration,
+           current.invalidationGeneration == attempt.invalidationGeneration,
+           var currentPipeline = current.pipelines[scope.pipelineIdentity],
+           currentPipeline.id == attempt.pipelineSessionID,
+           currentPipeline.manifestRevision == attempt.manifestRevision
+        {
+            switch outcome {
+            case .terminal:
+                currentPipeline.manifestLoadFinished = true
+            case .retryable:
+                currentPipeline.manifestLoadStarted = false
+                currentPipeline.manifestLoadFinished = false
+                currentPipeline.manifestState = .dirtyRetryRequired
+            case .superseded:
+                break
+            }
+            current.pipelines[scope.pipelineIdentity] = currentPipeline
+            roots[scope.rootEpoch] = .eligible(current)
+        }
+        for waiter in operation.waiters.values {
+            waiter.resume()
         }
     }
 
@@ -977,15 +1218,23 @@ actor WorkspaceCodemapBindingEngine {
         _ context: ManifestAdoptionContext,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> Bool {
-        guard case let .eligible(session)? = roots[rootEpoch] else { return false }
+        let scope = PipelineScope(
+            rootEpoch: rootEpoch,
+            pipelineIdentity: context.pipelineIdentity
+        )
+        guard manifestAdoptionOperations[scope]?.attempt.operationID == context.operationID,
+              case let .eligible(session)? = roots[rootEpoch],
+              let pipeline = session.pipelines[context.pipelineIdentity]
+        else { return false }
         return session.id == context.sessionID &&
             session.generation == context.sessionGeneration &&
             session.invalidationGeneration == context.invalidationGeneration &&
+            pipeline.id == context.pipelineSessionID &&
             session.registration.catalogGeneration == context.catalogGeneration &&
             session.capability.repositoryAuthority == context.repositoryAuthority &&
-            session.namespace == context.namespace &&
-            session.authority == context.authority &&
-            session.manifestRevision == context.manifestRevision
+            pipeline.namespace == context.namespace &&
+            pipeline.authority == context.authority &&
+            pipeline.manifestRevision == context.manifestRevision
     }
 
     private func updateManifestState(
@@ -994,30 +1243,65 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
         guard adoptionContextIsCurrent(context, rootEpoch: rootEpoch),
-              case var .eligible(session)? = roots[rootEpoch]
+              case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[context.pipelineIdentity]
         else { return }
-        session.manifestState = state
+        pipeline.manifestState = state
+        session.pipelines[context.pipelineIdentity] = pipeline
+        roots[rootEpoch] = .eligible(session)
+    }
+
+    private func updatePreviouslyObservedManifestAuthority(
+        _ authority: CodeMapRootManifestAuthority?,
+        context: ManifestAdoptionContext,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard adoptionContextIsCurrent(context, rootEpoch: rootEpoch),
+              case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[context.pipelineIdentity]
+        else { return }
+        pipeline.previouslyObservedManifestAuthority = authority
+        session.pipelines[context.pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
     }
 
     private func reserveAdoptionRecords(
         _ count: Int,
-        rootEpoch: WorkspaceCodemapRootEpoch
+        scope: PipelineScope
     ) -> UUID? {
+        let currentRootRecordCount: Int
+        let replacedRecordCount: Int
+        if case let .eligible(session)? = roots[scope.rootEpoch] {
+            currentRootRecordCount = session.pipelines.values.reduce(0) {
+                addingSaturating($0, $1.manifestRecords.count)
+            }
+            replacedRecordCount = session.pipelines[scope.pipelineIdentity]?.manifestRecords.count ?? 0
+        } else {
+            currentRootRecordCount = 0
+            replacedRecordCount = 0
+        }
+        let pendingRootCount = adoptionReservations.reduce(0) { partial, item in
+            guard item.key.rootEpoch == scope.rootEpoch, item.key != scope else { return partial }
+            return addingSaturating(partial, item.value.recordCount)
+        }
         let pendingCount = adoptionReservations.values.reduce(0) {
             addingSaturating($0, $1.recordCount)
         }
-        guard count <= policy.maximumRetainedManifestRecordCountPerRoot,
-              adoptionReservations[rootEpoch] == nil,
-              let reservedCount = addingChecked(
-                  retainedManifestRecordCount(excluding: nil),
-                  pendingCount
-              ),
-              let projectedCount = addingChecked(reservedCount, count),
-              projectedCount <= policy.maximumRetainedManifestRecordCount
+        guard let projectedRootCount = addingChecked(
+            max(0, currentRootRecordCount - replacedRecordCount),
+            addingSaturating(pendingRootCount, count)
+        ),
+            projectedRootCount <= policy.maximumRetainedManifestRecordCountPerRoot,
+            adoptionReservations[scope] == nil,
+            let reservedCount = addingChecked(
+                max(0, retainedManifestRecordCount(excluding: nil) - replacedRecordCount),
+                pendingCount
+            ),
+            let projectedCount = addingChecked(reservedCount, count),
+            projectedCount <= policy.maximumRetainedManifestRecordCount
         else { return nil }
         let adoptionID = UUID()
-        adoptionReservations[rootEpoch] = AdoptionReservation(
+        adoptionReservations[scope] = AdoptionReservation(
             id: adoptionID,
             recordCount: count,
             leaseBytesByRelativePath: [:]
@@ -1027,32 +1311,33 @@ actor WorkspaceCodemapBindingEngine {
 
     private func finalizeAdoptionRecordReservation(
         _ count: Int,
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        scope: PipelineScope,
         adoptionID: UUID
     ) -> Bool {
-        guard var reservation = adoptionReservations[rootEpoch],
+        guard var reservation = adoptionReservations[scope],
               reservation.id == adoptionID,
               count <= reservation.recordCount,
               count <= policy.maximumRetainedManifestRecordCountPerRoot
         else { return false }
         reservation.recordCount = count
-        adoptionReservations[rootEpoch] = reservation
+        adoptionReservations[scope] = reservation
         return true
     }
 
     private func reserveAdoptionLease(
         relativePath: String,
         bytes: UInt64,
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        scope: PipelineScope,
         adoptionID: UUID
     ) -> Bool {
-        guard var reservation = adoptionReservations[rootEpoch],
+        guard var reservation = adoptionReservations[scope],
               reservation.id == adoptionID,
               reservation.leaseBytesByRelativePath[relativePath] == nil,
               let usage = adoptionLeaseUsage(),
-              let projectedRootCount = addingChecked(reservation.leaseCount, 1),
+              let rootUsage = adoptionLeaseUsage(rootEpoch: scope.rootEpoch),
+              let projectedRootCount = addingChecked(rootUsage.count, 1),
               let projectedGlobalCount = addingChecked(usage.count, 1),
-              let projectedRootBytes = addingChecked(reservation.leaseBytes, bytes),
+              let projectedRootBytes = addingChecked(rootUsage.bytes, bytes),
               let projectedGlobalBytes = addingChecked(usage.bytes, bytes),
               projectedRootCount <= policy.maximumManifestAdoptionLeaseCountPerRoot,
               projectedGlobalCount <= policy.maximumManifestAdoptionLeaseCount,
@@ -1060,20 +1345,20 @@ actor WorkspaceCodemapBindingEngine {
               projectedGlobalBytes <= policy.maximumManifestAdoptionLeaseByteCount
         else { return false }
         reservation.leaseBytesByRelativePath[relativePath] = bytes
-        adoptionReservations[rootEpoch] = reservation
+        adoptionReservations[scope] = reservation
         return true
     }
 
     private func releaseAdoptionLeaseReservation(
         relativePath: String,
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        scope: PipelineScope,
         adoptionID: UUID
     ) {
-        guard var reservation = adoptionReservations[rootEpoch],
+        guard var reservation = adoptionReservations[scope],
               reservation.id == adoptionID
         else { return }
         reservation.leaseBytesByRelativePath.removeValue(forKey: relativePath)
-        adoptionReservations[rootEpoch] = reservation
+        adoptionReservations[scope] = reservation
     }
 
     private func adoptionLeaseUsage() -> (count: Int, bytes: UInt64)? {
@@ -1090,12 +1375,29 @@ actor WorkspaceCodemapBindingEngine {
         return (count, bytes)
     }
 
+    private func adoptionLeaseUsage(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> (count: Int, bytes: UInt64)? {
+        let reservations = adoptionReservations.filter { $0.key.rootEpoch == rootEpoch }.map(\.value) +
+            retainedAdoptions.filter { $0.key.rootEpoch == rootEpoch }.map(\.value)
+        var count = 0
+        var bytes: UInt64 = 0
+        for reservation in reservations {
+            guard let nextCount = addingChecked(count, reservation.leaseCount),
+                  let nextBytes = addingChecked(bytes, reservation.leaseBytes)
+            else { return nil }
+            count = nextCount
+            bytes = nextBytes
+        }
+        return (count, bytes)
+    }
+
     private func releaseAdoptionReservation(
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        scope: PipelineScope,
         adoptionID: UUID
     ) {
-        guard adoptionReservations[rootEpoch]?.id == adoptionID else { return }
-        adoptionReservations.removeValue(forKey: rootEpoch)
+        guard adoptionReservations[scope]?.id == adoptionID else { return }
+        adoptionReservations.removeValue(forKey: scope)
         pruneAdmissionHistory()
     }
 
@@ -1103,18 +1405,20 @@ actor WorkspaceCodemapBindingEngine {
         _ relativePaths: Set<String>,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        guard var retained = retainedAdoptions[rootEpoch] else { return }
-        var removedRecordCount = 0
-        for relativePath in relativePaths {
-            if retained.leaseBytesByRelativePath.removeValue(forKey: relativePath) != nil {
-                removedRecordCount += 1
+        for scope in retainedAdoptions.keys where scope.rootEpoch == rootEpoch {
+            guard var retained = retainedAdoptions[scope] else { continue }
+            var removedRecordCount = 0
+            for relativePath in relativePaths {
+                if retained.leaseBytesByRelativePath.removeValue(forKey: relativePath) != nil {
+                    removedRecordCount += 1
+                }
             }
-        }
-        retained.recordCount = max(0, retained.recordCount - removedRecordCount)
-        if retained.leaseBytesByRelativePath.isEmpty, retained.recordCount == 0 {
-            retainedAdoptions.removeValue(forKey: rootEpoch)
-        } else {
-            retainedAdoptions[rootEpoch] = retained
+            retained.recordCount = max(0, retained.recordCount - removedRecordCount)
+            if retained.leaseBytesByRelativePath.isEmpty, retained.recordCount == 0 {
+                retainedAdoptions.removeValue(forKey: scope)
+            } else {
+                retainedAdoptions[scope] = retained
+            }
         }
     }
 
@@ -1138,7 +1442,9 @@ actor WorkspaceCodemapBindingEngine {
         roots.reduce(0) { partial, item in
             if item.key == rootEpoch { return partial }
             guard case let .eligible(session) = item.value else { return partial }
-            return addingSaturating(partial, session.manifestRecords.count)
+            return session.pipelines.values.reduce(partial) {
+                addingSaturating($0, $1.manifestRecords.count)
+            }
         }
     }
 
@@ -1217,12 +1523,21 @@ actor WorkspaceCodemapBindingEngine {
         guard demand.requestGeneration > 0 else {
             return .result(.rejected(.requestGenerationInvalid))
         }
-        guard demand.language == session.registration.language else {
-            return .result(.rejected(.languageMismatch))
-        }
         let fileExtension = (demand.identity.standardizedRelativePath as NSString).pathExtension
         guard SyntaxManager.shared.language(forFileExtension: fileExtension) == demand.language else {
             return .result(.unavailable(.unsupportedFileType))
+        }
+        let pipelineIdentity: CodeMapPipelineIdentity
+        do {
+            pipelineIdentity = try ensurePipeline(
+                rootEpoch: rootEpoch,
+                language: demand.language
+            )
+        } catch {
+            return .result(.unavailable(.unsupportedFileType))
+        }
+        guard case let .eligible(updatedSession)? = roots[rootEpoch] else {
+            return .result(.rejected(.staleCompletion))
         }
         let currentPathGeneration = session.pathGenerations[demand.identity.standardizedRelativePath]
             ?? demand.pathGeneration
@@ -1234,9 +1549,54 @@ actor WorkspaceCodemapBindingEngine {
         }
         return .valid(ValidatedDemandContext(
             rootEpoch: rootEpoch,
-            session: session,
+            session: updatedSession,
+            pipelineIdentity: pipelineIdentity,
             pathGeneration: currentPathGeneration
         ))
+    }
+
+    private func ensurePipeline(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        language: LanguageType
+    ) throws -> CodeMapPipelineIdentity {
+        guard case var .eligible(session)? = roots[rootEpoch] else {
+            throw WorkspaceCodemapBindingEngineProviderError.unconfigured
+        }
+        let pipelineIdentity = try SyntaxManager.shared.pipelineIdentity(
+            for: language,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        if let existing = session.pipelines[pipelineIdentity] {
+            guard existing.language == language else {
+                throw WorkspaceCodemapBindingEngineProviderError.unconfigured
+            }
+            return pipelineIdentity
+        }
+        let namespace = try CodeMapRootManifestNamespace(
+            capability: session.capability,
+            pipelineIdentity: pipelineIdentity
+        )
+        let authority = try CodeMapRootManifestAuthority(
+            namespace: namespace,
+            token: session.capability.repositoryAuthority
+        )
+        session.pipelines[pipelineIdentity] = PipelineSession(
+            id: UUID(),
+            language: language,
+            pipelineIdentity: pipelineIdentity,
+            namespace: namespace,
+            authority: authority,
+            previouslyObservedManifestAuthority: nil,
+            manifestRecords: [:],
+            manifestState: .miss,
+            manifestLoadStarted: false,
+            manifestLoadFinished: false,
+            manifestRevision: 0,
+            persistedManifestRevision: 0,
+            pendingManifestChanges: [:]
+        )
+        roots[rootEpoch] = .eligible(session)
+        return pipelineIdentity
     }
 
     private func canAdmit(
@@ -1290,6 +1650,10 @@ actor WorkspaceCodemapBindingEngine {
         context: ValidatedDemandContext,
         continuation: CheckedContinuation<WorkspaceCodemapBindingDemandResult, Never>?
     ) {
+        guard let pipeline = context.session.pipelines[context.pipelineIdentity] else {
+            continuation?.resume(returning: .rejected(.staleCompletion))
+            return
+        }
         let sourceBytes = UInt64(policy.maximumValidatedWorktreeByteCount)
         activeRequests[requestID] = ActiveRequest(
             id: requestID,
@@ -1299,7 +1663,8 @@ actor WorkspaceCodemapBindingEngine {
             relativePath: demand.identity.standardizedRelativePath,
             sessionID: context.session.id,
             sessionGeneration: context.session.generation,
-            invalidationGeneration: context.session.invalidationGeneration,
+            pipelineIdentity: context.pipelineIdentity,
+            pipelineSessionID: pipeline.id,
             repositoryAuthority: context.session.capability.repositoryAuthority,
             reservedSourceBytes: sourceBytes,
             overlayOwner: nil,
@@ -1449,8 +1814,8 @@ actor WorkspaceCodemapBindingEngine {
     private func pruneAdmissionHistory() {
         var retainedRoots = Set(activeRequests.values.map(\.rootEpoch))
         retainedRoots.formUnion(queuedRequests.values.map(\.rootEpoch))
-        retainedRoots.formUnion(adoptionReservations.keys)
-        retainedRoots.formUnion(retainedAdoptions.keys)
+        retainedRoots.formUnion(adoptionReservations.keys.map(\.rootEpoch))
+        retainedRoots.formUnion(retainedAdoptions.keys.map(\.rootEpoch))
         rootLastAdmission = rootLastAdmission.filter { retainedRoots.contains($0.key) }
 
         var retainedOwners = Set(activeRequests.values.map {
@@ -1491,8 +1856,14 @@ actor WorkspaceCodemapBindingEngine {
     private func processRequest(
         requestID: UUID
     ) async throws -> WorkspaceCodemapBindingDemandResult {
+        guard let initialRequest = currentRequest(requestID) else { throw CancellationError() }
+        await ensureManifestAdoption(
+            rootEpoch: initialRequest.rootEpoch,
+            pipelineIdentity: initialRequest.pipelineIdentity
+        )
         guard let request = currentRequest(requestID),
-              case let .eligible(session)? = roots[request.rootEpoch]
+              case let .eligible(session)? = roots[request.rootEpoch],
+              session.pipelines[request.pipelineIdentity]?.id == request.pipelineSessionID
         else { throw CancellationError() }
         try Task.checkCancellation()
         incrementCounter(\.classifications)
@@ -1556,11 +1927,15 @@ actor WorkspaceCodemapBindingEngine {
 
         switch classification.outcome {
         case let .oidEligible(blobOID):
+            guard let pipeline = latest.pipelines[current.pipelineIdentity] else {
+                return .rejected(.staleCompletion)
+            }
             incrementCounter(\.cleanClassifications)
             emit(.classificationClean, rootEpoch: current.rootEpoch)
             return try await processCleanRequest(
                 requestID: requestID,
                 session: latest,
+                pipeline: pipeline,
                 classification: classification,
                 repositoryRelativePath: repositoryRelativePath,
                 blobOID: blobOID,
@@ -1584,6 +1959,7 @@ actor WorkspaceCodemapBindingEngine {
     private func processCleanRequest(
         requestID: UUID,
         session: Session,
+        pipeline: PipelineSession,
         classification: GitBlobIdentityClassification,
         repositoryRelativePath: String,
         blobOID: GitBlobOID,
@@ -1594,7 +1970,7 @@ actor WorkspaceCodemapBindingEngine {
         let locator = GitBlobCodeMapLocatorIdentity(
             repositoryNamespace: session.capability.repositoryNamespace,
             blobOID: blobOID,
-            pipelineIdentity: session.pipelineIdentity
+            pipelineIdentity: pipeline.pipelineIdentity
         )
         guard let expectation = WorkspaceCodemapSourceExpectation.cleanGitBlob(
             bindingIdentity: request.demand.identity,
@@ -1615,7 +1991,7 @@ actor WorkspaceCodemapBindingEngine {
         case let .result(result): return result
         case let .ticket(ticket):
             guard let current = currentRequest(requestID) else { throw CancellationError() }
-            let manifestRecord = session.manifestRecords[repositoryRelativePath].flatMap {
+            let manifestRecord = pipeline.manifestRecords[repositoryRelativePath].flatMap {
                 $0.locatorIdentity == locator ? $0 : nil
             }
             let resolved = try await Self.resolveClean(
@@ -1735,6 +2111,7 @@ actor WorkspaceCodemapBindingEngine {
         let disposition = await overlay.preflightDemand(
             owner: overlayOwner,
             identity: request.demand.identity,
+            pipelineIdentity: request.pipelineIdentity,
             requestGeneration: request.demand.requestGeneration,
             catalogGeneration: request.demand.catalogGeneration
         )
@@ -1883,6 +2260,7 @@ actor WorkspaceCodemapBindingEngine {
             if let repositoryRelativePath, let gitMode, let association = resolved.association {
                 await persistCleanCompletion(
                     rootEpoch: request.rootEpoch,
+                    pipelineIdentity: request.pipelineIdentity,
                     repositoryRelativePath: repositoryRelativePath,
                     gitMode: gitMode,
                     association: association,
@@ -1906,6 +2284,7 @@ actor WorkspaceCodemapBindingEngine {
             if let repositoryRelativePath, let gitMode, let association = resolved.association {
                 await persistCleanCompletion(
                     rootEpoch: request.rootEpoch,
+                    pipelineIdentity: request.pipelineIdentity,
                     repositoryRelativePath: repositoryRelativePath,
                     gitMode: gitMode,
                     association: association,
@@ -1931,6 +2310,7 @@ actor WorkspaceCodemapBindingEngine {
               case let .eligible(session)? = roots[request.rootEpoch],
               session.id == request.sessionID,
               session.generation == request.sessionGeneration,
+              session.pipelines[request.pipelineIdentity]?.id == request.pipelineSessionID,
               session.registration.catalogGeneration == request.demand.catalogGeneration,
               session.capability.repositoryAuthority == request.repositoryAuthority
         else { return nil }
@@ -1947,7 +2327,12 @@ actor WorkspaceCodemapBindingEngine {
         result: WorkspaceCodemapBindingDemandResult,
         cancelOverlay: Bool
     ) async {
-        guard let request = activeRequests.removeValue(forKey: requestID) else { return }
+        guard let request = activeRequests.removeValue(forKey: requestID) else {
+            if drainingRequestTasks.removeValue(forKey: requestID) != nil {
+                scheduleQueuedRequests()
+            }
+            return
+        }
         if let preflight = request.preflight {
             _ = await overlay.cancelDemandPreflight(preflight)
         }
@@ -2045,29 +2430,36 @@ actor WorkspaceCodemapBindingEngine {
 
     private func persistCleanCompletion(
         rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
         repositoryRelativePath: String,
         gitMode: CodeMapRootManifestGitMode,
         association: VerifiedGitBlobCodeMapLocatorAssociation,
         bindingGeneration: UInt64
     ) async {
         guard case var .eligible(session)? = roots[rootEpoch],
+              var pipeline = session.pipelines[pipelineIdentity],
               let record = try? makeManifestRecord(
                   session: session,
+                  pipeline: pipeline,
                   repositoryRelativePath: repositoryRelativePath,
                   gitMode: gitMode,
                   association: association,
                   bindingGeneration: bindingGeneration
               )
         else { return }
-        let isNew = session.manifestRecords[repositoryRelativePath] == nil
+        let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
+        let isNew = pipeline.manifestRecords[repositoryRelativePath] == nil
         if isNew {
             let pendingAdoptionCount = adoptionReservations.values.reduce(0) {
                 addingSaturating($0, $1.recordCount)
             }
-            guard let projectedRootCount = addingChecked(session.manifestRecords.count, 1),
+            let currentRootCount = session.pipelines.values.reduce(0) {
+                addingSaturating($0, $1.manifestRecords.count)
+            }
+            guard let projectedRootCount = addingChecked(currentRootCount, 1),
                   let retainedCount = addingChecked(
                       retainedManifestRecordCount(excluding: rootEpoch),
-                      session.manifestRecords.count
+                      currentRootCount
                   ),
                   let reservedCount = addingChecked(retainedCount, pendingAdoptionCount),
                   let projectedGlobalCount = addingChecked(reservedCount, 1),
@@ -2078,135 +2470,337 @@ actor WorkspaceCodemapBindingEngine {
                 return
             }
         }
-        guard session.manifestRevision < UInt64.max else {
-            session.manifestState = .dirtyRetryRequired
+        guard pipeline.manifestRevision < UInt64.max else {
+            pipeline.manifestState = .dirtyRetryRequired
+            session.pipelines[pipelineIdentity] = pipeline
             roots[rootEpoch] = .eligible(session)
             recordFailure(rootEpoch)
             return
         }
-        session.manifestRecords[repositoryRelativePath] = record
-        session.manifestRevision += 1
-        session.manifestState = .dirtyRetryRequired
-        let revision = session.manifestRevision
+        pipeline.manifestRecords[repositoryRelativePath] = record
+        pipeline.manifestRevision += 1
+        pipeline.manifestState = .dirtyRetryRequired
+        let revision = pipeline.manifestRevision
+        pipeline.pendingManifestChanges[repositoryRelativePath] = PendingManifestChange(
+            revision: revision,
+            record: record
+        )
+        session.pipelines[pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
-        startManifestWriter(rootEpoch: rootEpoch)
         emit(.manifestRevisionQueued, rootEpoch: rootEpoch, numericValue: revision)
-        let succeeded = await waitForManifestRevision(rootEpoch: rootEpoch, revision: revision)
+        let succeeded = await waitForManifestRevision(scope: scope, revision: revision)
         if succeeded {
             emit(.manifestWrite, rootEpoch: rootEpoch, artifact: association.artifactKey)
         }
     }
 
-    private func startManifestWriter(rootEpoch: WorkspaceCodemapRootEpoch) {
-        guard case .eligible = roots[rootEpoch] else { return }
-        var state = manifestWriters[rootEpoch] ?? ManifestWriterState()
-        guard state.writerID == nil else { return }
+    private func startManifestWriter(scope: PipelineScope) {
+        guard case let .eligible(session)? = roots[scope.rootEpoch],
+              let pipeline = session.pipelines[scope.pipelineIdentity],
+              !pipeline.pendingManifestChanges.isEmpty
+        else { return }
+        let namespace = pipeline.namespace
+        let workKey = ManifestWriterWorkKey(
+            scope: scope,
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        var state = manifestWriters[namespace] ?? ManifestWriterState()
+        let inFlightCoversRevision = state.inFlightWork == workKey &&
+            (state.inFlightRevision ?? 0) >= pipeline.manifestRevision
+        if !inFlightCoversRevision, !state.queuedWorkSet.contains(workKey) {
+            state.queuedWork.append(workKey)
+            state.queuedWorkSet.insert(workKey)
+        }
+        guard state.writerID == nil else {
+            manifestWriters[namespace] = state
+            return
+        }
         let writerID = UUID()
         state.writerID = writerID
-        manifestWriters[rootEpoch] = state
-        let task = Task { await self.runManifestWriter(rootEpoch: rootEpoch, writerID: writerID) }
-        guard var current = manifestWriters[rootEpoch], current.writerID == writerID else {
+        manifestWriters[namespace] = state
+        let task = Task { await self.runManifestWriter(namespace: namespace, writerID: writerID) }
+        guard var current = manifestWriters[namespace], current.writerID == writerID else {
             task.cancel()
             return
         }
         current.task = task
-        manifestWriters[rootEpoch] = current
+        manifestWriters[namespace] = current
     }
 
     private func runManifestWriter(
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        namespace: CodeMapRootManifestNamespace,
         writerID: UUID
     ) async {
         while !Task.isCancelled {
-            guard let writer = manifestWriters[rootEpoch], writer.writerID == writerID,
-                  case let .eligible(session)? = roots[rootEpoch]
-            else { return }
-            let sessionID = session.id
-            let generation = session.generation
-            let invalidationGeneration = session.invalidationGeneration
-            let revision = session.manifestRevision
-            let records = session.manifestRecords.values.sorted {
-                $0.repositoryRelativePath < $1.repositoryRelativePath
-            }
-            do {
-                let result = try await runtime.manifestStore.updateCurrentManifest(
-                    namespace: session.namespace,
-                    authority: session.authority,
-                    records: records,
-                    lastAccessEpochSeconds: accessEpochSeconds()
-                )
-                guard var currentWriter = manifestWriters[rootEpoch],
-                      currentWriter.writerID == writerID,
-                      case var .eligible(current)? = roots[rootEpoch],
-                      current.id == sessionID,
-                      current.generation == generation,
-                      current.invalidationGeneration == invalidationGeneration
-                else { return }
-                current.persistedManifestRevision = max(current.persistedManifestRevision, revision)
-                if current.manifestRevision == revision {
-                    current.manifestState = .clean(generation: manifestGeneration(result))
+            guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
+            guard !writer.queuedWork.isEmpty else {
+                writer.writerID = nil
+                writer.task = nil
+                writer.inFlightWork = nil
+                writer.inFlightRevision = nil
+                if writer.waiters.isEmpty {
+                    manifestWriters.removeValue(forKey: namespace)
                 } else {
-                    current.manifestState = .dirtyRetryRequired
+                    manifestWriters[namespace] = writer
                 }
-                roots[rootEpoch] = .eligible(current)
+                return
+            }
+            let workKey = writer.queuedWork.removeFirst()
+            writer.queuedWorkSet.remove(workKey)
+            let scope = workKey.scope
+            guard case let .eligible(session)? = roots[scope.rootEpoch],
+                  session.id == workKey.sessionID,
+                  let pipeline = session.pipelines[scope.pipelineIdentity],
+                  pipeline.id == workKey.pipelineSessionID,
+                  pipeline.namespace == namespace,
+                  !pipeline.pendingManifestChanges.isEmpty
+            else {
+                let detached = writer.waiters.filter { $0.workKey == workKey }
+                writer.waiters.removeAll { $0.workKey == workKey }
+                manifestWriters[namespace] = writer
+                for waiter in detached {
+                    waiter.continuation.resume(returning: false)
+                }
+                continue
+            }
+            let sessionID = session.id
+            let pipelineSessionID = pipeline.id
+            let revision = pipeline.manifestRevision
+            let changes = pipeline.pendingManifestChanges
+            let upserts = changes.values.compactMap(\.record)
+            let removals = Set(changes.compactMap { path, change in
+                change.record == nil ? path : nil
+            })
+            writer.inFlightWork = workKey
+            writer.inFlightRevision = revision
+            manifestWriters[namespace] = writer
+            do {
+                guard let writerAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
+                    namespace: namespace,
+                    authority: pipeline.authority,
+                    writerSession: session.manifestWriterSession
+                ) else {
+                    throw CodeMapRootManifestStoreError.staleWriterAuthority
+                }
+                let result = try await mergeManifestChanges(
+                    namespace: namespace,
+                    authority: pipeline.authority,
+                    writerAuthority: writerAuthority,
+                    previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
+                    upserts: upserts,
+                    removals: removals
+                )
+                guard var currentWriter = manifestWriters[namespace],
+                      currentWriter.writerID == writerID
+                else { return }
+                currentWriter.inFlightWork = nil
+                currentWriter.inFlightRevision = nil
+                let completed = currentWriter.waiters.filter {
+                    $0.workKey == workKey && $0.revision <= revision
+                }
+                currentWriter.waiters.removeAll {
+                    $0.workKey == workKey && $0.revision <= revision
+                }
+                if case var .eligible(current)? = roots[scope.rootEpoch],
+                   current.id == sessionID,
+                   var currentPipeline = current.pipelines[scope.pipelineIdentity],
+                   currentPipeline.id == pipelineSessionID,
+                   currentPipeline.namespace == namespace
+                {
+                    currentPipeline.previouslyObservedManifestAuthority = currentPipeline.authority
+                    for (path, change) in changes
+                        where currentPipeline.pendingManifestChanges[path]?.revision == change.revision
+                    {
+                        currentPipeline.pendingManifestChanges.removeValue(forKey: path)
+                    }
+                    currentPipeline.persistedManifestRevision = max(
+                        currentPipeline.persistedManifestRevision,
+                        revision
+                    )
+                    if currentPipeline.pendingManifestChanges.isEmpty,
+                       currentPipeline.manifestRevision == revision
+                    {
+                        currentPipeline.manifestState = .clean(generation: manifestGeneration(result))
+                    } else {
+                        currentPipeline.manifestState = .dirtyRetryRequired
+                    }
+                    current.pipelines[scope.pipelineIdentity] = currentPipeline
+                    roots[scope.rootEpoch] = .eligible(current)
+                }
+                manifestWriters[namespace] = currentWriter
                 incrementCounter(\.manifestWrites)
-                let completed = currentWriter.waiters.filter { $0.revision <= revision }
-                currentWriter.waiters.removeAll { $0.revision <= revision }
                 for waiter in completed {
                     waiter.continuation.resume(returning: true)
                 }
-                if current.manifestRevision == revision {
-                    currentWriter.writerID = nil
-                    currentWriter.task = nil
-                    manifestWriters[rootEpoch] = currentWriter
-                    return
-                }
-                manifestWriters[rootEpoch] = currentWriter
             } catch {
-                guard var currentWriter = manifestWriters[rootEpoch],
+                guard var currentWriter = manifestWriters[namespace],
                       currentWriter.writerID == writerID
                 else { return }
-                currentWriter.writerID = nil
-                currentWriter.task = nil
-                let waiters = currentWriter.waiters
-                currentWriter.waiters.removeAll()
-                manifestWriters[rootEpoch] = currentWriter
-                if case var .eligible(current)? = roots[rootEpoch], current.id == sessionID {
-                    current.manifestState = .dirtyRetryRequired
-                    roots[rootEpoch] = .eligible(current)
+                currentWriter.inFlightWork = nil
+                currentWriter.inFlightRevision = nil
+                let failed = currentWriter.waiters.filter {
+                    $0.workKey == workKey && $0.revision <= revision
                 }
-                for waiter in waiters {
+                currentWriter.waiters.removeAll {
+                    $0.workKey == workKey && $0.revision <= revision
+                }
+                manifestWriters[namespace] = currentWriter
+                if case var .eligible(current)? = roots[scope.rootEpoch],
+                   current.id == sessionID,
+                   var currentPipeline = current.pipelines[scope.pipelineIdentity],
+                   currentPipeline.id == pipelineSessionID
+                {
+                    currentPipeline.manifestState = .dirtyRetryRequired
+                    current.pipelines[scope.pipelineIdentity] = currentPipeline
+                    roots[scope.rootEpoch] = .eligible(current)
+                }
+                for waiter in failed {
                     waiter.continuation.resume(returning: false)
                 }
                 incrementCounter(\.manifestFailures)
-                emit(.manifestFailure, rootEpoch: rootEpoch)
-                return
+                emit(.manifestFailure, rootEpoch: scope.rootEpoch)
             }
         }
     }
 
+    private func mergeManifestChanges(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority,
+        writerAuthority: CodeMapRootManifestWriterAuthorityToken,
+        previouslyObservedAuthority: CodeMapRootManifestAuthority?,
+        upserts: [CodeMapRootManifestRecord],
+        removals: Set<String>
+    ) async throws -> CodeMapRootManifestWriteResult {
+        var predecessor = previouslyObservedAuthority
+        for attempt in 0 ... 1 {
+            do {
+                return try await runtime.manifestStore.mergeCurrentManifest(
+                    namespace: namespace,
+                    authority: authority,
+                    writerAuthority: writerAuthority,
+                    replacingPreviouslyObservedAuthority: predecessor,
+                    upserting: upserts,
+                    removing: removals,
+                    lastAccessEpochSeconds: accessEpochSeconds()
+                )
+            } catch CodeMapRootManifestModelError.staleAuthority where attempt == 0 {
+                guard await runtime.manifestStore.manifestWriterAuthorityIsCurrent(writerAuthority) else {
+                    throw CodeMapRootManifestStoreError.staleWriterAuthority
+                }
+                let load = try await runtime.manifestStore.loadCurrentManifest(
+                    namespace: namespace,
+                    currentAuthority: authority
+                )
+                predecessor = switch load {
+                case .miss:
+                    nil
+                case let .stale(existingAuthority):
+                    existingAuthority
+                case let .hit(snapshot):
+                    snapshot.authority
+                }
+                if let predecessor, predecessor != authority,
+                   predecessor.authorityGeneration >= authority.authorityGeneration
+                {
+                    throw CodeMapRootManifestModelError.staleAuthority
+                }
+            }
+        }
+        throw CodeMapRootManifestModelError.staleAuthority
+    }
+
     private func waitForManifestRevision(
-        rootEpoch: WorkspaceCodemapRootEpoch,
+        scope: PipelineScope,
         revision: UInt64
     ) async -> Bool {
-        guard case let .eligible(session)? = roots[rootEpoch] else { return false }
-        if session.persistedManifestRevision >= revision { return true }
-        return await withCheckedContinuation { continuation in
-            var state = manifestWriters[rootEpoch] ?? ManifestWriterState()
-            state.waiters.append(ManifestWriteWaiter(revision: revision, continuation: continuation))
-            manifestWriters[rootEpoch] = state
-            startManifestWriter(rootEpoch: rootEpoch)
+        guard case let .eligible(session)? = roots[scope.rootEpoch],
+              let pipeline = session.pipelines[scope.pipelineIdentity]
+        else { return false }
+        if pipeline.persistedManifestRevision >= revision { return true }
+        let namespace = pipeline.namespace
+        let waiterID = UUID()
+        let workKey = ManifestWriterWorkKey(
+            scope: scope,
+            sessionID: session.id,
+            pipelineSessionID: pipeline.id
+        )
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                var state = manifestWriters[namespace] ?? ManifestWriterState()
+                state.waiters.append(ManifestWriteWaiter(
+                    id: waiterID,
+                    workKey: workKey,
+                    revision: revision,
+                    continuation: continuation
+                ))
+                manifestWriters[namespace] = state
+                startManifestWriter(scope: scope)
+            }
+        } onCancel: {
+            Task { await self.cancelManifestWaiter(namespace: namespace, waiterID: waiterID) }
         }
     }
 
-    @discardableResult
-    private func cancelManifestWriter(rootEpoch: WorkspaceCodemapRootEpoch) -> Task<Void, Never>? {
-        guard let state = manifestWriters.removeValue(forKey: rootEpoch) else { return nil }
-        state.task?.cancel()
-        for waiter in state.waiters {
-            waiter.continuation.resume(returning: false)
+    private func cancelManifestWaiter(
+        namespace: CodeMapRootManifestNamespace,
+        waiterID: UUID
+    ) {
+        guard var state = manifestWriters[namespace],
+              let index = state.waiters.firstIndex(where: { $0.id == waiterID })
+        else { return }
+        let waiter = state.waiters.remove(at: index)
+        if state.writerID == nil, state.queuedWork.isEmpty, state.waiters.isEmpty {
+            manifestWriters.removeValue(forKey: namespace)
+        } else {
+            manifestWriters[namespace] = state
         }
-        return state.task
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func detachManifestWriters(rootEpoch: WorkspaceCodemapRootEpoch) {
+        for namespace in Array(manifestWriters.keys) {
+            guard var state = manifestWriters[namespace] else { continue }
+            state.queuedWork.removeAll { $0.scope.rootEpoch == rootEpoch }
+            state.queuedWorkSet = Set(state.queuedWork)
+            let detached = state.waiters.filter { $0.workKey.scope.rootEpoch == rootEpoch }
+            state.waiters.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
+            if state.writerID == nil, state.queuedWork.isEmpty, state.waiters.isEmpty {
+                manifestWriters.removeValue(forKey: namespace)
+            } else {
+                manifestWriters[namespace] = state
+            }
+            for waiter in detached {
+                waiter.continuation.resume(returning: false)
+            }
+        }
+    }
+
+    private func cancelAllManifestWriters() -> [Task<Void, Never>] {
+        let states = Array(manifestWriters.values)
+        manifestWriters.removeAll()
+        for state in states {
+            state.task?.cancel()
+            for waiter in state.waiters {
+                waiter.continuation.resume(returning: false)
+            }
+        }
+        return states.compactMap(\.task)
+    }
+
+    private func detachManifestAdoptionOperations(rootEpoch: WorkspaceCodemapRootEpoch) {
+        for scope in Array(manifestAdoptionOperations.keys) where scope.rootEpoch == rootEpoch {
+            guard let operation = manifestAdoptionOperations.removeValue(forKey: scope) else { continue }
+            operation.task.cancel()
+            drainingManifestAdoptionTasks[operation.attempt.operationID] = operation.task
+            for waiter in operation.waiters.values {
+                waiter.resume()
+            }
+        }
     }
 
     private func invalidatePaths(
@@ -2242,25 +2836,39 @@ actor WorkspaceCodemapBindingEngine {
             )
         }
         guard session.invalidationGeneration < UInt64.max,
-              session.manifestRevision < UInt64.max,
+              session.pipelines.values.allSatisfy({ $0.manifestRevision < UInt64.max }),
               safePaths.allSatisfy({ (session.pathGenerations[$0] ?? 0) < UInt64.max })
         else {
             return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .authorityChanged)
         }
 
         session.invalidationGeneration += 1
-        session.manifestRevision += 1
         for path in safePaths {
             session.pathGenerations[path] = (session.pathGenerations[path] ?? 0) + 1
-            if let repositoryPath = repositoryPath(
-                loadedRootRelativePath: path,
-                prefix: session.capability.repositoryRelativeLoadedRootPrefix
-            ) {
-                session.manifestRecords.removeValue(forKey: repositoryPath)
-            }
         }
-        session.manifestState = .dirtyRetryRequired
+        for identity in session.pipelines.keys {
+            guard var pipeline = session.pipelines[identity] else { continue }
+            pipeline.manifestRevision += 1
+            for path in safePaths {
+                if let repositoryPath = repositoryPath(
+                    loadedRootRelativePath: path,
+                    prefix: session.capability.repositoryRelativeLoadedRootPrefix
+                ) {
+                    pipeline.manifestRecords.removeValue(forKey: repositoryPath)
+                    pipeline.pendingManifestChanges[repositoryPath] = PendingManifestChange(
+                        revision: pipeline.manifestRevision,
+                        record: nil
+                    )
+                }
+            }
+            pipeline.manifestState = .dirtyRetryRequired
+            session.pipelines[identity] = pipeline
+        }
+        let revisions = session.pipelines.map { identity, pipeline in
+            (PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: identity), pipeline.manifestRevision)
+        }
         roots[rootEpoch] = .eligible(session)
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let requestIDs = activeRequests.values.filter {
             $0.rootEpoch == rootEpoch && safePaths.contains($0.relativePath)
         }.map(\.id)
@@ -2268,7 +2876,6 @@ actor WorkspaceCodemapBindingEngine {
             $0.rootEpoch == rootEpoch && safePaths.contains($0.demand.identity.standardizedRelativePath)
         }.map(\.id)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs + queuedIDs)
-        startManifestWriter(rootEpoch: rootEpoch)
 
         let revoked = await overlay.invalidatePaths(
             rootEpoch: rootEpoch,
@@ -2278,10 +2885,12 @@ actor WorkspaceCodemapBindingEngine {
         releaseRetainedAdoptionPaths(safePaths, rootEpoch: rootEpoch)
         pruneAdmissionHistory()
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
-        let failed = await !waitForManifestRevision(
-            rootEpoch: rootEpoch,
-            revision: session.manifestRevision
-        )
+        var failed = false
+        for (scope, revision) in revisions {
+            if await !waitForManifestRevision(scope: scope, revision: revision) {
+                failed = true
+            }
+        }
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         emit(.invalidation, rootEpoch: rootEpoch, numericValue: UInt64(revoked))
         return WorkspaceCodemapBindingInvalidationResult(
@@ -2320,15 +2929,18 @@ actor WorkspaceCodemapBindingEngine {
             registration: session.registration,
             state: .unresolved
         ))
-        cancelManifestWriter(rootEpoch: rootEpoch)
+        detachManifestWriters(rootEpoch: rootEpoch)
+        detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs + queuedIDs)
+        await runtime.manifestStore.endManifestWriterSession(session.manifestWriterSession)
 
         let revoked = await overlay.invalidateRootAuthority(
             rootEpoch: rootEpoch,
             expectedAuthority: session.capability.repositoryAuthority,
             reason: reason
         )
-        retainedAdoptions.removeValue(forKey: rootEpoch)
+        adoptionReservations = adoptionReservations.filter { $0.key.rootEpoch != rootEpoch }
+        retainedAdoptions = retainedAdoptions.filter { $0.key.rootEpoch != rootEpoch }
         pruneAdmissionHistory()
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
@@ -2352,7 +2964,7 @@ actor WorkspaceCodemapBindingEngine {
                 cancelledRequestCount += 1
                 continue
             }
-            guard var request = activeRequests[requestID], !request.cancelled else { continue }
+            guard var request = activeRequests.removeValue(forKey: requestID), !request.cancelled else { continue }
             request.cancelled = true
             request.task?.cancel()
             if request.ticket != nil || request.preflight != nil {
@@ -2366,9 +2978,12 @@ actor WorkspaceCodemapBindingEngine {
             request.preflight = nil
             request.continuation?.resume(returning: .cancelled)
             request.continuation = nil
-            activeRequests[requestID] = request
+            if let task = request.task {
+                drainingRequestTasks[requestID] = task
+            }
             cancelledRequestCount += 1
         }
+        scheduleQueuedRequests()
         return SynchronousCancellationBatch(
             overlayCancellations: overlayCancellations,
             cancelledRequestCount: cancelledRequestCount
@@ -2390,6 +3005,7 @@ actor WorkspaceCodemapBindingEngine {
 
     private func makeManifestRecord(
         session: Session,
+        pipeline: PipelineSession,
         repositoryRelativePath: String,
         gitMode: CodeMapRootManifestGitMode,
         association: VerifiedGitBlobCodeMapLocatorAssociation,
@@ -2411,12 +3027,12 @@ actor WorkspaceCodemapBindingEngine {
             nil
         }
         return try CodeMapRootManifestRecord.verifiedClean(
-            namespace: session.namespace,
+            namespace: pipeline.namespace,
             repositoryRelativePath: repositoryRelativePath,
             gitMode: gitMode,
             association: association,
             contribution: contribution,
-            authority: session.authority,
+            authority: pipeline.authority,
             bindingGeneration: bindingGeneration
         )
     }

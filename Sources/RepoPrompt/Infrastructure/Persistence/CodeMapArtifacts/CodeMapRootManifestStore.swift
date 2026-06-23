@@ -6,8 +6,23 @@ enum CodeMapRootManifestStoreError: Error, Equatable {
     case insecureDirectory
     case insecureLeaf
     case quotaExceeded
+    case staleWriterAuthority
     case simulatedProcessTermination(CodeMapRootManifestStoreFaultPoint)
     case ioFailure(operation: String, code: Int32)
+}
+
+struct CodeMapRootManifestWriterSessionToken: Hashable {
+    fileprivate let storeID: UUID
+    fileprivate let sequence: UInt64
+    fileprivate let nonce: UUID
+}
+
+struct CodeMapRootManifestWriterAuthorityToken: Hashable {
+    fileprivate let storeID: UUID
+    fileprivate let writerSession: CodeMapRootManifestWriterSessionToken
+    fileprivate let namespace: CodeMapRootManifestNamespace
+    fileprivate let authority: CodeMapRootManifestAuthority
+    fileprivate let nonce: UUID
 }
 
 enum CodeMapRootManifestStoreFaultPoint: String, Equatable {
@@ -107,7 +122,7 @@ struct CodeMapRootManifestStoreHooks {
 
 enum CodeMapRootManifestLoadResult: Equatable {
     case miss
-    case stale
+    case stale(existingAuthority: CodeMapRootManifestAuthority)
     case hit(CodeMapRootManifestSnapshot)
 }
 
@@ -136,6 +151,11 @@ struct CodeMapRootManifestMaintenanceResult: Equatable {
     let accounting: CodeMapRootManifestAccounting
 }
 
+private enum ManifestAuthorityReplacementPolicy {
+    case unconstrained
+    case exactPredecessor(CodeMapRootManifestAuthority?)
+}
+
 /// Inert, Git-only root-manifest persistence.
 ///
 /// A whole namespace snapshot is published with one rename, so readers observe either the old
@@ -150,6 +170,12 @@ actor CodeMapRootManifestStore {
     private let hooks: CodeMapRootManifestStoreHooks
     private let lockAnchor: ManifestDirectoryDescriptor
     private let accessEpochSeconds: @Sendable () -> UInt64
+    private let writerAuthorityStoreID = UUID()
+    private var nextWriterSessionSequence: UInt64? = 1
+    private var activeWriterSessions: Set<CodeMapRootManifestWriterSessionToken> = []
+    private var currentWriterAuthorities: [
+        CodeMapRootManifestNamespace: CodeMapRootManifestWriterAuthorityToken
+    ] = [:]
     private var pendingAccessRefreshes: [String: ManifestPendingAccessRefresh] = [:]
     private var accessRefreshTask: Task<Void, Never>?
 
@@ -181,6 +207,64 @@ actor CodeMapRootManifestStore {
         }
         _ = try Self.openLayout(rootURL: rootURL, create: true)
         self.lockAnchor = lockAnchor
+    }
+
+    func registerManifestWriterSession() throws -> CodeMapRootManifestWriterSessionToken {
+        guard let sequence = nextWriterSessionSequence else {
+            throw CodeMapRootManifestStoreError.quotaExceeded
+        }
+        let token = CodeMapRootManifestWriterSessionToken(
+            storeID: writerAuthorityStoreID,
+            sequence: sequence,
+            nonce: UUID()
+        )
+        nextWriterSessionSequence = sequence == .max ? nil : sequence + 1
+        activeWriterSessions.insert(token)
+        return token
+    }
+
+    func endManifestWriterSession(_ token: CodeMapRootManifestWriterSessionToken) {
+        guard token.storeID == writerAuthorityStoreID else { return }
+        activeWriterSessions.remove(token)
+    }
+
+    func claimManifestWriterAuthority(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority,
+        writerSession: CodeMapRootManifestWriterSessionToken
+    ) -> CodeMapRootManifestWriterAuthorityToken? {
+        guard writerSession.storeID == writerAuthorityStoreID,
+              activeWriterSessions.contains(writerSession)
+        else { return nil }
+        if let current = currentWriterAuthorities[namespace] {
+            if current.writerSession == writerSession {
+                return current.authority == authority ? current : nil
+            }
+            guard current.writerSession.sequence < writerSession.sequence else { return nil }
+        }
+        let token = CodeMapRootManifestWriterAuthorityToken(
+            storeID: writerAuthorityStoreID,
+            writerSession: writerSession,
+            namespace: namespace,
+            authority: authority,
+            nonce: UUID()
+        )
+        currentWriterAuthorities[namespace] = token
+        return token
+    }
+
+    func manifestWriterAuthorityIsCurrent(
+        _ token: CodeMapRootManifestWriterAuthorityToken
+    ) -> Bool {
+        writerAuthorityIsCurrent(token)
+    }
+
+    private func writerAuthorityIsCurrent(
+        _ token: CodeMapRootManifestWriterAuthorityToken
+    ) -> Bool {
+        token.storeID == writerAuthorityStoreID &&
+            activeWriterSessions.contains(token.writerSession) &&
+            currentWriterAuthorities[token.namespace] == token
     }
 
     nonisolated func manifestURL(for namespace: CodeMapRootManifestNamespace) -> URL {
@@ -291,7 +375,9 @@ actor CodeMapRootManifestStore {
         else {
             return .miss
         }
-        guard snapshot.authority == currentAuthority else { return .stale }
+        guard snapshot.authority == currentAuthority else {
+            return .stale(existingAuthority: snapshot.authority)
+        }
         scheduleAccessRefresh(for: snapshot)
         return .hit(snapshot)
     }
@@ -330,7 +416,8 @@ actor CodeMapRootManifestStore {
                     authority: refresh.snapshot.authority,
                     records: refresh.snapshot.records,
                     lastAccessEpochSeconds: refresh.accessEpochSeconds,
-                    expectedSnapshot: refresh.snapshot
+                    expectedSnapshot: refresh.snapshot,
+                    authorityReplacementPolicy: .unconstrained
                 )
             }
         }
@@ -375,7 +462,74 @@ actor CodeMapRootManifestStore {
             authority: authority,
             records: records,
             lastAccessEpochSeconds: lastAccessEpochSeconds,
-            expectedSnapshot: nil
+            expectedSnapshot: nil,
+            authorityReplacementPolicy: .unconstrained
+        )
+    }
+
+    /// Atomically merges namespace-local changes while holding the secure store authority lock.
+    /// The on-disk value remains a complete manifest snapshot.
+    func mergeCurrentManifest(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority,
+        replacingPreviouslyObservedAuthority predecessor: CodeMapRootManifestAuthority?,
+        upserting records: [CodeMapRootManifestRecord],
+        removing repositoryRelativePaths: Set<String>,
+        lastAccessEpochSeconds: UInt64
+    ) async throws -> CodeMapRootManifestWriteResult {
+        let upsertPaths = Set(records.map(\.repositoryRelativePath))
+        guard records.allSatisfy(\.isVerifiedForPublication),
+              upsertPaths.count == records.count,
+              upsertPaths.isDisjoint(with: repositoryRelativePaths),
+              upsertPaths.allSatisfy(namespace.contains(repositoryRelativePath:)),
+              repositoryRelativePaths.allSatisfy(namespace.contains(repositoryRelativePath:))
+        else {
+            throw CodeMapRootManifestModelError.corruptRecord
+        }
+        return try await publishCurrentManifest(
+            namespace: namespace,
+            authority: authority,
+            records: records,
+            lastAccessEpochSeconds: lastAccessEpochSeconds,
+            expectedSnapshot: nil,
+            authorityReplacementPolicy: .exactPredecessor(predecessor),
+            mergeExisting: true,
+            removingRepositoryRelativePaths: repositoryRelativePaths
+        )
+    }
+
+    /// Production writer entry point. The opaque token is revalidated after the final suspension
+    /// point so an older writer session cannot publish after a newer session claims the namespace.
+    func mergeCurrentManifest(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority,
+        writerAuthority: CodeMapRootManifestWriterAuthorityToken,
+        replacingPreviouslyObservedAuthority predecessor: CodeMapRootManifestAuthority?,
+        upserting records: [CodeMapRootManifestRecord],
+        removing repositoryRelativePaths: Set<String>,
+        lastAccessEpochSeconds: UInt64
+    ) async throws -> CodeMapRootManifestWriteResult {
+        let upsertPaths = Set(records.map(\.repositoryRelativePath))
+        guard records.allSatisfy(\.isVerifiedForPublication),
+              upsertPaths.count == records.count,
+              upsertPaths.isDisjoint(with: repositoryRelativePaths),
+              upsertPaths.allSatisfy(namespace.contains(repositoryRelativePath:)),
+              repositoryRelativePaths.allSatisfy(namespace.contains(repositoryRelativePath:)),
+              writerAuthority.namespace == namespace,
+              writerAuthority.authority == authority
+        else {
+            throw CodeMapRootManifestModelError.corruptRecord
+        }
+        return try await publishCurrentManifest(
+            namespace: namespace,
+            authority: authority,
+            records: records,
+            lastAccessEpochSeconds: lastAccessEpochSeconds,
+            expectedSnapshot: nil,
+            authorityReplacementPolicy: .exactPredecessor(predecessor),
+            writerAuthority: writerAuthority,
+            mergeExisting: true,
+            removingRepositoryRelativePaths: repositoryRelativePaths
         )
     }
 
@@ -384,16 +538,14 @@ actor CodeMapRootManifestStore {
         authority: CodeMapRootManifestAuthority,
         records: [CodeMapRootManifestRecord],
         lastAccessEpochSeconds: UInt64,
-        expectedSnapshot: CodeMapRootManifestSnapshot?
+        expectedSnapshot: CodeMapRootManifestSnapshot?,
+        authorityReplacementPolicy: ManifestAuthorityReplacementPolicy,
+        writerAuthority: CodeMapRootManifestWriterAuthorityToken? = nil,
+        mergeExisting: Bool = false,
+        removingRepositoryRelativePaths: Set<String> = []
     ) async throws -> CodeMapRootManifestWriteResult {
-        guard namespace.isCurrent,
-              records.count <= policy.maximumRecordCountPerManifest,
-              records.count <= CodeMapRootManifestCodec.maximumRecordCount
-        else {
+        guard namespace.isCurrent else {
             throw CodeMapRootManifestStoreError.quotaExceeded
-        }
-        let sortedRecords = records.sorted {
-            $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
         }
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
@@ -403,6 +555,9 @@ actor CodeMapRootManifestStore {
               Self.layoutIsCurrent(layout, rootURL: rootURL)
         else {
             throw CodeMapRootManifestStoreError.insecureDirectory
+        }
+        if let writerAuthority, !writerAuthorityIsCurrent(writerAuthority) {
+            throw CodeMapRootManifestStoreError.staleWriterAuthority
         }
 
         let shard = try Self.requireOwnedDirectory(parent: layout.manifests, name: namespace.shard)
@@ -423,6 +578,43 @@ actor CodeMapRootManifestStore {
             else {
                 return .unchanged(manifestGeneration: expectedSnapshot.manifestGeneration)
             }
+        }
+        if case let .exactPredecessor(predecessor) = authorityReplacementPolicy,
+           let existingAuthority = existing.snapshot?.authority,
+           existingAuthority != authority
+        {
+            guard existingAuthority == predecessor,
+                  existingAuthority.authorityGeneration < authority.authorityGeneration
+            else {
+                throw CodeMapRootManifestModelError.staleAuthority
+            }
+        }
+        let sortedRecords: [CodeMapRootManifestRecord]
+        if mergeExisting {
+            var recordsByPath: [String: CodeMapRootManifestRecord] = [:]
+            if let snapshot = existing.snapshot, snapshot.authority == authority {
+                recordsByPath = Dictionary(
+                    uniqueKeysWithValues: snapshot.records.map { ($0.repositoryRelativePath, $0) }
+                )
+            }
+            for path in removingRepositoryRelativePaths {
+                recordsByPath.removeValue(forKey: path)
+            }
+            for record in records {
+                recordsByPath[record.repositoryRelativePath] = record
+            }
+            sortedRecords = recordsByPath.values.sorted {
+                $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
+            }
+        } else {
+            sortedRecords = records.sorted {
+                $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
+            }
+        }
+        guard sortedRecords.count <= policy.maximumRecordCountPerManifest,
+              sortedRecords.count <= CodeMapRootManifestCodec.maximumRecordCount
+        else {
+            throw CodeMapRootManifestStoreError.quotaExceeded
         }
         let semanticUnchanged = existing.snapshot.map {
             $0.authority == authority && $0.records == sortedRecords

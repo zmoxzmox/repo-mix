@@ -68,13 +68,15 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             let active = Task {
                 await fixture.engine.demand(fixture.demand(path: "Sources/Active.swift"))
             }
-            await gate.waitUntilEntered(2)
+            let initialReadsEntered = await gate.waitUntilEntered(2)
+            XCTAssertTrue(initialReadsEntered)
             let queued = Task {
                 await fixture.engine.demand(fixture.demand(path: "Sources/Queued.swift"))
             }
-            while await fixture.engine.accounting().queuedRequestCount != 1 {
-                await Task.yield()
+            let requestQueued = await waitForEngineCondition {
+                await fixture.engine.accounting().queuedRequestCount == 1
             }
+            XCTAssertTrue(requestQueued)
 
             alreadyCancelled.cancel()
             guard case .cancelled = await alreadyCancelled.value else {
@@ -83,7 +85,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             XCTAssertTrue(hookEvents.wait(kind: .cancellation, numericValue: 1))
             let preBulk = await fixture.engine.accounting()
             XCTAssertEqual(preBulk.activeRequestCount, 2)
-            XCTAssertEqual(preBulk.queuedRequestCount, 1)
+            XCTAssertEqual(preBulk.queuedRequestCount, 0)
             XCTAssertEqual(preBulk.counters.cancellations, 1)
 
             let shutdown: Task<Void, Never>?
@@ -124,9 +126,10 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             guard case .cancelled = await active.value,
                   case .cancelled = await queued.value
             else { return XCTFail("Expected bulk cancellation for \(operation).") }
-            while await fixture.engine.accounting().activeRequestCount != 0 {
-                await Task.yield()
+            let drained = await waitForEngineCondition {
+                await fixture.engine.accounting().activeRequestCount == 0
             }
+            XCTAssertTrue(drained)
             let finalAccounting = await fixture.engine.accounting()
             XCTAssertEqual(finalAccounting.counters.cancellations, 3)
             XCTAssertEqual(hookEvents.count(kind: .cancellation), 2)
@@ -161,14 +164,12 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             }
         )
         addTeardownBlock { await engine.shutdown() }
-
         let result = await engine.registerRoot(WorkspaceCodemapBindingRootRegistration(
             rootID: UUID(),
             rootLifetimeID: UUID(),
             loadedRootURL: root,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         ))
         guard case let .unavailable(state) = result,
               case .terminalUnavailable(.nonGit) = state
@@ -180,6 +181,141 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         XCTAssertEqual(coordinator.counters.requests, 0)
         let accounting = await engine.accounting()
         XCTAssertEqual(accounting.unavailableRootCount, 1)
+    }
+
+    func testOneRootServesMultipleLanguagePipelines() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.ts": "export interface Feature {}\n"
+            ]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        guard case .registered(adoptedReadyCount: 0) = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected language-neutral registration.")
+        }
+
+        async let swiftResult = fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.swift", language: .swift)
+        )
+        async let typeScriptResult = fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.ts", language: .ts)
+        )
+        guard case .ready = await swiftResult,
+              case .ready = await typeScriptResult
+        else { return XCTFail("Expected both language pipelines to become ready.") }
+
+        let bundleValue = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
+        let bundle = try XCTUnwrap(bundleValue)
+        XCTAssertEqual(Set(bundle.entries.map(\.standardizedRelativePath)), [
+            "Sources/Feature.swift",
+            "Sources/Feature.ts"
+        ])
+    }
+
+    func testPipelineManifestsRemainDistinct() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.ts": "export interface Feature {}\n"
+            ]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        guard case .ready = await fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.swift", language: .swift)
+        ), case .ready = await fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.ts", language: .ts)
+        ) else { return XCTFail("Expected both pipeline manifests to be written.") }
+
+        let capability = try await eligible(fixture.capabilityService.resolve(
+            root: fixture.registration.capabilityRequest
+        ))
+        let swiftNamespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: SyntaxManager.shared.pipelineIdentity(
+                for: .swift,
+                decoderPolicy: .workspaceAutomaticV1
+            )
+        )
+        let typeScriptNamespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: SyntaxManager.shared.pipelineIdentity(
+                for: .ts,
+                decoderPolicy: .workspaceAutomaticV1
+            )
+        )
+        XCTAssertNotEqual(swiftNamespace.storageDigestHex, typeScriptNamespace.storageDigestHex)
+        let swiftManifest = try await runtime.manifestStore.loadCurrentManifest(
+            namespace: swiftNamespace,
+            currentAuthority: CodeMapRootManifestAuthority(
+                namespace: swiftNamespace,
+                token: capability.repositoryAuthority
+            )
+        )
+        let typeScriptManifest = try await runtime.manifestStore.loadCurrentManifest(
+            namespace: typeScriptNamespace,
+            currentAuthority: CodeMapRootManifestAuthority(
+                namespace: typeScriptNamespace,
+                token: capability.repositoryAuthority
+            )
+        )
+        guard case let .hit(swiftSnapshot) = swiftManifest,
+              case let .hit(typeScriptSnapshot) = typeScriptManifest
+        else { return XCTFail("Expected distinct persisted pipeline manifests.") }
+        XCTAssertEqual(swiftSnapshot.records.map(\.repositoryRelativePath), ["Sources/Feature.swift"])
+        XCTAssertEqual(typeScriptSnapshot.records.map(\.repositoryRelativePath), ["Sources/Feature.ts"])
+    }
+
+    func testRootInvalidationRevokesEveryPipeline() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "struct Feature {}\n",
+                "Sources/Feature.ts": "export interface Feature {}\n"
+            ]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        guard await isReady(fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.swift", language: .swift)
+        )), await isReady(fixture.engine.demand(
+            fixture.demand(path: "Sources/Feature.ts", language: .ts)
+        )) else {
+            return XCTFail("Expected both language pipelines to become ready before invalidation.")
+        }
+        let frozenBeforeInvalidation = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
+        let retainedBundle = try XCTUnwrap(frozenBeforeInvalidation)
+        XCTAssertEqual(
+            Set(retainedBundle.entries.map(\.standardizedRelativePath)),
+            ["Sources/Feature.swift", "Sources/Feature.ts"]
+        )
+        retainedBundle.close()
+
+        let result = await fixture.engine.invalidateRepositoryAuthority(rootEpoch: fixture.rootEpoch)
+        XCTAssertFalse(result.manifestWriteFailed)
+        let snapshotAfterInvalidation = await fixture.engine.snapshot(rootEpoch: fixture.rootEpoch)
+        let revokedSnapshot = try XCTUnwrap(snapshotAfterInvalidation)
+        XCTAssertFalse(revokedSnapshot.authorityIsCurrent)
+        XCTAssertTrue(revokedSnapshot.entries.isEmpty)
+        let bundle = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
+        XCTAssertNil(bundle)
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
     }
 
     func testCleanColdBuildPublishesManifestAndWarmRegistrationAdoptsWithoutMaterialization() async throws {
@@ -214,8 +350,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             runtime: runtime,
             sourceReaderOverride: trappingReader
         )
-        guard case .registered(adoptedReadyCount: 1) = await warm.engine.registerRoot(warm.registration) else {
-            return XCTFail("Expected warm manifest adoption.")
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
+            return XCTFail("Expected lazy warm registration.")
+        }
+        guard await isReady(warm.engine.demand(warm.demand(path: "Sources/Clean.swift"))) else {
+            return XCTFail("Expected first demand to adopt the warm manifest.")
         }
         let warmAccounting = await warm.engine.accounting()
         XCTAssertEqual(warmAccounting.counters.materializations, 0)
@@ -229,6 +368,253 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             return XCTFail("Expected adopted ready entry.")
         }
         XCTAssertEqual(source, .cleanManifest)
+    }
+
+    func testPathInvalidationDuringBlockedWarmAdoptionRemainsRetryable() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Warm.swift": "struct Warm {}\n",
+                "Sources/Trigger.swift": "struct Trigger {}\n",
+                "Sources/Other.swift": "struct Other {}\n"
+            ]
+        )
+        let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
+        let seed = try await makeEngineFixture(root: root, runtime: seedRuntime)
+        _ = await seed.engine.registerRoot(seed.registration)
+        guard case .ready = await seed.engine.demand(seed.demand(path: "Sources/Warm.swift")) else {
+            return XCTFail("Expected warm manifest seed.")
+        }
+        await seed.engine.unloadRoot(rootEpoch: seed.rootEpoch)
+
+        let adoptionGate = EngineFirstResolutionGate()
+        let warmRuntime = try CodeMapArtifactRuntime(
+            rootURL: artifactRoot,
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterReadAdmission: { await adoptionGate.enter() }
+            )
+        )
+        let warm = try await makeEngineFixture(root: root, runtime: warmRuntime)
+        _ = await warm.engine.registerRoot(warm.registration)
+        let trigger = Task {
+            await warm.engine.demand(warm.demand(path: "Sources/Trigger.swift"))
+        }
+        let firstAdoptionEntered = await adoptionGate.waitUntilFirstResolution()
+        XCTAssertTrue(firstAdoptionEntered)
+        let invalidationResult = await warm.engine.invalidateModified(
+            rootEpoch: warm.rootEpoch,
+            standardizedRelativePaths: ["Sources/Other.swift"]
+        )
+        XCTAssertFalse(invalidationResult.manifestWriteFailed)
+        let replacement = Task {
+            await warm.engine.demand(warm.demand(path: "Sources/Warm.swift"))
+        }
+        guard let replacementResult = await demandResult(
+            replacement,
+            before: .seconds(5)
+        ), await adoptionGate.resolutionCount >= 2,
+        isReady(replacementResult)
+        else {
+            return XCTFail("Expected warm manifest adoption to retry after invalidation.")
+        }
+        await adoptionGate.releaseFirstResolution()
+        guard case .ready = await trigger.value else {
+            return XCTFail("Expected unrelated trigger demand to remain active.")
+        }
+        let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
+        let snapshot = try XCTUnwrap(snapshotValue)
+        let warmEntry = try XCTUnwrap(snapshot.entries.first(where: {
+            $0.standardizedRelativePath == "Sources/Warm.swift"
+        }))
+        guard case .ready = warmEntry.state else {
+            return XCTFail("Expected retried warm entry.")
+        }
+        let accounting = await warm.engine.accounting()
+        XCTAssertEqual(accounting.counters.manifestLoads, 2)
+    }
+
+    func testCancelledManifestAdoptionWaiterReleasesAdmissionWithoutCancellingSharedLoad() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+        )
+        let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
+        let seed = try await makeEngineFixture(root: root, runtime: seedRuntime)
+        _ = await seed.engine.registerRoot(seed.registration)
+        guard case .ready = await seed.engine.demand(seed.demand(path: "Sources/Warm.swift")) else {
+            return XCTFail("Expected warm manifest seed.")
+        }
+        await seed.engine.unloadRoot(rootEpoch: seed.rootEpoch)
+
+        let loadGate = EngineBuildGate()
+        let sharedLoadCancellation = EngineLockedFlag()
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: artifactRoot,
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterReadAdmission: {
+                    await loadGate.enter()
+                    sharedLoadCancellation.set(Task.isCancelled)
+                }
+            )
+        )
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumActiveRequestCountPerRoot: 1,
+                maximumActiveRequestCount: 1,
+                maximumQueuedRequestCountPerRoot: 1,
+                maximumQueuedRequestCount: 1,
+                maximumActiveTaskCountPerRoot: 1,
+                maximumActiveTaskCount: 1,
+                maximumConcurrentMaterializationCountPerRoot: 1,
+                maximumConcurrentMaterializationCount: 1
+            )
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let first = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Warm.swift"))
+        }
+        let sharedLoadEntered = await loadGate.waitUntilEntered()
+        XCTAssertTrue(sharedLoadEntered)
+        let second = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Warm.swift"))
+        }
+        while await fixture.engine.accounting().queuedRequestCount != 1 {
+            await Task.yield()
+        }
+
+        first.cancel()
+        guard case .cancelled = await first.value else {
+            return XCTFail("Expected the detached manifest waiter to cancel.")
+        }
+        let waiterReplaced = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.activeRequestCount == 1 && accounting.queuedRequestCount == 0
+        }
+        XCTAssertTrue(waiterReplaced)
+        let recovered = await fixture.engine.accounting()
+        XCTAssertEqual(recovered.activeRequestCount, 1)
+        XCTAssertEqual(recovered.queuedRequestCount, 0)
+        XCTAssertEqual(recovered.ownerCount, 1)
+        XCTAssertEqual(recovered.counters.cancellations, 1)
+
+        await loadGate.release()
+        guard await isReady(second.value) else {
+            return XCTFail("Expected the remaining waiter to complete from the shared adoption.")
+        }
+        XCTAssertFalse(sharedLoadCancellation.value)
+        let final = await fixture.engine.accounting()
+        XCTAssertEqual(final.activeRequestCount, 0)
+        XCTAssertEqual(final.queuedRequestCount, 0)
+        XCTAssertEqual(final.counters.manifestLoads, 1)
+        XCTAssertEqual(final.counters.manifestAdoptions, 1)
+        XCTAssertEqual(final.counters.cancellations, 1)
+    }
+
+    func testOwnerCancellationImmediatelyReleasesAdmissionWhileBlockedIOGuaranteesDrain() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Blocked.swift": "struct Blocked {}\n",
+                "Sources/Replacement.swift": "struct Replacement {}\n"
+            ]
+        )
+        let gate = EngineFirstResolutionGate()
+        let fileSystem = try await FileSystemService(
+            path: root.path,
+            respectGitignore: false,
+            respectRepoIgnore: false,
+            respectCursorignore: false
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumActiveRequestCountPerRoot: 1,
+                maximumActiveRequestCount: 1,
+                maximumQueuedRequestCountPerRoot: 1,
+                maximumQueuedRequestCount: 1,
+                maximumActiveTaskCountPerRoot: 1,
+                maximumActiveTaskCount: 1,
+                maximumConcurrentMaterializationCountPerRoot: 1,
+                maximumConcurrentMaterializationCount: 1
+            ),
+            sourceReaderOverride: WorkspaceCodemapValidatedSourceReaderClient {
+                identity,
+                expected,
+                maximumBytes,
+                ownerID in
+                await gate.enter()
+                return try await fileSystem.loadValidatedRawContent(
+                    ofRelativePath: identity.standardizedRelativePath,
+                    expectedFingerprint: FileContentFingerprint(
+                        deviceID: expected.device,
+                        fileNumber: expected.inode,
+                        byteSize: expected.size,
+                        modificationSeconds: expected.modificationSeconds,
+                        modificationNanoseconds: expected.modificationNanoseconds,
+                        statusChangeSeconds: expected.changeSeconds,
+                        statusChangeNanoseconds: expected.changeNanoseconds
+                    ),
+                    maximumBytes: maximumBytes,
+                    workloadClass: .codemap,
+                    schedulerOwnerID: ownerID
+                )
+            }
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        try repository.write("struct Blocked { let dirty = true }\n", to: "Sources/Blocked.swift", at: root)
+        try repository.write(
+            "struct Replacement { let dirty = true }\n",
+            to: "Sources/Replacement.swift",
+            at: root
+        )
+        let blockedOwner = WorkspaceCodemapLiveDemandOwner()
+        let blocked = Task {
+            await fixture.engine.demand(fixture.demand(
+                path: "Sources/Blocked.swift",
+                owner: blockedOwner
+            ))
+        }
+        let blockedReadEntered = await gate.waitUntilFirstResolution()
+        XCTAssertTrue(blockedReadEntered)
+        let replacement = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Replacement.swift"))
+        }
+
+        let queued = await waitForEngineCondition {
+            await fixture.engine.accounting().queuedRequestCount == 1
+        }
+        XCTAssertTrue(queued)
+        let cancelledCount = await fixture.engine.cancel(owner: blockedOwner)
+        XCTAssertEqual(cancelledCount, 1)
+        guard case .cancelled = await blocked.value else {
+            return XCTFail("Expected logical cancellation before blocked I/O drained.")
+        }
+        guard let replacementResult = await demandResult(replacement, before: .seconds(5)),
+              isReady(replacementResult),
+              await gate.resolutionCount >= 2
+        else {
+            return XCTFail("Expected immediate replacement admission while stale I/O remained blocked.")
+        }
+        let recovered = await fixture.engine.accounting()
+        XCTAssertEqual(recovered.queuedRequestCount, 0)
+        XCTAssertEqual(recovered.counters.cancellations, 1)
+
+        await gate.releaseFirstResolution()
+        let drained = await waitForEngineCondition {
+            await fixture.engine.accounting().activeRequestCount == 0
+        }
+        XCTAssertTrue(drained)
     }
 
     func testWarmManifestAdoptionReclassifiesDirtyCandidateAndKeepsOnlyCurrentCleanOID() async throws {
@@ -265,8 +651,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             runtime: runtime,
             sourceReaderOverride: trappingReader
         )
-        guard case .registered(adoptedReadyCount: 1) = await warm.engine.registerRoot(warm.registration) else {
-            return XCTFail("Only the current clean manifest candidate should be adopted.")
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
+            return XCTFail("Expected lazy warm registration.")
+        }
+        guard await isReady(warm.engine.demand(warm.demand(path: "Sources/Clean.swift"))) else {
+            return XCTFail("Only the current clean manifest candidate should be adopted on demand.")
         }
         let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
         let snapshot = try XCTUnwrap(snapshotValue)
@@ -281,7 +670,10 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Race.swift": "struct Race {}\n"]
+            files: [
+                "Sources/Race.swift": "struct Race {}\n",
+                "Sources/Trigger.swift": "struct Trigger {}\n"
+            ]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -298,6 +690,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             contents: "struct Race { let changed = true }\n"
         )
         let sourceReadCounter = EngineAsyncCounter()
+        let hookEvents = EngineHookEvents()
         let trappingReader = WorkspaceCodemapValidatedSourceReaderClient { _, _, _, _ in
             await sourceReadCounter.increment()
             throw CancellationError()
@@ -305,17 +698,28 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let warm = try await makeEngineFixture(
             root: root,
             runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) },
             sourceReaderOverride: trappingReader,
             identityHooks: GitBlobIdentityServiceHooks(
                 afterGitCollection: { await mutation.mutateOnce() }
             )
         )
         guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
-            return XCTFail("A candidate changed during registration must not be adopted.")
+            return XCTFail("Expected lazy warm registration.")
         }
+        guard await isReady(warm.engine.demand(warm.demand(path: "Sources/Trigger.swift"))) else {
+            return XCTFail("Expected trigger demand after rejecting the stale warm candidate.")
+        }
+        XCTAssertEqual(hookEvents.count(kind: .manifestLoadHit), 1)
+        let mutationInvocationCount = await mutation.invocationCount
+        XCTAssertGreaterThanOrEqual(mutationInvocationCount, 1)
         let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
         let snapshot = try XCTUnwrap(snapshotValue)
-        XCTAssertTrue(snapshot.entries.isEmpty)
+        XCTAssertFalse(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Race.swift" })
+        XCTAssertTrue(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Trigger.swift" })
+        let accounting = await warm.engine.accounting()
+        XCTAssertEqual(accounting.counters.materializations, 1)
+        XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
         let sourceReadCount = await sourceReadCounter.value
         XCTAssertEqual(sourceReadCount, 0)
     }
@@ -324,7 +728,10 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Race.swift": "struct Race {}\n"]
+            files: [
+                "Sources/Race.swift": "struct Race {}\n",
+                "Sources/Trigger.swift": "struct Trigger {}\n"
+            ]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -341,9 +748,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             contents: "struct Race { let changedAfterClassification = true }\n"
         )
         let sourceReadCounter = EngineAsyncCounter()
+        let hookEvents = EngineHookEvents()
         let warm = try await makeEngineFixture(
             root: root,
             runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) },
             sourceReaderOverride: WorkspaceCodemapValidatedSourceReaderClient { _, _, _, _ in
                 await sourceReadCounter.increment()
                 throw CancellationError()
@@ -354,12 +763,20 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
 
         guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
-            return XCTFail("A mutation after classification must fail closed.")
+            return XCTFail("Expected lazy warm registration.")
         }
+        guard await isReady(warm.engine.demand(warm.demand(path: "Sources/Trigger.swift"))) else {
+            return XCTFail("Expected trigger demand after the stale candidate failed closed.")
+        }
+        XCTAssertEqual(hookEvents.count(kind: .manifestLoadHit), 1)
+        let mutationInvocationCount = await mutation.invocationCount
+        XCTAssertGreaterThanOrEqual(mutationInvocationCount, 1)
         let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
         let snapshot = try XCTUnwrap(snapshotValue)
-        XCTAssertTrue(snapshot.entries.isEmpty)
+        XCTAssertFalse(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Race.swift" })
+        XCTAssertTrue(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Trigger.swift" })
         let accounting = await warm.engine.accounting()
+        XCTAssertEqual(accounting.counters.materializations, 1)
         XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
         XCTAssertEqual(accounting.manifestAdoptionLeaseByteCount, 0)
         let sourceReadCount = await sourceReadCounter.value
@@ -370,7 +787,10 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
-            files: ["Sources/Race.swift": "struct Race {}\n"]
+            files: [
+                "Sources/Race.swift": "struct Race {}\n",
+                "Sources/Trigger.swift": "struct Trigger {}\n"
+            ]
         )
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -387,9 +807,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             contents: "struct Race { let changedAfterAuthority = true }\n"
         )
         let sourceReadCounter = EngineAsyncCounter()
+        let hookEvents = EngineHookEvents()
         let warm = try await makeEngineFixture(
             root: root,
             runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) },
             sourceReaderOverride: WorkspaceCodemapValidatedSourceReaderClient { _, _, _, _ in
                 await sourceReadCounter.increment()
                 throw CancellationError()
@@ -398,12 +820,20 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
 
         guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
-            return XCTFail("The final authority fence must reject post-capture mutation.")
+            return XCTFail("Expected lazy warm registration.")
         }
+        guard await isReady(warm.engine.demand(warm.demand(path: "Sources/Trigger.swift"))) else {
+            return XCTFail("Expected trigger demand after the final authority fence rejected the candidate.")
+        }
+        XCTAssertEqual(hookEvents.count(kind: .manifestLoadHit), 1)
+        let resolutionCount = await mutation.resolutionCount
+        XCTAssertGreaterThanOrEqual(resolutionCount, 2)
         let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
         let snapshot = try XCTUnwrap(snapshotValue)
-        XCTAssertTrue(snapshot.entries.isEmpty)
+        XCTAssertFalse(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Race.swift" })
+        XCTAssertTrue(snapshot.entries.contains { $0.standardizedRelativePath == "Sources/Trigger.swift" })
         let accounting = await warm.engine.accounting()
+        XCTAssertEqual(accounting.counters.materializations, 1)
         XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
         XCTAssertEqual(accounting.manifestAdoptionLeaseByteCount, 0)
         let sourceReadCount = await sourceReadCounter.value
@@ -414,9 +844,13 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         for state in WarmManifestCandidateState.allCases {
             let repository = try makeRepositoryFixture(name: "\(#function)-\(state)")
             let path = "Sources/Candidate.swift"
+            let triggerPath = "Sources/Trigger.swift"
             let root = try repository.makeRepository(
                 named: "repository",
-                files: [path: "struct Candidate {}\n"]
+                files: [
+                    path: "struct Candidate {}\n",
+                    triggerPath: "struct Trigger {}\n"
+                ]
             )
             let runtime = try CodeMapArtifactRuntime(
                 rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
@@ -488,14 +922,21 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
                 }
             )
             guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
-                return XCTFail("Expected \(state) to reject warm adoption.")
+                return XCTFail("Expected lazy warm registration for \(state).")
+            }
+            guard await isReady(warm.engine.demand(warm.demand(path: triggerPath))) else {
+                return XCTFail("Expected trigger demand after rejecting \(state).")
             }
             XCTAssertEqual(hookEvents.count(kind: .manifestLoadHit), 1)
             let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
             let snapshot = try XCTUnwrap(snapshotValue)
-            XCTAssertTrue(snapshot.entries.isEmpty, "Unexpected warm entry for \(state).")
+            XCTAssertFalse(
+                snapshot.entries.contains { $0.standardizedRelativePath == path },
+                "Unexpected warm entry for \(state)."
+            )
+            XCTAssertTrue(snapshot.entries.contains { $0.standardizedRelativePath == triggerPath })
             let accounting = await warm.engine.accounting()
-            XCTAssertEqual(accounting.counters.materializations, 0)
+            XCTAssertEqual(accounting.counters.materializations, 1)
             XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
             XCTAssertEqual(accounting.manifestAdoptionLeaseByteCount, 0)
             let sourceReadCount = await sourceReadCounter.value
@@ -619,7 +1060,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let firstOwner = WorkspaceCodemapLiveDemandOwner()
         let secondOwner = WorkspaceCodemapLiveDemandOwner()
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/FanIn.swift", owner: firstOwner)) }
-        await gate.waitUntilEntered()
+        _ = await gate.waitUntilEntered()
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/FanIn.swift", owner: secondOwner)) }
         for _ in 0 ..< 200 {
             if await fixture.engine.accounting().activeRequestCount == 2 { break }
@@ -667,7 +1108,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Duplicate.swift")) }
-        await gate.waitUntilEntered()
+        _ = await gate.waitUntilEntered()
         let second = Task {
             await fixture.engine.demand(fixture.demand(
                 path: "Sources/Duplicate.swift",
@@ -773,8 +1214,13 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
 
         let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
-        guard case .registered(adoptedReadyCount: 2) = await reloaded.engine.registerRoot(reloaded.registration) else {
-            return XCTFail("Expected recovered manifest to retain both revisions.")
+        guard case .registered(adoptedReadyCount: 0) = await reloaded.engine.registerRoot(reloaded.registration) else {
+            return XCTFail("Expected lazy recovered registration.")
+        }
+        guard await isReady(reloaded.engine.demand(
+            reloaded.demand(path: "Sources/Failure.swift")
+        )) else {
+            return XCTFail("Expected recovered manifest to retain both revisions on demand.")
         }
     }
 
@@ -806,8 +1252,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             rootLifetimeID: UUID(),
             loadedRootURL: secondRoot,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         )
         guard case .busy = await first.engine.registerRoot(secondRegistration) else {
             return XCTFail("Expected root bound.")
@@ -861,11 +1306,11 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         }
         await seed.engine.unloadRoot(rootEpoch: seed.rootEpoch)
 
-        let loadGate = EngineBuildGate()
+        let manifestReads = EngineLockedCounter()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: artifactRoot,
             manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterReadAdmission: { await loadGate.enter() }
+                afterReadAdmission: { manifestReads.increment() }
             )
         )
         let fixture = try await makeEngineFixture(
@@ -873,19 +1318,18 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             runtime: runtime,
             policy: WorkspaceCodemapBindingEnginePolicy(maximumRootCount: 1)
         )
-        let first = Task { await fixture.engine.registerRoot(fixture.registration) }
-        await loadGate.waitUntilEntered()
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected first registration.")
+        }
+        XCTAssertEqual(manifestReads.value, 0)
         let second = await fixture.engine.registerRoot(WorkspaceCodemapBindingRootRegistration(
             rootID: UUID(),
             rootLifetimeID: UUID(),
             loadedRootURL: secondRoot,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         ))
-        guard case .busy = second else { return XCTFail("Expected reserved root slot to reject overlap.") }
-        await loadGate.release()
-        guard case .registered = await first.value else { return XCTFail("Expected first registration.") }
+        guard case .busy = second else { return XCTFail("Expected occupied root slot to reject overlap.") }
     }
 
     func testInvalidationsFenceBlockedCapabilityRegistrationBeforeAwait() async throws {
@@ -908,7 +1352,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
                 )
             )
             let registration = Task { await fixture.engine.registerRoot(fixture.registration) }
-            await gate.waitUntilEntered()
+            _ = await gate.waitUntilEntered()
 
             let result: WorkspaceCodemapBindingInvalidationResult = switch kind {
             case .path:
@@ -964,7 +1408,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             )
         )
         let first = Task { await fixture.engine.registerRoot(fixture.registration) }
-        await gate.waitUntilFirstResolution()
+        _ = await gate.waitUntilFirstResolution()
 
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
         guard case .failed = await first.value else {
@@ -983,8 +1427,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             rootLifetimeID: UUID(),
             loadedRootURL: root,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         )
         guard case .registered = await fixture.engine.registerRoot(replacement) else {
             return XCTFail("Expected the synchronously released root slot to admit a replacement.")
@@ -1042,7 +1485,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         _ = await fixture.engine.registerRoot(fixture.registration)
         try repository.write("struct Dirty { let changed = true }\n", to: "Sources/Dirty.swift", at: root)
         let task = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Dirty.swift")) }
-        await readGate.waitUntilEntered()
+        _ = await readGate.waitUntilEntered()
         let queued = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Queued.swift")) }
         for _ in 0 ..< 20 {
             await Task.yield()
@@ -1126,7 +1569,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let fixture = try await makeEngineFixture(root: root, runtime: runtime)
         _ = await fixture.engine.registerRoot(fixture.registration)
         let demand = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Race.swift")) }
-        await buildGate.waitUntilEntered()
+        _ = await buildGate.waitUntilEntered()
         let invalidation = await fixture.engine.invalidateModified(
             rootEpoch: fixture.rootEpoch,
             standardizedRelativePaths: ["Sources/Race.swift"]
@@ -1145,6 +1588,93 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
         let repeatedInvalidationAccounting = await fixture.engine.accounting()
         XCTAssertEqual(repeatedInvalidationAccounting.counters.cancellations, 1)
+    }
+
+    func testPathInvalidationDoesNotCancelUnrelatedActiveRequest() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Invalidated.swift": "struct Invalidated {}\n",
+                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+            ]
+        )
+        let sourceGate = EngineMultiEntryGate()
+        let fileSystem = try await FileSystemService(
+            path: root.path,
+            respectGitignore: false,
+            respectRepoIgnore: false,
+            respectCursorignore: false
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumActiveRequestCountPerRoot: 2,
+                maximumActiveRequestCount: 2,
+                maximumActiveTaskCountPerRoot: 2,
+                maximumActiveTaskCount: 2,
+                maximumConcurrentMaterializationCountPerRoot: 2,
+                maximumConcurrentMaterializationCount: 2
+            ),
+            sourceReaderOverride: WorkspaceCodemapValidatedSourceReaderClient {
+                identity, expected, maximumBytes, ownerID in
+                await sourceGate.enter()
+                return try await fileSystem.loadValidatedRawContent(
+                    ofRelativePath: identity.standardizedRelativePath,
+                    expectedFingerprint: FileContentFingerprint(
+                        deviceID: expected.device,
+                        fileNumber: expected.inode,
+                        byteSize: expected.size,
+                        modificationSeconds: expected.modificationSeconds,
+                        modificationNanoseconds: expected.modificationNanoseconds,
+                        statusChangeSeconds: expected.changeSeconds,
+                        statusChangeNanoseconds: expected.changeNanoseconds
+                    ),
+                    maximumBytes: maximumBytes,
+                    workloadClass: .codemap,
+                    schedulerOwnerID: ownerID
+                )
+            }
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        try repository.write(
+            "struct Invalidated { let dirty = true }\n",
+            to: "Sources/Invalidated.swift",
+            at: root
+        )
+        try repository.write(
+            "struct Unrelated { let dirty = true }\n",
+            to: "Sources/Unrelated.swift",
+            at: root
+        )
+        let invalidated = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Invalidated.swift"))
+        }
+        let unrelated = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Unrelated.swift"))
+        }
+        _ = await sourceGate.waitUntilEntered(2)
+
+        let invalidation = await fixture.engine.invalidateModified(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Sources/Invalidated.swift"]
+        )
+        XCTAssertEqual(invalidation.cancelledRequestCount, 1)
+        await sourceGate.releaseAll()
+
+        guard case .cancelled = await invalidated.value else {
+            return XCTFail("Expected only the invalidated path to cancel.")
+        }
+        guard case .ready = await unrelated.value else {
+            return XCTFail("Expected the unrelated active request to remain current.")
+        }
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.cancellations, 1)
+        XCTAssertEqual(accounting.activeRequestCount, 0)
     }
 
     func testUnloadCancellationTelemetryCountsActiveRequestExactlyOnce() async throws {
@@ -1176,9 +1706,10 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         guard case .cancelled = await demand.value else {
             return XCTFail("Expected unload to cancel the active request.")
         }
-        while await fixture.engine.accounting().activeRequestCount != 0 {
-            await Task.yield()
+        let drained = await waitForEngineCondition {
+            await fixture.engine.accounting().activeRequestCount == 0
         }
+        XCTAssertTrue(drained)
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.cancellations, 1)
     }
@@ -1256,9 +1787,211 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
 
         let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
-        guard case .registered(adoptedReadyCount: 2) = await reloaded.engine.registerRoot(reloaded.registration) else {
-            return XCTFail("Expected latest two-record manifest snapshot.")
+        guard case .registered(adoptedReadyCount: 0) = await reloaded.engine.registerRoot(reloaded.registration) else {
+            return XCTFail("Expected lazy reloaded registration.")
         }
+        guard await isReady(reloaded.engine.demand(
+            reloaded.demand(path: "Sources/One.swift")
+        )) else {
+            return XCTFail("Expected latest two-record manifest snapshot on demand.")
+        }
+    }
+
+    func testSameNamespaceWriterDrainsUnloadedPredecessorBeforeSuccessor() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First {}\n",
+                "Sources/Second.swift": "struct Second {}\n"
+            ]
+        )
+        let writeGate = EngineBlockingGate()
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { writeGate.enterAndWait() }
+            )
+        )
+        let service = capabilityService()
+        let firstEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let secondEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let firstFileIDs = EngineFileIDs()
+        let secondFileIDs = EngineFileIDs()
+        let fileSystem = try await FileSystemService(
+            path: root.path,
+            respectGitignore: false,
+            respectRepoIgnore: false,
+            respectCursorignore: false
+        )
+        let catalog = WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
+            let fileIDs = epoch == firstEpoch ? firstFileIDs : secondFileIDs
+            guard epoch == firstEpoch || epoch == secondEpoch,
+                  let identity = WorkspaceCodemapArtifactBindingIdentity(
+                      rootID: epoch.rootID,
+                      rootLifetimeID: epoch.rootLifetimeID,
+                      fileID: fileIDs.id(for: relativePath),
+                      standardizedRootPath: root.path,
+                      standardizedRelativePath: relativePath,
+                      standardizedFullPath: root.appendingPathComponent(relativePath).path
+                  )
+            else { return nil }
+            return WorkspaceCodemapManifestBindingCandidate(
+                identity: identity,
+                requestGeneration: 1,
+                pathGeneration: 1,
+                ingressGeneration: 1
+            )
+        }
+        let reader = WorkspaceCodemapValidatedSourceReaderClient { identity, expected, maximumBytes, ownerID in
+            try await fileSystem.loadValidatedRawContent(
+                ofRelativePath: identity.standardizedRelativePath,
+                expectedFingerprint: FileContentFingerprint(
+                    deviceID: expected.device,
+                    fileNumber: expected.inode,
+                    byteSize: expected.size,
+                    modificationSeconds: expected.modificationSeconds,
+                    modificationNanoseconds: expected.modificationNanoseconds,
+                    statusChangeSeconds: expected.changeSeconds,
+                    statusChangeNanoseconds: expected.changeNanoseconds
+                ),
+                maximumBytes: maximumBytes,
+                workloadClass: .codemap,
+                schedulerOwnerID: ownerID
+            )
+        }
+        let engine = WorkspaceCodemapBindingEngine(
+            runtime: runtime,
+            capabilityService: service,
+            sourceReader: reader,
+            catalogClient: catalog,
+            accessEpochSeconds: { 42 }
+        )
+        addTeardownBlock { await engine.shutdown() }
+        let firstRegistration = WorkspaceCodemapBindingRootRegistration(
+            rootID: firstEpoch.rootID,
+            rootLifetimeID: firstEpoch.rootLifetimeID,
+            loadedRootURL: root,
+            catalogGeneration: 1,
+            ingressGeneration: 1
+        )
+        let secondRegistration = WorkspaceCodemapBindingRootRegistration(
+            rootID: secondEpoch.rootID,
+            rootLifetimeID: secondEpoch.rootLifetimeID,
+            loadedRootURL: root,
+            catalogGeneration: 1,
+            ingressGeneration: 1
+        )
+        func demand(
+            epoch: WorkspaceCodemapRootEpoch,
+            fileIDs: EngineFileIDs,
+            path: String
+        ) -> WorkspaceCodemapBindingDemand {
+            WorkspaceCodemapBindingDemand(
+                owner: .init(),
+                identity: WorkspaceCodemapArtifactBindingIdentity(
+                    rootID: epoch.rootID,
+                    rootLifetimeID: epoch.rootLifetimeID,
+                    fileID: fileIDs.id(for: path),
+                    standardizedRootPath: root.path,
+                    standardizedRelativePath: path,
+                    standardizedFullPath: root.appendingPathComponent(path).path
+                )!,
+                requestGeneration: 1,
+                catalogGeneration: 1,
+                pathGeneration: 1,
+                ingressGeneration: 1,
+                priority: .demand,
+                language: .swift
+            )
+        }
+
+        _ = await engine.registerRoot(firstRegistration)
+        _ = await engine.registerRoot(secondRegistration)
+        let first = Task {
+            await engine.demand(demand(
+                epoch: firstEpoch,
+                fileIDs: firstFileIDs,
+                path: "Sources/First.swift"
+            ))
+        }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        await engine.unloadRoot(rootEpoch: firstEpoch)
+        let second = Task {
+            await engine.demand(demand(
+                epoch: secondEpoch,
+                fileIDs: secondFileIDs,
+                path: "Sources/Second.swift"
+            ))
+        }
+        writeGate.release()
+
+        guard case .cancelled = await first.value else {
+            return XCTFail("Expected unloaded predecessor demand to cancel.")
+        }
+        guard case .ready = await second.value else {
+            return XCTFail("Expected same-namespace successor demand to complete.")
+        }
+        let state = await service.state(for: secondEpoch)
+        let capability = try eligible(state)
+        let pipeline = try SyntaxManager.shared.pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let namespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: pipeline
+        )
+        let authority = try CodeMapRootManifestAuthority(
+            namespace: namespace,
+            token: capability.repositoryAuthority
+        )
+        guard case let .hit(snapshot) = try await runtime.manifestStore.loadCurrentManifest(
+            namespace: namespace,
+            currentAuthority: authority
+        ) else {
+            return XCTFail("Expected same-namespace manifest.")
+        }
+        XCTAssertEqual(
+            Set(snapshot.records.map(\.repositoryRelativePath)),
+            ["Sources/First.swift", "Sources/Second.swift"]
+        )
+    }
+
+    func testPathInvalidationDuringManifestWriteDrainsNewestRevision() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let writeGate = EngineBlockingGate()
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { writeGate.enterAndWait() }
+            )
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let demand = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Feature.swift"))
+        }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        let invalidation = Task {
+            await fixture.engine.invalidateModified(
+                rootEpoch: fixture.rootEpoch,
+                standardizedRelativePaths: ["Sources/Feature.swift"]
+            )
+        }
+
+        writeGate.release()
+        let invalidationResult = await invalidation.value
+        XCTAssertFalse(invalidationResult.manifestWriteFailed)
+        guard case .cancelled = await demand.value else {
+            return XCTFail("Expected the invalidated manifest-producing demand to cancel.")
+        }
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
     }
 
     func testQueuedAndLastOwnerCancellationDrainReservationsAndFairnessHistoryAfterOrdinalRebase() async throws {
@@ -1308,7 +2041,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         let first = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/First.swift", owner: firstOwner))
         }
-        await gate.waitUntilEntered()
+        _ = await gate.waitUntilEntered()
         let second = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Second.swift", owner: secondOwner))
         }
@@ -1370,10 +2103,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
 
         let firstEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
         let secondEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
-        let recoveryEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
         let firstFileIDs = EngineFileIDs()
         let secondFileIDs = EngineFileIDs()
-        let recoveryFileIDs = EngineFileIDs()
         let catalog = WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
             let root: URL
             let fileIDs: EngineFileIDs
@@ -1383,9 +2114,6 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             } else if epoch == secondEpoch {
                 root = secondRoot
                 fileIDs = secondFileIDs
-            } else if epoch == recoveryEpoch {
-                root = secondRoot
-                fileIDs = recoveryFileIDs
             } else {
                 return nil
             }
@@ -1422,25 +2150,56 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             )
         )
         addTeardownBlock { await engine.shutdown() }
+        func demand(
+            epoch: WorkspaceCodemapRootEpoch,
+            root: URL,
+            fileIDs: EngineFileIDs,
+            path: String
+        ) -> WorkspaceCodemapBindingDemand {
+            let identity = WorkspaceCodemapArtifactBindingIdentity(
+                rootID: epoch.rootID,
+                rootLifetimeID: epoch.rootLifetimeID,
+                fileID: fileIDs.id(for: path),
+                standardizedRootPath: root.path,
+                standardizedRelativePath: path,
+                standardizedFullPath: root.appendingPathComponent(path).path
+            )!
+            return WorkspaceCodemapBindingDemand(
+                owner: .init(),
+                identity: identity,
+                requestGeneration: 1,
+                catalogGeneration: 1,
+                pathGeneration: 1,
+                ingressGeneration: 1,
+                priority: .demand,
+                language: .swift
+            )
+        }
         let firstRegistration = WorkspaceCodemapBindingRootRegistration(
             rootID: firstEpoch.rootID,
             rootLifetimeID: firstEpoch.rootLifetimeID,
             loadedRootURL: firstRoot,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         )
         let secondRegistration = WorkspaceCodemapBindingRootRegistration(
             rootID: secondEpoch.rootID,
             rootLifetimeID: secondEpoch.rootLifetimeID,
             loadedRootURL: secondRoot,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         )
 
-        guard case .registered(adoptedReadyCount: 1) = await engine.registerRoot(firstRegistration) else {
-            return XCTFail("Expected first retained adoption.")
+        guard case .registered(adoptedReadyCount: 0) = await engine.registerRoot(firstRegistration) else {
+            return XCTFail("Expected lazy first registration.")
+        }
+        guard await isReady(engine.demand(demand(
+            epoch: firstEpoch,
+            root: firstRoot,
+            fileIDs: firstFileIDs,
+            path: "Sources/A.swift"
+        ))) else {
+            return XCTFail("Expected first retained adoption on demand.")
         }
         let firstAccounting = await engine.accounting()
         XCTAssertEqual(firstAccounting.manifestAdoptionLeaseCount, 1)
@@ -1449,6 +2208,12 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         guard case .registered(adoptedReadyCount: 0) = await engine.registerRoot(secondRegistration) else {
             return XCTFail("Expected second root to respect the retained global lease bound.")
         }
+        _ = await engine.demand(demand(
+            epoch: secondEpoch,
+            root: secondRoot,
+            fileIDs: secondFileIDs,
+            path: "Sources/Missing.swift"
+        ))
         let boundedAccounting = await engine.accounting()
         XCTAssertEqual(boundedAccounting.manifestAdoptionLeaseCount, 1)
         XCTAssertEqual(
@@ -1457,23 +2222,21 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
 
         await engine.unloadRoot(rootEpoch: firstEpoch)
-        await engine.unloadRoot(rootEpoch: secondEpoch)
         let releasedAccounting = await engine.accounting()
         XCTAssertEqual(releasedAccounting.manifestAdoptionLeaseCount, 0)
         XCTAssertEqual(releasedAccounting.manifestAdoptionLeaseByteCount, 0)
 
-        let recoveryRegistration = WorkspaceCodemapBindingRootRegistration(
-            rootID: recoveryEpoch.rootID,
-            rootLifetimeID: recoveryEpoch.rootLifetimeID,
-            loadedRootURL: secondRoot,
-            catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
-        )
-        let recovered = await engine.registerRoot(recoveryRegistration)
-        guard case .registered(adoptedReadyCount: 1) = recovered else {
-            return XCTFail("Expected lease-budget recovery after unload, got \(recovered).")
+        guard await isReady(engine.demand(demand(
+            epoch: secondEpoch,
+            root: secondRoot,
+            fileIDs: secondFileIDs,
+            path: "Sources/B.swift"
+        ))) else {
+            return XCTFail("Expected same-session adoption retry after lease pressure cleared.")
         }
+        let recoveredAccounting = await engine.accounting()
+        XCTAssertEqual(recoveredAccounting.manifestAdoptionLeaseCount, 1)
+        XCTAssertEqual(recoveredAccounting.counters.manifestAdoptions, 2)
     }
 
     func testUnloadDuringBlockedManifestRegistrationFailsAndReleasesRootAndLeaseState() async throws {
@@ -1499,20 +2262,42 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             )
         )
         let fixture = try await makeEngineFixture(root: root, runtime: runtime)
-        let registration = Task { await fixture.engine.registerRoot(fixture.registration) }
-        await loadGate.waitUntilEntered()
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected lazy registration.")
+        }
+        let demand = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Unload.swift"))
+        }
+        _ = await loadGate.waitUntilEntered()
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
-        await loadGate.release()
 
-        guard case .failed = await registration.value else {
-            return XCTFail("Expected unloaded registration to fail.")
+        guard case .cancelled = await demand.value else {
+            return XCTFail("Expected unload to cancel blocked manifest adoption demand.")
+        }
+        while await fixture.engine.accounting().activeRequestCount != 0 {
+            await Task.yield()
         }
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.rootCount, 0)
+        XCTAssertEqual(accounting.activeRequestCount, 0)
+        XCTAssertEqual(accounting.queuedRequestCount, 0)
+        XCTAssertEqual(accounting.ownerCount, 0)
+        XCTAssertEqual(accounting.reservedSourceByteCount, 0)
         XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
         XCTAssertEqual(accounting.manifestAdoptionLeaseByteCount, 0)
+        XCTAssertEqual(accounting.rootAdmissionHistoryCount, 0)
+        XCTAssertEqual(accounting.ownerAdmissionHistoryCount, 0)
         let snapshot = await fixture.engine.snapshot(rootEpoch: fixture.rootEpoch)
         XCTAssertNil(snapshot)
+
+        let shutdownFinished = EngineCompletionFlag()
+        let shutdown = Task {
+            await fixture.engine.shutdown()
+            shutdownFinished.finish()
+        }
+        XCTAssertFalse(shutdownFinished.waitUntilFinished(timeout: 0.1))
+        await loadGate.release()
+        await shutdown.value
     }
 
     func testPostCommitManifestAdoptionAuthorityRaceRollsBackOverlaySessionAndLease() async throws {
@@ -1536,8 +2321,13 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         )
         let runtime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
         let fixture = try await makeEngineFixture(root: root, runtime: runtime, overlay: overlay)
-        let registration = Task { await fixture.engine.registerRoot(fixture.registration) }
-        await adoptionGate.waitUntilEntered()
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected lazy registration.")
+        }
+        let demand = Task {
+            await fixture.engine.demand(fixture.demand(path: "Sources/Race.swift"))
+        }
+        _ = await adoptionGate.waitUntilEntered()
 
         let invalidation = Task {
             await fixture.engine.invalidateRepositoryAuthority(rootEpoch: fixture.rootEpoch)
@@ -1548,8 +2338,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         await adoptionGate.release()
 
         _ = await invalidation.value
-        guard case .failed = await registration.value else {
-            return XCTFail("Expected stale registration to fail after adoption rollback.")
+        guard case .cancelled = await demand.value else {
+            return XCTFail("Expected stale demand to cancel after adoption rollback.")
         }
         let snapshotValue = await fixture.engine.snapshot(rootEpoch: fixture.rootEpoch)
         let snapshot = try XCTUnwrap(snapshotValue)
@@ -1690,7 +2480,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             let merge = try repository.runGitResult(["merge", "other"], at: root)
             XCTAssertNotEqual(merge.terminationStatus, 0)
         case .checkoutTransform:
-            try repository.write("*.swift text eol=crlf\n", to: ".gitattributes", at: root)
+            try repository.write("\(path) text eol=crlf\n", to: ".gitattributes", at: root)
         }
     }
 
@@ -1817,8 +2607,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             rootLifetimeID: lifetimeID,
             loadedRootURL: root,
             catalogGeneration: 1,
-            ingressGeneration: 1,
-            language: .swift
+            ingressGeneration: 1
         )
         let engine = WorkspaceCodemapBindingEngine(
             runtime: runtime,
@@ -1880,6 +2669,67 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         }
         return capability
     }
+
+    private func isReady(_ result: WorkspaceCodemapBindingDemandResult) -> Bool {
+        switch result {
+        case .ready, .alreadyReady:
+            true
+        default:
+            false
+        }
+    }
+
+    private func demandResult(
+        _ task: Task<WorkspaceCodemapBindingDemandResult, Never>,
+        before timeout: Duration
+    ) async -> WorkspaceCodemapBindingDemandResult? {
+        await EngineDemandResultTimeoutRace().wait(for: task, timeout: timeout)
+    }
+
+    private func waitForEngineCondition(
+        timeout: Duration = .seconds(5),
+        _ condition: () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
+}
+
+private final class EngineDemandResultTimeoutRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<WorkspaceCodemapBindingDemandResult?, Never>?
+    private var resolved = false
+
+    func wait(
+        for task: Task<WorkspaceCodemapBindingDemandResult, Never>,
+        timeout: Duration
+    ) async -> WorkspaceCodemapBindingDemandResult? {
+        await withCheckedContinuation { continuation in
+            lock.withLock { self.continuation = continuation }
+            Task { [self] in
+                await finish(task.value)
+            }
+            Task { [self] in
+                try? await Task.sleep(for: timeout)
+                finish(nil)
+            }
+        }
+    }
+
+    private func finish(_ result: WorkspaceCodemapBindingDemandResult?) {
+        let continuation = lock.withLock { () -> CheckedContinuation<WorkspaceCodemapBindingDemandResult?, Never>? in
+            guard !resolved else { return nil }
+            resolved = true
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: result)
+    }
 }
 
 private struct EngineFixture {
@@ -1893,7 +2743,8 @@ private struct EngineFixture {
     func demand(
         path: String,
         owner: WorkspaceCodemapLiveDemandOwner = WorkspaceCodemapLiveDemandOwner(),
-        priority: CodeMapArtifactBuildPriority = .demand
+        priority: CodeMapArtifactBuildPriority = .demand,
+        language: LanguageType = .swift
     ) -> WorkspaceCodemapBindingDemand {
         let identity = WorkspaceCodemapArtifactBindingIdentity(
             rootID: rootEpoch.rootID,
@@ -1911,7 +2762,7 @@ private struct EngineFixture {
             pathGeneration: 1,
             ingressGeneration: 1,
             priority: priority,
-            language: .swift
+            language: language
         )
     }
 }
@@ -1962,6 +2813,19 @@ private final class EngineLockedCounter: @unchecked Sendable {
     }
 }
 
+private final class EngineLockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.withLock { storage }
+    }
+
+    func set(_ value: Bool) {
+        lock.withLock { storage = value }
+    }
+}
+
 private actor EngineBuildGate {
     private var entered = false
     private var released = false
@@ -1973,10 +2837,13 @@ private actor EngineBuildGate {
         await withCheckedContinuation { continuation = $0 }
     }
 
-    func waitUntilEntered() async {
-        while !entered {
-            await Task.yield()
+    func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !entered, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return entered
     }
 
     func release() {
@@ -1990,6 +2857,7 @@ private actor EngineOneShotFileMutation {
     private let url: URL
     private let contents: String
     private var didMutate = false
+    private(set) var invocationCount = 0
 
     init(url: URL, contents: String) {
         self.url = url
@@ -1997,6 +2865,7 @@ private actor EngineOneShotFileMutation {
     }
 
     func mutateOnce() {
+        invocationCount += 1
         guard !didMutate else { return }
         didMutate = true
         try? contents.write(to: url, atomically: true, encoding: .utf8)
@@ -2006,7 +2875,7 @@ private actor EngineOneShotFileMutation {
 private actor EngineSecondCatalogResolutionMutation {
     private let url: URL
     private let contents: String
-    private var resolutionCount = 0
+    private(set) var resolutionCount = 0
 
     init(url: URL, contents: String) {
         self.url = url
@@ -2078,10 +2947,16 @@ private actor EngineMultiEntryGate {
         await withCheckedContinuation { continuations.append($0) }
     }
 
-    func waitUntilEntered(_ expectedCount: Int) async {
-        while enteredCount < expectedCount {
-            await Task.yield()
+    func waitUntilEntered(
+        _ expectedCount: Int,
+        timeout: Duration = .seconds(10)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while enteredCount < expectedCount, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return enteredCount >= expectedCount
     }
 
     func releaseAll() {
@@ -2095,7 +2970,7 @@ private actor EngineMultiEntryGate {
 }
 
 private actor EngineFirstResolutionGate {
-    private var resolutionCount = 0
+    private(set) var resolutionCount = 0
     private var firstResolutionEntered = false
     private var firstResolutionReleased = false
     private var continuation: CheckedContinuation<Void, Never>?
@@ -2108,10 +2983,13 @@ private actor EngineFirstResolutionGate {
         await withCheckedContinuation { continuation = $0 }
     }
 
-    func waitUntilFirstResolution() async {
-        while !firstResolutionEntered {
-            await Task.yield()
+    func waitUntilFirstResolution(timeout: Duration = .seconds(10)) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !firstResolutionEntered, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return firstResolutionEntered
     }
 
     func releaseFirstResolution() {
