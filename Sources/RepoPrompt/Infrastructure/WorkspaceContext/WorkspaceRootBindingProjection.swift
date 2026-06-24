@@ -378,15 +378,35 @@ struct WorkspaceRootBindingProjectionMaterializer {
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         var initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
+        #if DEBUG
+            var receiptProjectionDecision = WorktreeStartupInstrumentation.ReceiptProjectionDecision()
+            receiptProjectionDecision.suppliedHintCount = initializationHintsByBindingID.count
+            receiptProjectionDecision.allHintKeysMatchedBindings = Set(initializationHintsByBindingID.keys)
+                .isSubset(of: Set(bindings.map(\.id)))
+        #endif
         for binding in bindings {
             guard let hint = initializationHintsByBindingID[binding.id] else { continue }
             let physicalPath = StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
-            initializationHintsByPhysicalRootPath[physicalPath] = hint.validated(
+            let validatedHint = hint.validated(
                 matching: binding,
                 sessionID: sessionID,
                 startupContext: startupContext
             )
+            initializationHintsByPhysicalRootPath[physicalPath] = validatedHint
+            #if DEBUG
+                receiptProjectionDecision.matchedHintCount += 1
+                receiptProjectionDecision.validationFallback = receiptProjectionDecision.validationFallback
+                    ?? validatedHint.validationFallbackReason
+            #endif
         }
+        #if DEBUG
+            if let startupContext {
+                WorktreeStartupInstrumentation.recordReceiptProjectionDecision(
+                    correlationID: startupContext.correlationID,
+                    decision: receiptProjectionDecision
+                )
+            }
+        #endif
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
@@ -406,7 +426,15 @@ struct WorkspaceRootBindingProjectionMaterializer {
     func commit(
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
-        let records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        let records: [WorkspaceSessionWorktreeOwnedRoot]
+        do {
+            records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        } catch {
+            #if DEBUG
+                await store.terminalizeReceiptConsumptionDecision(preparation.ownership)
+            #endif
+            throw error
+        }
         if let startupContext = preparation.startupContext {
             WorktreeStartupInstrumentation.record(.rootReady, context: startupContext)
         }

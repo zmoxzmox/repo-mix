@@ -8,7 +8,7 @@ struct AgentMCPStartWorktreeCoordinator {
         _ bindings: [AgentSessionWorktreeBinding],
         _ startupContext: WorktreeStartupContext?,
         _ initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
-    ) -> Void
+    ) throws -> Void
 
     struct Request {
         enum Mode: Equatable {
@@ -160,6 +160,12 @@ struct AgentMCPStartWorktreeCoordinator {
         }
         try Task.checkCancellation()
         if request.hasExplicitWorktreeArgs {
+            #if DEBUG
+                var receiptCoordinatorDecision = startupContext.map { _ in
+                    WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+                }
+                var createdReceiptAttemptCorrelationID: UUID?
+            #endif
             do {
                 let context = try await resolveRepositoryContext(
                     request: request,
@@ -168,6 +174,7 @@ struct AgentMCPStartWorktreeCoordinator {
                 try validateRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
                 let worktree: GitWorktreeDescriptor
                 let initializationReceipt: GitWorktreeCreationReceipt?
+                let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
                 let expectedOwnerBindingGeneration = await targetWindow.promptManager
                     .workspaceFileContextStore
                     .nextSessionWorktreeOwnershipGeneration(ownerID: targetSessionID)
@@ -182,6 +189,7 @@ struct AgentMCPStartWorktreeCoordinator {
                             allRepos: context.allRepos
                         )
                         initializationReceipt = nil
+                        initializationFallbackReason = nil
                     } catch let error as GitRepoTargetResolverError {
                         throw MCPError.invalidParams(error.message)
                     }
@@ -195,6 +203,16 @@ struct AgentMCPStartWorktreeCoordinator {
                     )
                     worktree = result.descriptor
                     initializationReceipt = result.initializationReceipt
+                    initializationFallbackReason = result.initializationFallbackReason
+                    #if DEBUG
+                        if let startupContext {
+                            var decision = WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+                            decision.createResultReceiptCount = result.initializationReceipt == nil ? 0 : 1
+                            decision.creationFallbackObserved = result.initializationFallbackReason
+                            receiptCoordinatorDecision = decision
+                            createdReceiptAttemptCorrelationID = startupContext.correlationID
+                        }
+                    #endif
                 }
                 try Task.checkCancellation()
                 let identity = try persistVisualIdentity(for: worktree, request: request)
@@ -228,7 +246,24 @@ struct AgentMCPStartWorktreeCoordinator {
                 } else {
                     [:]
                 }
-                transitionObserver?(
+                #if DEBUG
+                    if let startupContext, var decision = receiptCoordinatorDecision {
+                        decision.hintCount = initializationHintsByBindingID.count
+                        decision.bindingCount = desiredBindings.count
+                        if initializationHintsByBindingID[binding.id] != nil {
+                            decision.hintKeyedByCreatedBinding = .match
+                        } else if initializationReceipt != nil {
+                            decision.hintKeyedByCreatedBinding = .mismatch
+                        }
+                        decision.creationFallbackObserved = initializationFallbackReason
+                        receiptCoordinatorDecision = decision
+                        WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                            correlationID: startupContext.correlationID,
+                            decision: decision
+                        )
+                    }
+                #endif
+                try transitionObserver?(
                     targetSessionID,
                     desiredBindings,
                     startupContext,
@@ -257,6 +292,17 @@ struct AgentMCPStartWorktreeCoordinator {
                     )
                 #endif
             } catch {
+                #if DEBUG
+                    if let correlationID = createdReceiptAttemptCorrelationID,
+                       let receiptCoordinatorDecision
+                    {
+                        WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                            correlationID: correlationID,
+                            decision: receiptCoordinatorDecision,
+                            terminal: true
+                        )
+                    }
+                #endif
                 throw preparationError(error)
             }
         }

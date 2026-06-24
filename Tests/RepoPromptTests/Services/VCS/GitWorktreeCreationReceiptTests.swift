@@ -1229,6 +1229,308 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         )
     }
 
+    #if DEBUG
+        func testQueuedMutationLockCancellationRecordsOneTerminalDecisionWithoutReceipt() async throws {
+            let fixture = try ReceiptFixture()
+            defer { fixture.cleanup() }
+            let authority = GitWorkspaceStateAuthority()
+            let git = GitService(workspaceStateAuthority: authority)
+            let gate = ReceiptMutationLockGate()
+            let holderCorrelationID = UUID()
+            let cancelledCorrelationID = UUID()
+            let holderRequest = fixture.createRequest()
+            let cancelledRequest = fixture.createRequest()
+            await git.setWorktreeMutationLockAcquiredHandlerForTesting { correlationID in
+                guard correlationID == holderCorrelationID else { return }
+                await gate.enterAndWaitForRelease()
+            }
+            defer {
+                Task {
+                    await gate.release()
+                    await git.setWorktreeMutationLockAcquiredHandlerForTesting(nil)
+                }
+            }
+            WorktreeStartupInstrumentation.resetForTesting()
+
+            let holder = Task {
+                try await git.createWorktreeWithResult(
+                    request: holderRequest,
+                    at: fixture.root,
+                    initializationContext: fixture.initializationContext(correlationID: holderCorrelationID)
+                )
+            }
+            await gate.waitUntilEntered()
+            let cancelled = Task {
+                try await git.createWorktreeWithResult(
+                    request: cancelledRequest,
+                    at: fixture.root,
+                    initializationContext: fixture.initializationContext(correlationID: cancelledCorrelationID)
+                )
+            }
+            await git.waitForWorktreeMutationWaiterForTesting(at: fixture.root)
+            cancelled.cancel()
+
+            do {
+                _ = try await cancelled.value
+                XCTFail("Queued worktree creation must remain cancelled before mutation.")
+            } catch {
+                XCTAssertTrue(error is CancellationError, "Expected CancellationError, got \(error)")
+            }
+
+            let records = WorktreeStartupInstrumentation.receiptDecisions(
+                correlationID: cancelledCorrelationID
+            )
+            XCTAssertEqual(records.count, 1)
+            let aggregate = try XCTUnwrap(records.first)
+            let decision = try XCTUnwrap(aggregate.creation)
+            XCTAssertEqual(aggregate.creationAttemptCount, 1)
+            XCTAssertEqual(aggregate.terminalStage, .creation)
+            XCTAssertFalse(aggregate.ambiguousOrDuplicate)
+            XCTAssertEqual(decision.outcome, .cancelled)
+            XCTAssertFalse(decision.receiptEmitted)
+            XCTAssertNil(decision.receiptFallbackReason)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: cancelledRequest.path.path))
+            assertReceiptDecisionIsPathFree(aggregate, fixture: fixture)
+
+            await gate.release()
+            _ = try await holder.value
+            await git.setWorktreeMutationLockAcquiredHandlerForTesting(nil)
+        }
+
+        func testReceiptDecisionClassifiesNaturalRecoveryWithoutCompatibleSnapshot() async throws {
+            let fixture = try ReceiptFixture()
+            defer { fixture.cleanup() }
+            let correlationID = UUID()
+            let authority = GitWorkspaceStateAuthority()
+            let git = GitService(workspaceStateAuthority: authority)
+            WorktreeStartupInstrumentation.resetForTesting()
+
+            let result = try await git.createWorktreeWithResult(
+                request: fixture.createRequest(),
+                at: fixture.root,
+                initializationContext: fixture.initializationContext(correlationID: correlationID)
+            )
+
+            XCTAssertNil(result.initializationReceipt)
+            XCTAssertEqual(result.initializationFallbackReason, .authorityUnstable)
+            let records = WorktreeStartupInstrumentation.receiptDecisions(correlationID: correlationID)
+            XCTAssertEqual(records.count, 1)
+            let aggregate = try XCTUnwrap(records.first)
+            let decision = try XCTUnwrap(aggregate.creation)
+            XCTAssertEqual(aggregate.creationAttemptCount, 1)
+            XCTAssertFalse(aggregate.ambiguousOrDuplicate)
+            XCTAssertEqual(decision.currentLeasePresent, false)
+            XCTAssertEqual(decision.parentLookupRoute, .failed)
+            XCTAssertEqual(decision.parentLookupFailure, .compatibleSnapshotMissing)
+            XCTAssertEqual(decision.targetTreeResolution, .notAttempted)
+            XCTAssertEqual(decision.outcome, .receiptAbsent)
+            assertReceiptDecisionIsPathFree(aggregate, fixture: fixture)
+        }
+
+        func testReceiptCreationFailurePointsAreCorrelationScopedOneShotAndFailClosed() async throws {
+            let fixture = try ReceiptFixture()
+            defer { fixture.cleanup() }
+            let authority = GitWorkspaceStateAuthority()
+            let git = GitService(workspaceStateAuthority: authority)
+            let coordinator = WorkspaceRootReusableSnapshotCoordinator(gitService: git, authority: authority)
+            guard case .admitted = await coordinator.observeAuthoritativeFullLoad(
+                rootURL: fixture.root,
+                authoritativeRelativeFilePaths: fixture.authoritativeRelativeFilePaths
+            ) else { return XCTFail("Expected reusable parent snapshot") }
+
+            struct GateCase {
+                let point: GitService.ReceiptCreationFailurePointForTesting
+                let expectedReceipt: Bool
+                let expectedFallback: WorkspaceRootSeedFallbackReason?
+                let expectedReceiptFallback: WorkspaceRootSeedFallbackReason?
+            }
+            let cases: [GateCase] = [
+                .init(
+                    point: .targetTreeUnavailable,
+                    expectedReceipt: false,
+                    expectedFallback: .authorityUnstable,
+                    expectedReceiptFallback: nil
+                ),
+                .init(
+                    point: .witnessCoverageInvalid,
+                    expectedReceipt: true,
+                    expectedFallback: nil,
+                    expectedReceiptFallback: .witnessGap
+                ),
+                .init(
+                    point: .includeCopyIncomplete,
+                    expectedReceipt: true,
+                    expectedFallback: .includeCopyFailure,
+                    expectedReceiptFallback: .includeCopyFailure
+                ),
+                .init(
+                    point: .targetLayoutUnavailable,
+                    expectedReceipt: false,
+                    expectedFallback: .authorityUnstable,
+                    expectedReceiptFallback: nil
+                ),
+                .init(
+                    point: .targetAuthorityUnavailable,
+                    expectedReceipt: false,
+                    expectedFallback: .authorityUnstable,
+                    expectedReceiptFallback: nil
+                )
+            ]
+
+            for testCase in cases {
+                WorktreeStartupInstrumentation.resetForTesting()
+                let armedCorrelationID = UUID()
+                let unrelatedCorrelationID = UUID()
+                await git.setReceiptCreationFailureForTesting(
+                    correlationID: armedCorrelationID,
+                    point: testCase.point
+                )
+
+                let unrelated = try await git.createWorktreeWithResult(
+                    request: fixture.createRequest(),
+                    at: fixture.root,
+                    initializationContext: fixture.initializationContext(correlationID: unrelatedCorrelationID)
+                )
+                XCTAssertNotNil(unrelated.initializationReceipt, "\(testCase.point)")
+
+                let result = try await git.createWorktreeWithResult(
+                    request: fixture.createRequest(),
+                    at: fixture.root,
+                    initializationContext: fixture.initializationContext(correlationID: armedCorrelationID)
+                )
+                XCTAssertEqual(result.initializationReceipt != nil, testCase.expectedReceipt, "\(testCase.point)")
+                XCTAssertEqual(result.initializationFallbackReason, testCase.expectedFallback, "\(testCase.point)")
+
+                let records = WorktreeStartupInstrumentation.receiptDecisions(
+                    correlationID: armedCorrelationID
+                )
+                XCTAssertEqual(records.count, 1, "\(testCase.point)")
+                let aggregate = try XCTUnwrap(records.first)
+                let decision = try XCTUnwrap(aggregate.creation)
+                XCTAssertEqual(aggregate.creationAttemptCount, 1, "\(testCase.point)")
+                XCTAssertFalse(aggregate.ambiguousOrDuplicate, "\(testCase.point)")
+                XCTAssertEqual(decision.receiptFallbackReason, testCase.expectedReceiptFallback, "\(testCase.point)")
+                XCTAssertEqual(
+                    decision.outcome,
+                    testCase.expectedReceipt ? .receiptEmitted : .receiptAbsent,
+                    "\(testCase.point)"
+                )
+                assertReceiptDecisionIsPathFree(aggregate, fixture: fixture)
+
+                if let receipt = result.initializationReceipt {
+                    let binding = fixture.binding(for: result.descriptor)
+                    let hint = WorkspaceRootMaterializationHint(
+                        bindingID: binding.id,
+                        standardizedTargetPath: binding.worktreeRootPath,
+                        creationReceipt: receipt,
+                        correlationID: armedCorrelationID
+                    ).validated(
+                        matching: binding,
+                        sessionID: fixture.agentSessionID,
+                        startupContext: fixture.startupContext(correlationID: armedCorrelationID)
+                    )
+                    let evaluator = WorkspaceRootMaterializationHintEvaluator(
+                        gitService: git,
+                        authority: authority
+                    )
+                    let observation = await evaluator.observe(hint, observationEnabled: true)
+                    let expectedReceiptFallback = try XCTUnwrap(testCase.expectedReceiptFallback)
+                    XCTAssertEqual(
+                        observation,
+                        .fallback(expectedReceiptFallback),
+                        "\(testCase.point)"
+                    )
+                }
+            }
+        }
+
+        func testLinkedBaseReceiptDecisionMatchesAdmittedSnapshotAndRepositoryScope() async throws {
+            let fixture = try ReceiptFixture()
+            defer { fixture.cleanup() }
+            let linkedBase = fixture.sandbox.appendingPathComponent("linked-base", isDirectory: true)
+            try fixture.git([
+                "worktree", "add", "-b", "linked-base-\(UUID().uuidString)", linkedBase.path, "HEAD"
+            ])
+            let sourceLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: linkedBase))
+            XCTAssertTrue(sourceLayout.isLinkedWorktree)
+
+            let authority = GitWorkspaceStateAuthority()
+            let git = GitService(workspaceStateAuthority: authority)
+            let coordinator = WorkspaceRootReusableSnapshotCoordinator(gitService: git, authority: authority)
+            let admission = await coordinator.observeAuthoritativeFullLoad(
+                rootURL: linkedBase,
+                authoritativeRelativeFilePaths: fixture.authoritativeRelativeFilePaths
+            )
+            guard case let .admitted(snapshotIdentity) = admission else {
+                return XCTFail("Expected reusable linked-base snapshot, got \(admission)")
+            }
+
+            let correlationID = UUID()
+            let target = fixture.worktrees.appendingPathComponent("linked-child-\(UUID().uuidString)")
+            let request = GitWorktreeCreateRequest(
+                path: target,
+                branch: "linked-child-\(UUID().uuidString)",
+                baseRef: "HEAD",
+                appManagedContainer: fixture.worktrees,
+                mainWorktreeRoot: fixture.root,
+                knownWorktreeRoots: [fixture.root, linkedBase],
+                copyWorktreeIncludeFiles: true
+            )
+            let context = try GitWorktreeInitializationContext(
+                agentSessionID: fixture.agentSessionID,
+                correlationID: correlationID,
+                logicalRootPath: linkedBase.path,
+                expectedOwnerBindingGeneration: fixture.expectedOwnerBindingGeneration,
+                repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""),
+                observeReceipt: true
+            )
+            WorktreeStartupInstrumentation.resetForTesting()
+
+            let result = try await git.createWorktreeWithResult(
+                request: request,
+                at: linkedBase,
+                initializationContext: context
+            )
+            let receipt = try XCTUnwrap(result.initializationReceipt)
+            let targetLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(
+                atWorkTreeRoot: URL(fileURLWithPath: result.descriptor.path)
+            ))
+            XCTAssertEqual(receipt.parentSnapshotIdentity, snapshotIdentity)
+            XCTAssertEqual(sourceLayout.commonDir.standardizedFileURL.path, targetLayout.commonDir.standardizedFileURL.path)
+            XCTAssertNotEqual(sourceLayout.gitDir.standardizedFileURL.path, targetLayout.gitDir.standardizedFileURL.path)
+
+            let records = WorktreeStartupInstrumentation.receiptDecisions(correlationID: correlationID)
+            XCTAssertEqual(records.count, 1)
+            let aggregate = try XCTUnwrap(records.first)
+            let decision = try XCTUnwrap(aggregate.creation)
+            XCTAssertEqual(decision.sourceLayoutState, .linkedWorktree)
+            XCTAssertEqual(decision.currentSnapshotSHA256, snapshotIdentity.sha256)
+            XCTAssertEqual(decision.parentLookupRoute, .currentAlias)
+            XCTAssertEqual(decision.parentAuthorityKeyMatch, .match)
+            XCTAssertEqual(decision.parentPrefixMatch, .match)
+            XCTAssertEqual(decision.commonDirectoryMatch, .match)
+            XCTAssertEqual(decision.repositoryIDMatch, .match)
+            XCTAssertEqual(decision.repositoryNamespaceMatch, .match)
+            XCTAssertEqual(decision.targetPrefixMatch, .match)
+            XCTAssertEqual(decision.targetTreeAuthorityMatch, .match)
+            XCTAssertEqual(decision.outcome, .receiptEmitted)
+            XCTAssertNil(decision.receiptFallbackReason)
+            assertReceiptDecisionIsPathFree(aggregate, fixture: fixture)
+        }
+
+        private func assertReceiptDecisionIsPathFree(
+            _ decision: WorktreeStartupInstrumentation.ReceiptDecision,
+            fixture: ReceiptFixture,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            let diagnosticText = String(reflecting: decision)
+            XCTAssertFalse(diagnosticText.contains(fixture.sandbox.path), file: file, line: line)
+            XCTAssertFalse(diagnosticText.contains(fixture.root.path), file: file, line: line)
+            XCTAssertFalse(diagnosticText.contains(fixture.worktrees.path), file: file, line: line)
+        }
+    #endif
+
     func testNonGitObservationDoesNotInvokeGit() async throws {
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent("NonGitRootSeedIsolation-\(UUID().uuidString)", isDirectory: true)
@@ -1294,6 +1596,44 @@ private actor MutationTokenBox {
         return token
     }
 }
+
+#if DEBUG
+    private actor ReceiptMutationLockGate {
+        private var entered = false
+        private var released = false
+        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func enterAndWaitForRelease() async {
+            entered = true
+            let waiters = enteredWaiters
+            enteredWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilEntered() async {
+            guard !entered else { return }
+            await withCheckedContinuation { continuation in
+                enteredWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+    }
+#endif
 
 private struct ReceiptFixture {
     let sandbox: URL

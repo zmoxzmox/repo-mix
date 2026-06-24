@@ -1,4 +1,7 @@
 import Foundation
+#if DEBUG
+    import CryptoKit
+#endif
 
 enum WorktreeStartupServingControl: Equatable {
     case automatic
@@ -130,6 +133,172 @@ enum GitProcessCommandFamily: String, Equatable {
 
 enum WorktreeStartupInstrumentation {
     #if DEBUG
+        enum ReceiptSourceLayoutState: String, Equatable {
+            case missing
+            case mainCheckout
+            case linkedWorktree
+        }
+
+        enum ReceiptDestinationEligibility: String, Equatable {
+            case eligible
+            case notAppManaged
+            case includeCopyDisabled
+        }
+
+        enum ReceiptParentLookupRoute: String, Equatable {
+            case notAttempted
+            case currentAlias
+            case recovered
+            case failed
+        }
+
+        enum ReceiptParentLookupFailure: String, Equatable {
+            case none
+            case currentLeaseUnavailable
+            case currentSnapshotUnavailable
+            case recoveryObservationUnavailable
+            case recoveryCollectionUnavailable
+            case externalAuthorityChanged
+            case recoveryObservationStale
+            case recoveryInstallFailed
+            case compatibleSnapshotMissing
+            case recoveryAdmissionFailed
+            case unexpected
+        }
+
+        enum ReceiptGateState: String, Equatable {
+            case notAttempted
+            case succeeded
+            case failed
+        }
+
+        enum ReceiptMatchState: String, Equatable {
+            case notEvaluated
+            case match
+            case mismatch
+        }
+
+        enum ReceiptCreationOutcome: String, Equatable {
+            case receiptEmitted
+            case receiptAbsent
+            case failed
+            case cancelled
+        }
+
+        enum ReceiptFinalObservation: Equatable {
+            case eligible
+            case disabled
+            case fallback(WorkspaceRootSeedFallbackReason)
+        }
+
+        enum ReceiptTerminalStage: String, Equatable {
+            case creation
+            case coordinator
+            case projection
+            case consumption
+        }
+
+        enum ReceiptDecisionDigestDomain: String {
+            case authorityKey = "authority-key"
+            case commonDirectory = "common-directory"
+            case repositoryID = "repository-id"
+            case repositoryNamespace = "repository-namespace"
+            case requestedPrefix = "requested-prefix"
+            case snapshot
+        }
+
+        struct ReceiptCreationDecision: Equatable {
+            var sourceLayoutState: ReceiptSourceLayoutState = .missing
+            var destinationEligibility: ReceiptDestinationEligibility = .notAppManaged
+            var sourceAuthorityKeyDigest: String?
+            var sourceCommonDirectoryDigest: String?
+            var repositoryIDDigest: String?
+            var repositoryNamespaceDigest: String?
+            var requestedPrefixDigest: String?
+            var currentLeasePresent: Bool?
+            var currentLeaseCurrentAtSnapshotLookup: Bool?
+            var currentSnapshotPresent: Bool?
+            var currentSnapshotContentAddressValid: Bool?
+            var currentSnapshotSHA256: String?
+            var parentLookupRoute: ReceiptParentLookupRoute = .notAttempted
+            var parentLookupFailure: ReceiptParentLookupFailure = .none
+            var parentAuthorityKeyMatch: ReceiptMatchState = .notEvaluated
+            var parentPrefixMatch: ReceiptMatchState = .notEvaluated
+            var targetTreeResolution: ReceiptGateState = .notAttempted
+            var witnessRequested: Bool?
+            var witnessStarted: Bool?
+            var witnessFinished: Bool?
+            var witnessStartEventIDValid: Bool?
+            var witnessEndEventIDValid: Bool?
+            var witnessGap: Bool?
+            var witnessDrop: Bool?
+            var witnessOverflow: Bool?
+            var witnessProvesInterval: Bool?
+            var includeCopyRequested: Bool?
+            var includeCopyResultPresent: Bool?
+            var includeCopyComplete: Bool?
+            var includeCopyHadFailures: Bool?
+            var targetLayoutPresent: Bool?
+            var targetLayoutLinked: Bool?
+            var targetAuthorityCapture: ReceiptGateState = .notAttempted
+            var commonDirectoryMatch: ReceiptMatchState = .notEvaluated
+            var repositoryIDMatch: ReceiptMatchState = .notEvaluated
+            var repositoryNamespaceMatch: ReceiptMatchState = .notEvaluated
+            var targetPrefixMatch: ReceiptMatchState = .notEvaluated
+            var targetTreeAuthorityMatch: ReceiptMatchState = .notEvaluated
+            var receiptEmitted: Bool = false
+            var receiptFallbackReason: WorkspaceRootSeedFallbackReason?
+            var initializationFallbackReason: WorkspaceRootSeedFallbackReason?
+            var outcome: ReceiptCreationOutcome = .receiptAbsent
+
+            init() {}
+        }
+
+        struct ReceiptCoordinatorDecision: Equatable {
+            var createResultReceiptCount = 0
+            var hintCount = 0
+            var bindingCount = 0
+            var hintKeyedByCreatedBinding: ReceiptMatchState = .notEvaluated
+            var creationFallbackObserved: WorkspaceRootSeedFallbackReason?
+
+            init() {}
+        }
+
+        struct ReceiptProjectionDecision: Equatable {
+            var suppliedHintCount = 0
+            var matchedHintCount = 0
+            var allHintKeysMatchedBindings: Bool?
+            var validationFallback: WorkspaceRootSeedFallbackReason?
+
+            init() {}
+        }
+
+        struct ReceiptConsumptionDecision: Equatable {
+            var ownerGenerationMatch: ReceiptMatchState = .notEvaluated
+            var hintSessionMatch: ReceiptMatchState = .notEvaluated
+            var hintCorrelationMatch: ReceiptMatchState = .notEvaluated
+            var hintOwnerMatch: ReceiptMatchState = .notEvaluated
+            var ownershipReused: Bool?
+            var initialHintObservation: ReceiptFinalObservation?
+            var pendingSeededPreparationResult: ReceiptFinalObservation?
+            var fullCrawlPerformed: Bool?
+            var finalObservation: ReceiptFinalObservation?
+            var selectedRoute: WorkspaceRootStartupRoute?
+
+            init() {}
+        }
+
+        struct ReceiptDecision: Equatable {
+            let correlationID: UUID
+            fileprivate(set) var creation: ReceiptCreationDecision?
+            fileprivate(set) var coordinator: ReceiptCoordinatorDecision?
+            fileprivate(set) var projection: ReceiptProjectionDecision?
+            fileprivate(set) var consumption: ReceiptConsumptionDecision?
+            fileprivate(set) var terminalStage: ReceiptTerminalStage?
+            fileprivate(set) var ambiguousOrDuplicate = false
+            fileprivate(set) var creationAttemptCount = 0
+        }
+
         struct BenchmarkMetricTag: Hashable {
             let correlationID: UUID
             let contextID: UUID
@@ -237,6 +406,8 @@ enum WorktreeStartupInstrumentation {
         #if DEBUG
             let eventEvictionCount: Int
             let gitCommandEvictionCount: Int
+            let receiptDecisions: [ReceiptDecision]
+            let receiptDecisionEvictionCount: Int
         #endif
     }
 
@@ -279,8 +450,11 @@ enum WorktreeStartupInstrumentation {
     private static var shadowCounters = ShadowCounters()
     private static var seedCounters = SeedCounters()
     #if DEBUG
+        private static let maximumReceiptDecisionCount = 128
         private static var eventEvictionCount = 0
         private static var gitCommandEvictionCount = 0
+        private static var storedReceiptDecisions: [ReceiptDecision] = []
+        private static var receiptDecisionEvictionCount = 0
         private static var benchmarkMetricsByTag: [BenchmarkMetricTag: BenchmarkMetricSnapshot] = [:]
     #endif
 
@@ -339,6 +513,121 @@ enum WorktreeStartupInstrumentation {
     }
 
     #if DEBUG
+        static func receiptDecisionDigest(
+            _ value: String,
+            domain: ReceiptDecisionDigestDomain
+        ) -> String {
+            let material = "rpce-receipt-decision-v1\0\(domain.rawValue)\0\(value)"
+            return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+
+        static func recordReceiptCreationDecision(
+            correlationID: UUID,
+            decision: ReceiptCreationDecision,
+            terminal: Bool = false
+        ) {
+            lock.lock()
+            let index = receiptDecisionIndexLocked(correlationID: correlationID)
+            storedReceiptDecisions[index].creationAttemptCount = incremented(
+                storedReceiptDecisions[index].creationAttemptCount
+            )
+            if let existing = storedReceiptDecisions[index].creation {
+                storedReceiptDecisions[index].ambiguousOrDuplicate = true
+                if existing != decision {
+                    storedReceiptDecisions[index].ambiguousOrDuplicate = true
+                }
+            } else {
+                storedReceiptDecisions[index].creation = decision
+            }
+            setReceiptTerminalLocked(index: index, stage: terminal ? .creation : nil)
+            lock.unlock()
+        }
+
+        static func recordReceiptCoordinatorDecision(
+            correlationID: UUID,
+            decision: ReceiptCoordinatorDecision,
+            terminal: Bool = false
+        ) {
+            lock.lock()
+            let index = receiptDecisionIndexLocked(correlationID: correlationID)
+            if let existing = storedReceiptDecisions[index].coordinator {
+                if existing != decision {
+                    storedReceiptDecisions[index].ambiguousOrDuplicate = true
+                }
+            } else {
+                storedReceiptDecisions[index].coordinator = decision
+            }
+            setReceiptTerminalLocked(index: index, stage: terminal ? .coordinator : nil)
+            lock.unlock()
+        }
+
+        static func recordReceiptProjectionDecision(
+            correlationID: UUID,
+            decision: ReceiptProjectionDecision,
+            terminal: Bool = false
+        ) {
+            lock.lock()
+            let index = receiptDecisionIndexLocked(correlationID: correlationID)
+            if let existing = storedReceiptDecisions[index].projection {
+                if existing != decision {
+                    storedReceiptDecisions[index].ambiguousOrDuplicate = true
+                }
+            } else {
+                storedReceiptDecisions[index].projection = decision
+            }
+            setReceiptTerminalLocked(index: index, stage: terminal ? .projection : nil)
+            lock.unlock()
+        }
+
+        static func recordReceiptConsumptionDecision(
+            correlationID: UUID,
+            decision: ReceiptConsumptionDecision,
+            terminal: Bool = true
+        ) {
+            lock.lock()
+            let index = receiptDecisionIndexLocked(correlationID: correlationID)
+            if let existing = storedReceiptDecisions[index].consumption {
+                if existing != decision {
+                    storedReceiptDecisions[index].ambiguousOrDuplicate = true
+                }
+            } else {
+                storedReceiptDecisions[index].consumption = decision
+            }
+            setReceiptTerminalLocked(index: index, stage: terminal ? .consumption : nil)
+            lock.unlock()
+        }
+
+        static func receiptDecisions(correlationID: UUID? = nil) -> [ReceiptDecision] {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let correlationID else { return storedReceiptDecisions }
+            return storedReceiptDecisions.filter { $0.correlationID == correlationID }
+        }
+
+        static func currentReceiptDecisionEvictionCount() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return receiptDecisionEvictionCount
+        }
+
+        private static func receiptDecisionIndexLocked(correlationID: UUID) -> Int {
+            if let index = storedReceiptDecisions.firstIndex(where: { $0.correlationID == correlationID }) {
+                return index
+            }
+            if storedReceiptDecisions.count == maximumReceiptDecisionCount {
+                let evictionIndex = storedReceiptDecisions.firstIndex(where: { $0.terminalStage != nil }) ?? 0
+                storedReceiptDecisions.remove(at: evictionIndex)
+                receiptDecisionEvictionCount = incremented(receiptDecisionEvictionCount)
+            }
+            storedReceiptDecisions.append(ReceiptDecision(correlationID: correlationID))
+            return storedReceiptDecisions.count - 1
+        }
+
+        private static func setReceiptTerminalLocked(index: Int, stage: ReceiptTerminalStage?) {
+            guard let stage, storedReceiptDecisions[index].terminalStage == nil else { return }
+            storedReceiptDecisions[index].terminalStage = stage
+        }
+
         static func recordBenchmarkGitCommand(
             tag: BenchmarkMetricTag?,
             family: GitProcessCommandFamily,
@@ -573,7 +862,9 @@ enum WorktreeStartupInstrumentation {
                 shadow: shadowCounters,
                 seed: seedCounters,
                 eventEvictionCount: eventEvictionCount,
-                gitCommandEvictionCount: gitCommandEvictionCount
+                gitCommandEvictionCount: gitCommandEvictionCount,
+                receiptDecisions: storedReceiptDecisions,
+                receiptDecisionEvictionCount: receiptDecisionEvictionCount
             )
         #else
             return Snapshot(
@@ -610,6 +901,8 @@ enum WorktreeStartupInstrumentation {
             seedCounters = SeedCounters()
             eventEvictionCount = 0
             gitCommandEvictionCount = 0
+            storedReceiptDecisions.removeAll(keepingCapacity: true)
+            receiptDecisionEvictionCount = 0
             benchmarkMetricsByTag.removeAll(keepingCapacity: true)
             lock.unlock()
         }

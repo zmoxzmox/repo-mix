@@ -1838,6 +1838,12 @@ actor WorkspaceFileContextStore {
     private var sessionWorktreeReservationLoadFlightsByToken: [WorkspaceSessionWorktreeOwnershipToken: [String: RootLoadFlight]] = [:]
     private var pendingSeededRootsByID: [WorkspacePendingSeededRootID: PendingSeededRoot] = [:]
     private var pendingSeededRootIDsByStandardizedPath: [String: WorkspacePendingSeededRootID] = [:]
+    #if DEBUG
+        private var pendingReceiptConsumptionDecisionByToken: [
+            WorkspaceSessionWorktreeOwnershipToken:
+                (correlationID: UUID, decision: WorktreeStartupInstrumentation.ReceiptConsumptionDecision)
+        ] = [:]
+    #endif
     private var pendingSeededRootVisibilityWaitersByPath: [
         String: [UUID: CheckedContinuation<Void, Error>]
     ] = [:]
@@ -3253,6 +3259,9 @@ actor WorkspaceFileContextStore {
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> WorkspaceSessionWorktreeOwnershipPreparation {
+        #if DEBUG
+            var receiptConsumptionDecision = WorktreeStartupInstrumentation.ReceiptConsumptionDecision()
+        #endif
         let standardizedPaths = Array(Set(physicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
         })).sorted()
@@ -3262,6 +3271,16 @@ actor WorkspaceFileContextStore {
            installedRecord.roots.map(\.standardizedPhysicalPath).sorted() == standardizedPaths,
            sessionWorktreeOwnershipRecordIsCurrent(installedRecord)
         {
+            #if DEBUG
+                if let startupContext {
+                    receiptConsumptionDecision.ownershipReused = true
+                    receiptConsumptionDecision.finalObservation = .disabled
+                    WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                        correlationID: startupContext.correlationID,
+                        decision: receiptConsumptionDecision
+                    )
+                }
+            #endif
             return WorkspaceSessionWorktreeOwnershipPreparation(
                 token: installedToken,
                 bindingFingerprint: bindingFingerprint,
@@ -3271,6 +3290,9 @@ actor WorkspaceFileContextStore {
         }
 
         let generation = (latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] ?? 0) &+ 1
+        #if DEBUG
+            receiptConsumptionDecision.ownershipReused = false
+        #endif
         latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] = generation
         let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID]
         if let installedToken,
@@ -3310,6 +3332,22 @@ actor WorkspaceFileContextStore {
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                 }
                 let hint = initializationHintsByPhysicalRootPath[path]
+                #if DEBUG
+                    if let hint, let startupContext {
+                        receiptConsumptionDecision.ownerGenerationMatch = hint.expectedOwnerBindingGeneration == generation
+                            ? .match
+                            : .mismatch
+                        receiptConsumptionDecision.hintSessionMatch = hint.agentSessionID == ownerID
+                            ? .match
+                            : .mismatch
+                        receiptConsumptionDecision.hintCorrelationMatch = hint.correlationID == startupContext.correlationID
+                            ? .match
+                            : .mismatch
+                        receiptConsumptionDecision.hintOwnerMatch = startupContext.agentSessionID == ownerID
+                            ? .match
+                            : .mismatch
+                    }
+                #endif
                 var servingFallbackReason: WorkspaceRootSeedFallbackReason?
                 if let startupContext,
                    startupContext.flags.serveDiffSeededWorktreeStartup,
@@ -3332,6 +3370,16 @@ actor WorkspaceFileContextStore {
                         throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                     }
                     materializationHintObservations[path] = observation
+                    #if DEBUG
+                        switch observation {
+                        case .observationDisabled:
+                            receiptConsumptionDecision.initialHintObservation = .disabled
+                        case let .fallback(reason):
+                            receiptConsumptionDecision.initialHintObservation = .fallback(reason)
+                        case .eligible:
+                            receiptConsumptionDecision.initialHintObservation = .eligible
+                        }
+                    #endif
                     switch observation {
                     case .observationDisabled:
                         break
@@ -3357,9 +3405,18 @@ actor WorkspaceFileContextStore {
                         }
                         switch attempt {
                         case let .prepared(preparation):
+                            #if DEBUG
+                                receiptConsumptionDecision.pendingSeededPreparationResult = .eligible
+                                receiptConsumptionDecision.fullCrawlPerformed = false
+                                receiptConsumptionDecision.finalObservation = .eligible
+                                receiptConsumptionDecision.selectedRoute = .diffSeedServing
+                            #endif
                             pendingSeededRootPreparations.append(preparation)
                             continue
                         case let .fallback(reason):
+                            #if DEBUG
+                                receiptConsumptionDecision.pendingSeededPreparationResult = .fallback(reason)
+                            #endif
                             servingFallbackReason = reason
                             materializationHintObservations[path] = .fallback(reason)
                         }
@@ -3367,6 +3424,10 @@ actor WorkspaceFileContextStore {
                 }
 
                 if let startupContext {
+                    #if DEBUG
+                        receiptConsumptionDecision.fullCrawlPerformed = true
+                        receiptConsumptionDecision.selectedRoute = .fullCrawl
+                    #endif
                     WorktreeStartupInstrumentation.record(
                         .rootLoadStarted,
                         context: startupContext,
@@ -3429,6 +3490,22 @@ actor WorkspaceFileContextStore {
                         observationEnabled: startupContext?.flags.observeDiffSeededWorktreeStartup ?? false
                     )
                 }
+                #if DEBUG
+                    switch observation {
+                    case .observationDisabled:
+                        receiptConsumptionDecision.finalObservation = .disabled
+                        receiptConsumptionDecision.initialHintObservation = receiptConsumptionDecision.initialHintObservation
+                            ?? .disabled
+                    case let .fallback(reason):
+                        receiptConsumptionDecision.finalObservation = .fallback(reason)
+                        receiptConsumptionDecision.initialHintObservation = receiptConsumptionDecision.initialHintObservation
+                            ?? .fallback(reason)
+                    case .eligible:
+                        receiptConsumptionDecision.finalObservation = .eligible
+                        receiptConsumptionDecision.initialHintObservation = receiptConsumptionDecision.initialHintObservation
+                            ?? .eligible
+                    }
+                #endif
                 if servingFallbackReason == nil,
                    startupContext?.servingControl != .forceFullCrawl,
                    case let .fallback(reason) = observation,
@@ -3520,6 +3597,21 @@ actor WorkspaceFileContextStore {
                 }
                 materializationHintObservations[path] = observation
             }
+            #if DEBUG
+                if let startupContext {
+                    if pendingSeededRootPreparations.isEmpty {
+                        WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                            correlationID: startupContext.correlationID,
+                            decision: receiptConsumptionDecision
+                        )
+                    } else {
+                        pendingReceiptConsumptionDecisionByToken[token] = (
+                            correlationID: startupContext.correlationID,
+                            decision: receiptConsumptionDecision
+                        )
+                    }
+                }
+            #endif
             return WorkspaceSessionWorktreeOwnershipPreparation(
                 token: token,
                 bindingFingerprint: bindingFingerprint,
@@ -3530,6 +3622,14 @@ actor WorkspaceFileContextStore {
                 pendingSeededRootPreparations: pendingSeededRootPreparations
             )
         } catch {
+            #if DEBUG
+                if let startupContext {
+                    WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                        correlationID: startupContext.correlationID,
+                        decision: receiptConsumptionDecision
+                    )
+                }
+            #endif
             let resources = removeSessionWorktreeOwnershipToken(token)
             await cleanupOrphanedSessionWorktreeResources(resources)
             throw error
@@ -3950,6 +4050,16 @@ actor WorkspaceFileContextStore {
                 route: .diffSeedServing
             )
         }
+        #if DEBUG
+            if let pendingDecision = pendingReceiptConsumptionDecisionByToken.removeValue(
+                forKey: preparation.token
+            ) {
+                WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                    correlationID: pendingDecision.correlationID,
+                    decision: pendingDecision.decision
+                )
+            }
+        #endif
         for path in newlyPublishedPaths {
             finishPendingSeededRootVisibility(path: path)
         }
@@ -4020,12 +4130,30 @@ actor WorkspaceFileContextStore {
             preparation.materializationHintObservationsByPhysicalRootPath,
             rootSeedShadowPreparations: preparation.rootSeedShadowPreparations
         )
-        return try await commitSessionWorktreeOwnership(replacement)
+        let committedRoots = try await commitSessionWorktreeOwnership(replacement)
+        #if DEBUG
+            if var pendingDecision = pendingReceiptConsumptionDecisionByToken.removeValue(
+                forKey: preparation.token
+            ) {
+                pendingDecision.decision.pendingSeededPreparationResult = .fallback(reason)
+                pendingDecision.decision.fullCrawlPerformed = true
+                pendingDecision.decision.finalObservation = .fallback(reason)
+                pendingDecision.decision.selectedRoute = .fullCrawl
+                WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                    correlationID: pendingDecision.correlationID,
+                    decision: pendingDecision.decision
+                )
+            }
+        #endif
+        return committedRoots
     }
 
     func abortSessionWorktreeOwnership(
         _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
     ) async {
+        #if DEBUG
+            terminalizePendingReceiptConsumptionDecision(for: preparation.token)
+        #endif
         guard !preparation.reusesInstalledOwnership,
               installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] != preparation.token
         else { return }
@@ -4277,6 +4405,9 @@ actor WorkspaceFileContextStore {
     private func removeSessionWorktreeOwnershipToken(
         _ token: WorkspaceSessionWorktreeOwnershipToken
     ) -> SessionWorktreeOwnershipRemoval {
+        #if DEBUG
+            terminalizePendingReceiptConsumptionDecision(for: token)
+        #endif
         let record = sessionWorktreeOwnershipRecordsByToken.removeValue(forKey: token)
         let reservedPaths = sessionWorktreeReservedPathsByToken.removeValue(forKey: token) ?? []
         let reservedLoadFlightsByPath =
@@ -4309,6 +4440,26 @@ actor WorkspaceFileContextStore {
             pendingSeededRootIDs: record?.pendingSeededRootIDs ?? []
         )
     }
+
+    #if DEBUG
+        func terminalizeReceiptConsumptionDecision(
+            _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
+        ) {
+            terminalizePendingReceiptConsumptionDecision(for: preparation.token)
+        }
+
+        private func terminalizePendingReceiptConsumptionDecision(
+            for token: WorkspaceSessionWorktreeOwnershipToken
+        ) {
+            guard let pendingDecision = pendingReceiptConsumptionDecisionByToken.removeValue(
+                forKey: token
+            ) else { return }
+            WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                correlationID: pendingDecision.correlationID,
+                decision: pendingDecision.decision
+            )
+        }
+    #endif
 
     private func scheduleOrphanedSessionWorktreeResourceCleanup(
         _ resources: SessionWorktreeOwnershipRemoval

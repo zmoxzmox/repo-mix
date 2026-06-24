@@ -89,6 +89,37 @@ import XCTest
             await materializer.release(sessionID: fixture.agentSessionID)
         }
 
+        func testProjectionAbortRecordsOneTerminalReceiptDecision() async throws {
+            let fixture = try PendingSeededRootFixture()
+            defer { fixture.cleanup() }
+            let prepared = try await fixture.prepareWorktree()
+            let store = WorkspaceFileContextStore()
+            let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+            WorktreeStartupInstrumentation.resetForTesting()
+
+            let preparation = try await materializer.prepare(
+                sessionID: fixture.agentSessionID,
+                bindings: [prepared.binding],
+                startupContext: fixture.startupContext(serving: true),
+                initializationHintsByBindingID: [prepared.binding.id: prepared.hint]
+            )
+            XCTAssertEqual(preparation.ownership.pendingSeededRootPreparations.count, 1)
+
+            await materializer.abort(preparation)
+            await materializer.abort(preparation)
+
+            let records = WorktreeStartupInstrumentation.receiptDecisions(
+                correlationID: fixture.correlationID
+            )
+            XCTAssertEqual(records.count, 1)
+            let aggregate = try XCTUnwrap(records.first)
+            XCTAssertEqual(aggregate.creationAttemptCount, 0)
+            XCTAssertEqual(aggregate.terminalStage, .consumption)
+            XCTAssertFalse(aggregate.ambiguousOrDuplicate)
+            XCTAssertNotNil(aggregate.projection)
+            XCTAssertNotNil(aggregate.consumption)
+        }
+
         func testPendingMetadataInvalidationAfterValidationFailsClosedBeforePublication() async throws {
             let fixture = try PendingSeededRootFixture()
             defer { fixture.cleanup() }
@@ -305,6 +336,7 @@ import XCTest
                 )
             }
             let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+            WorktreeStartupInstrumentation.resetForTesting()
             let preparation = try await materializer.prepare(
                 sessionID: fixture.agentSessionID,
                 bindings: [prepared.binding],
@@ -324,6 +356,16 @@ import XCTest
             let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
             XCTAssertEqual(ownership.pendingSeededRootCount, 0)
             XCTAssertEqual(ownership.pathReservationCount, 0)
+            let records = WorktreeStartupInstrumentation.receiptDecisions(
+                correlationID: fixture.correlationID
+            )
+            XCTAssertEqual(records.count, 1)
+            let aggregate = try XCTUnwrap(records.first)
+            XCTAssertEqual(aggregate.creationAttemptCount, 0)
+            XCTAssertEqual(aggregate.terminalStage, .consumption)
+            XCTAssertFalse(aggregate.ambiguousOrDuplicate)
+            XCTAssertNotNil(aggregate.projection)
+            XCTAssertNotNil(aggregate.consumption)
         }
 
         func testShardFailureRollsBackPrivateStateAndFallsBackToOneFullCrawl() async throws {

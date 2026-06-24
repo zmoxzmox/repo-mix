@@ -247,6 +247,7 @@
             let warmup: Bool
             let armedAtNanoseconds: UInt64
             let baselineEventEvictionCount: Int
+            let baselineReceiptDecisionEvictionCount: Int
             var agentSessionID: UUID?
             var startAttemptID: UUID?
             var metricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
@@ -438,6 +439,7 @@
                     warmup: warmup,
                     armedAtNanoseconds: now,
                     baselineEventEvictionCount: instrumentation.eventEvictionCount,
+                    baselineReceiptDecisionEvictionCount: instrumentation.receiptDecisionEvictionCount,
                     agentSessionID: nil,
                     startAttemptID: nil,
                     metricTag: nil
@@ -602,6 +604,18 @@
                 let fallbackCounts = Dictionary(grouping: events.compactMap(\.fallback), by: { $0.rawValue })
                     .mapValues(\.count)
                 let eventEvicted = instrumentation.eventEvictionCount > sample.baselineEventEvictionCount
+                let receiptDecisions = instrumentation.receiptDecisions.filter { $0.correlationID == correlationID }
+                let terminalReceiptDecisionCount = receiptDecisions.count(where: { $0.terminalStage != nil })
+                let receiptDecisionEvicted = instrumentation.receiptDecisionEvictionCount
+                    > sample.baselineReceiptDecisionEvictionCount
+                let receiptDecisionAmbiguous = receiptDecisions.contains {
+                    $0.ambiguousOrDuplicate || $0.creationAttemptCount > 1
+                }
+                let rootReady = eventTimes[.rootReady] != nil
+                let receiptDecisionValid = !receiptDecisionEvicted
+                    && receiptDecisions.count <= 1
+                    && !receiptDecisionAmbiguous
+                    && (!rootReady || terminalReceiptDecisionCount == 1)
                 let metrics = sample.metricTag.map(WorktreeStartupInstrumentation.benchmarkMetricSnapshot)
                 let git = metrics?.gitCommands ?? []
                 let gitFamilies = Dictionary(grouping: git, by: { $0.family.rawValue }).mapValues(\.count)
@@ -609,7 +623,7 @@
 
                 var payload: [String: Any] = [
                     "ok": true,
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "action": export ? "export" : "snapshot",
                     "scope": [
                         "window_id": scope.windowID,
@@ -626,7 +640,7 @@
                         "invocation": sample.invocation,
                         "ordinal": sample.ordinal,
                         "warmup": sample.warmup,
-                        "root_ready": eventTimes[.rootReady] != nil,
+                        "root_ready": rootReady,
                         "first_search_complete": eventTimes[.firstBenchmarkSearchCompleted] != nil,
                         "first_read_complete": eventTimes[.firstBenchmarkReadCompleted] != nil,
                         "route_counts": routeCounts,
@@ -634,8 +648,13 @@
                         "milestones_us": Self.milestonePayload(eventTimes, baseline: sample.armedAtNanoseconds),
                         "durations_us": Self.durationPayload(eventTimes),
                         "event_buffer_evicted": eventEvicted,
-                        "valid": !eventEvicted && sample.metricTag != nil
+                        "valid": !eventEvicted && sample.metricTag != nil && receiptDecisionValid
                     ],
+                    "receipt_decision_count": receiptDecisions.count,
+                    "terminal_receipt_decision_count": terminalReceiptDecisionCount,
+                    "receipt_decision_buffer_evicted": receiptDecisionEvicted,
+                    "receipt_decision_ambiguous": receiptDecisionAmbiguous,
+                    "receipt_decisions": receiptDecisions.map(Self.receiptDecisionPayload),
                     "git": Self.gitPayload(git, families: gitFamilies, priorities: gitPriorities),
                     "work": Self.workPayload(metrics)
                 ]
@@ -747,6 +766,137 @@
             }
             currentControlIDByScope.removeValue(forKey: lease.scope)
             return nil
+        }
+
+        private static func receiptDecisionPayload(
+            _ decision: WorktreeStartupInstrumentation.ReceiptDecision
+        ) -> [String: Any] {
+            var payload: [String: Any] = [
+                "correlation_id": decision.correlationID.uuidString,
+                "terminal_stage": optionalRawValue(decision.terminalStage),
+                "ambiguous_or_duplicate": decision.ambiguousOrDuplicate,
+                "creation_attempt_count": decision.creationAttemptCount
+            ]
+            payload["creation"] = decision.creation.map(receiptCreationPayload) ?? NSNull()
+            payload["coordinator"] = decision.coordinator.map(receiptCoordinatorPayload) ?? NSNull()
+            payload["projection"] = decision.projection.map(receiptProjectionPayload) ?? NSNull()
+            payload["consumption"] = decision.consumption.map(receiptConsumptionPayload) ?? NSNull()
+            return payload
+        }
+
+        private static func receiptCreationPayload(
+            _ decision: WorktreeStartupInstrumentation.ReceiptCreationDecision
+        ) -> [String: Any] {
+            [
+                "source_layout_state": decision.sourceLayoutState.rawValue,
+                "destination_eligibility": decision.destinationEligibility.rawValue,
+                "source_authority_key_digest": optional(decision.sourceAuthorityKeyDigest),
+                "source_common_directory_digest": optional(decision.sourceCommonDirectoryDigest),
+                "repository_id_digest": optional(decision.repositoryIDDigest),
+                "repository_namespace_digest": optional(decision.repositoryNamespaceDigest),
+                "requested_prefix_digest": optional(decision.requestedPrefixDigest),
+                "current_lease_present": optional(decision.currentLeasePresent),
+                "current_lease_current_at_snapshot_lookup": optional(decision.currentLeaseCurrentAtSnapshotLookup),
+                "current_snapshot_present": optional(decision.currentSnapshotPresent),
+                "current_snapshot_content_address_valid": optional(decision.currentSnapshotContentAddressValid),
+                "current_snapshot_sha256": optional(decision.currentSnapshotSHA256),
+                "parent_lookup_route": decision.parentLookupRoute.rawValue,
+                "parent_lookup_failure": decision.parentLookupFailure.rawValue,
+                "parent_authority_key_match": decision.parentAuthorityKeyMatch.rawValue,
+                "parent_prefix_match": decision.parentPrefixMatch.rawValue,
+                "target_tree_resolution": decision.targetTreeResolution.rawValue,
+                "witness_requested": optional(decision.witnessRequested),
+                "witness_started": optional(decision.witnessStarted),
+                "witness_finished": optional(decision.witnessFinished),
+                "witness_start_event_id_valid": optional(decision.witnessStartEventIDValid),
+                "witness_end_event_id_valid": optional(decision.witnessEndEventIDValid),
+                "witness_gap": optional(decision.witnessGap),
+                "witness_drop": optional(decision.witnessDrop),
+                "witness_overflow": optional(decision.witnessOverflow),
+                "witness_proves_interval": optional(decision.witnessProvesInterval),
+                "include_copy_requested": optional(decision.includeCopyRequested),
+                "include_copy_result_present": optional(decision.includeCopyResultPresent),
+                "include_copy_complete": optional(decision.includeCopyComplete),
+                "include_copy_had_failures": optional(decision.includeCopyHadFailures),
+                "target_layout_present": optional(decision.targetLayoutPresent),
+                "target_layout_linked": optional(decision.targetLayoutLinked),
+                "target_authority_capture": decision.targetAuthorityCapture.rawValue,
+                "common_directory_match": decision.commonDirectoryMatch.rawValue,
+                "repository_id_match": decision.repositoryIDMatch.rawValue,
+                "repository_namespace_match": decision.repositoryNamespaceMatch.rawValue,
+                "target_prefix_match": decision.targetPrefixMatch.rawValue,
+                "target_tree_authority_match": decision.targetTreeAuthorityMatch.rawValue,
+                "receipt_emitted": decision.receiptEmitted,
+                "receipt_fallback_reason": optionalRawValue(decision.receiptFallbackReason),
+                "initialization_fallback_reason": optionalRawValue(decision.initializationFallbackReason),
+                "outcome": decision.outcome.rawValue
+            ]
+        }
+
+        private static func receiptCoordinatorPayload(
+            _ decision: WorktreeStartupInstrumentation.ReceiptCoordinatorDecision
+        ) -> [String: Any] {
+            [
+                "create_result_receipt_count": decision.createResultReceiptCount,
+                "hint_count": decision.hintCount,
+                "binding_count": decision.bindingCount,
+                "hint_keyed_by_created_binding": decision.hintKeyedByCreatedBinding.rawValue,
+                "creation_fallback_observed": optionalRawValue(decision.creationFallbackObserved)
+            ]
+        }
+
+        private static func receiptProjectionPayload(
+            _ decision: WorktreeStartupInstrumentation.ReceiptProjectionDecision
+        ) -> [String: Any] {
+            [
+                "supplied_hint_count": decision.suppliedHintCount,
+                "matched_hint_count": decision.matchedHintCount,
+                "all_hint_keys_matched_bindings": optional(decision.allHintKeysMatchedBindings),
+                "validation_fallback": optionalRawValue(decision.validationFallback)
+            ]
+        }
+
+        private static func receiptConsumptionPayload(
+            _ decision: WorktreeStartupInstrumentation.ReceiptConsumptionDecision
+        ) -> [String: Any] {
+            [
+                "owner_generation_match": decision.ownerGenerationMatch.rawValue,
+                "hint_session_match": decision.hintSessionMatch.rawValue,
+                "hint_correlation_match": decision.hintCorrelationMatch.rawValue,
+                "hint_owner_match": decision.hintOwnerMatch.rawValue,
+                "ownership_reused": optional(decision.ownershipReused),
+                "initial_hint_observation": receiptObservationPayload(decision.initialHintObservation),
+                "pending_seeded_preparation_result": receiptObservationPayload(
+                    decision.pendingSeededPreparationResult
+                ),
+                "full_crawl_performed": optional(decision.fullCrawlPerformed),
+                "final_observation": receiptObservationPayload(decision.finalObservation),
+                "selected_route": optionalRawValue(decision.selectedRoute)
+            ]
+        }
+
+        private static func receiptObservationPayload(
+            _ observation: WorktreeStartupInstrumentation.ReceiptFinalObservation?
+        ) -> Any {
+            guard let observation else { return NSNull() }
+            switch observation {
+            case .eligible:
+                return ["state": "eligible"]
+            case .disabled:
+                return ["state": "disabled"]
+            case let .fallback(reason):
+                return ["state": "fallback", "fallback_reason": reason.rawValue]
+            }
+        }
+
+        private static func optional(_ value: (some Any)?) -> Any {
+            guard let value else { return NSNull() }
+            return value
+        }
+
+        private static func optionalRawValue<T: RawRepresentable>(_ value: T?) -> Any where T.RawValue == String {
+            guard let value else { return NSNull() }
+            return value.rawValue
         }
 
         private static func gitPayload(

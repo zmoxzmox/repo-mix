@@ -399,6 +399,290 @@ import XCTest
             XCTAssertEqual(snapshot.codemapAttribution, .unavailable)
         }
 
+        func testReceiptDecisionBufferCapsAt128AndEvictsOldestTerminalBeforeNonterminal() {
+            WorktreeStartupInstrumentation.resetForTesting()
+            let oldestTerminal = UUID()
+            let oldestNonterminal = UUID()
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: oldestTerminal,
+                decision: .init(),
+                terminal: true
+            )
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: oldestNonterminal,
+                decision: .init()
+            )
+            for _ in 0 ..< 126 {
+                WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                    correlationID: UUID(),
+                    decision: .init()
+                )
+            }
+            let newest = UUID()
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: newest,
+                decision: .init()
+            )
+
+            let snapshot = WorktreeStartupInstrumentation.snapshot()
+            XCTAssertEqual(snapshot.receiptDecisions.count, 128)
+            XCTAssertEqual(snapshot.receiptDecisionEvictionCount, 1)
+            XCTAssertTrue(snapshot.receiptDecisions.contains { $0.correlationID == oldestNonterminal })
+            XCTAssertTrue(snapshot.receiptDecisions.contains { $0.correlationID == newest })
+            XCTAssertFalse(snapshot.receiptDecisions.contains { $0.correlationID == oldestTerminal })
+
+            WorktreeStartupInstrumentation.resetForTesting()
+            let oldest = UUID()
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: oldest,
+                decision: .init()
+            )
+            for _ in 0 ..< 128 {
+                WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                    correlationID: UUID(),
+                    decision: .init()
+                )
+            }
+            XCTAssertFalse(
+                WorktreeStartupInstrumentation.receiptDecisions().contains { $0.correlationID == oldest }
+            )
+        }
+
+        func testReceiptDecisionStagesAreCorrelationIsolatedAndAggregateOnce() throws {
+            WorktreeStartupInstrumentation.resetForTesting()
+            let first = UUID()
+            let second = UUID()
+            var creation = WorktreeStartupInstrumentation.ReceiptCreationDecision()
+            creation.sourceLayoutState = .linkedWorktree
+            creation.outcome = .receiptEmitted
+            creation.receiptEmitted = true
+            var coordinator = WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+            coordinator.createResultReceiptCount = 1
+            coordinator.hintCount = 1
+            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                correlationID: first,
+                decision: creation
+            )
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: first,
+                decision: coordinator
+            )
+            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                correlationID: second,
+                decision: .init()
+            )
+
+            let firstDecision = try XCTUnwrap(
+                WorktreeStartupInstrumentation.receiptDecisions(correlationID: first).first
+            )
+            XCTAssertEqual(firstDecision.creation, creation)
+            XCTAssertEqual(firstDecision.coordinator, coordinator)
+            XCTAssertNil(firstDecision.projection)
+            XCTAssertEqual(firstDecision.creationAttemptCount, 1)
+            XCTAssertFalse(firstDecision.ambiguousOrDuplicate)
+            XCTAssertEqual(WorktreeStartupInstrumentation.receiptDecisions().count, 2)
+        }
+
+        func testReceiptDecisionDuplicateConflictInvalidatesAndFirstTerminalWins() throws {
+            WorktreeStartupInstrumentation.resetForTesting()
+            let correlationID = UUID()
+            var coordinator = WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
+            coordinator.bindingCount = 1
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: correlationID,
+                decision: coordinator,
+                terminal: true
+            )
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: correlationID,
+                decision: coordinator,
+                terminal: true
+            )
+            XCTAssertFalse(try XCTUnwrap(
+                WorktreeStartupInstrumentation.receiptDecisions(correlationID: correlationID).first
+            ).ambiguousOrDuplicate)
+
+            var conflicting = coordinator
+            conflicting.hintCount = 1
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: correlationID,
+                decision: conflicting
+            )
+            WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                correlationID: correlationID,
+                decision: .init(),
+                terminal: true
+            )
+            let decision = try XCTUnwrap(
+                WorktreeStartupInstrumentation.receiptDecisions(correlationID: correlationID).first
+            )
+            XCTAssertTrue(decision.ambiguousOrDuplicate)
+            XCTAssertEqual(decision.coordinator, coordinator)
+            XCTAssertNotNil(decision.consumption)
+            XCTAssertEqual(decision.terminalStage, .coordinator)
+
+            let duplicateCreationID = UUID()
+            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                correlationID: duplicateCreationID,
+                decision: .init()
+            )
+            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                correlationID: duplicateCreationID,
+                decision: .init()
+            )
+            let duplicate = try XCTUnwrap(
+                WorktreeStartupInstrumentation.receiptDecisions(correlationID: duplicateCreationID).first
+            )
+            XCTAssertTrue(duplicate.ambiguousOrDuplicate)
+            XCTAssertEqual(duplicate.creationAttemptCount, 2)
+        }
+
+        func testReceiptDecisionSchemaV3ExportIsTerminalBoundedAndPathFree() throws {
+            WorktreeStartupInstrumentation.resetForTesting()
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 611,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let expected = benchmarkExpectedStart(scope: scope)
+            let control = try diagnostics.setFlags(
+                scope: scope,
+                observe: true,
+                serve: true,
+                forceFullCrawl: false,
+                expiresSeconds: 120
+            )
+            let arm = try diagnostics.arm(
+                expectedStart: expected,
+                controlID: control.controlID,
+                scenario: "receipt_path_privacy",
+                invocation: 1,
+                ordinal: 1,
+                warmup: false,
+                expiresSeconds: 120
+            )
+            let consumed = try diagnostics.consume(
+                token: arm.token,
+                validatedStart: benchmarkValidatedStart(expected: expected)
+            )
+            let pathSentinel = "/private/receipt-path-sentinel"
+            var creation = WorktreeStartupInstrumentation.ReceiptCreationDecision()
+            creation.sourceLayoutState = .linkedWorktree
+            creation.sourceCommonDirectoryDigest = WorktreeStartupInstrumentation.receiptDecisionDigest(
+                pathSentinel,
+                domain: .commonDirectory
+            )
+            creation.outcome = .receiptEmitted
+            creation.receiptEmitted = true
+            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                correlationID: arm.correlationID,
+                decision: creation
+            )
+            WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                correlationID: arm.correlationID,
+                decision: .init()
+            )
+            WorktreeStartupInstrumentation.recordReceiptProjectionDecision(
+                correlationID: arm.correlationID,
+                decision: .init()
+            )
+            var consumption = WorktreeStartupInstrumentation.ReceiptConsumptionDecision()
+            consumption.finalObservation = .eligible
+            consumption.selectedRoute = .diffSeedServing
+            consumption.fullCrawlPerformed = false
+            WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                correlationID: arm.correlationID,
+                decision: consumption
+            )
+            let context = WorktreeStartupContext(
+                agentSessionID: consumed.metricTag.agentSessionID,
+                correlationID: arm.correlationID,
+                flags: consumed.flags,
+                servingControl: consumed.servingControl
+            )
+            WorktreeStartupInstrumentation.record(.rootReady, context: context, route: .diffSeedServing)
+
+            let payload = try diagnostics.snapshotPayload(
+                scope: scope,
+                correlationID: arm.correlationID,
+                export: true
+            )
+            XCTAssertEqual(payload["schema_version"] as? Int, 3)
+            XCTAssertEqual(payload["bounded"] as? Bool, true)
+            XCTAssertEqual(payload["contains_paths"] as? Bool, false)
+            XCTAssertEqual(payload["receipt_decision_count"] as? Int, 1)
+            XCTAssertEqual(payload["terminal_receipt_decision_count"] as? Int, 1)
+            XCTAssertEqual(payload["receipt_decision_buffer_evicted"] as? Bool, false)
+            XCTAssertEqual(payload["receipt_decision_ambiguous"] as? Bool, false)
+            let sample = try XCTUnwrap(payload["sample"] as? [String: Any])
+            XCTAssertEqual(sample["valid"] as? Bool, true)
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            let exported = try XCTUnwrap(String(data: data, encoding: .utf8))
+            XCTAssertFalse(exported.contains(pathSentinel))
+            XCTAssertTrue(exported.contains("source_common_directory_digest"))
+        }
+
+        func testReceiptDecisionEvictionInvalidatesBenchmarkSampleAndResetClearsState() throws {
+            WorktreeStartupInstrumentation.resetForTesting()
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 612,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let expected = benchmarkExpectedStart(scope: scope)
+            let control = try diagnostics.setFlags(
+                scope: scope,
+                observe: true,
+                serve: false,
+                forceFullCrawl: false,
+                expiresSeconds: 120
+            )
+            let arm = try diagnostics.arm(
+                expectedStart: expected,
+                controlID: control.controlID,
+                scenario: "receipt_eviction",
+                invocation: 1,
+                ordinal: 1,
+                warmup: false,
+                expiresSeconds: 120
+            )
+            _ = try diagnostics.consume(
+                token: arm.token,
+                validatedStart: benchmarkValidatedStart(expected: expected)
+            )
+            WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                correlationID: arm.correlationID,
+                decision: .init()
+            )
+            for _ in 0 ..< 128 {
+                WorktreeStartupInstrumentation.recordReceiptCoordinatorDecision(
+                    correlationID: UUID(),
+                    decision: .init()
+                )
+            }
+
+            let payload = try diagnostics.snapshotPayload(
+                scope: scope,
+                correlationID: arm.correlationID,
+                export: false
+            )
+            XCTAssertEqual(payload["receipt_decision_buffer_evicted"] as? Bool, true)
+            XCTAssertEqual((payload["sample"] as? [String: Any])?["valid"] as? Bool, false)
+
+            WorktreeStartupInstrumentation.resetForTesting()
+            let resetSnapshot = WorktreeStartupInstrumentation.snapshot()
+            XCTAssertTrue(resetSnapshot.receiptDecisions.isEmpty)
+            XCTAssertEqual(resetSnapshot.receiptDecisionEvictionCount, 0)
+        }
+
         private func benchmarkExpectedStart(
             scope: DebugWorktreeStartupBenchmarkScope
         ) -> DebugWorktreeStartupBenchmarkExpectedStart {

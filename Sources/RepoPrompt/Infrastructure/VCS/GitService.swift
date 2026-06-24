@@ -52,6 +52,71 @@ actor GitService {
     }
 
     #if DEBUG
+        enum ReceiptCreationFailurePointForTesting: Equatable {
+            case targetTreeUnavailable
+            case witnessCoverageInvalid
+            case includeCopyIncomplete
+            case targetLayoutUnavailable
+            case targetAuthorityUnavailable
+        }
+
+        private struct ReceiptCreationFailureForTesting {
+            let correlationID: UUID
+            let point: ReceiptCreationFailurePointForTesting
+        }
+
+        private final class ReceiptCreationFailureHook: @unchecked Sendable {
+            private let lock = NSLock()
+            private var failure: ReceiptCreationFailureForTesting?
+
+            func set(correlationID: UUID, point: ReceiptCreationFailurePointForTesting?) {
+                lock.lock()
+                failure = point.map {
+                    ReceiptCreationFailureForTesting(correlationID: correlationID, point: $0)
+                }
+                lock.unlock()
+            }
+
+            func consume(
+                _ point: ReceiptCreationFailurePointForTesting,
+                correlationID: UUID?
+            ) -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard let failure,
+                      failure.correlationID == correlationID,
+                      failure.point == point
+                else { return false }
+                self.failure = nil
+                return true
+            }
+        }
+
+        private final class ReceiptCreationTerminalClaim: @unchecked Sendable {
+            private let lock = NSLock()
+            private var claimed = false
+
+            func claim() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !claimed else { return false }
+                claimed = true
+                return true
+            }
+        }
+
+        private final class ReceiptParentLookupTrace: @unchecked Sendable {
+            var currentLeasePresent: Bool?
+            var currentLeaseCurrentAtSnapshotLookup: Bool?
+            var currentSnapshotPresent: Bool?
+            var currentSnapshotContentAddressValid: Bool?
+            var currentSnapshotSHA256: String?
+            var route: WorktreeStartupInstrumentation.ReceiptParentLookupRoute = .notAttempted
+            var failure: WorktreeStartupInstrumentation.ReceiptParentLookupFailure = .none
+        }
+
+        @TaskLocal private static var currentReceiptParentLookupTrace: ReceiptParentLookupTrace?
+
         struct WorktreeLayoutCacheSnapshot: Equatable {
             let entryCount: Int
             let retainedPaths: Set<String>
@@ -187,6 +252,10 @@ actor GitService {
     private let creationReceiptCoordinator = WorkspaceRootCreationReceiptCoordinator()
     private let processTerminationGrace: Duration
     private var preparedBaseProcessEnvironment: [String: String]?
+    #if DEBUG
+        private nonisolated let receiptCreationFailureHook = ReceiptCreationFailureHook()
+        private var worktreeMutationLockAcquiredHandlerForTesting: (@Sendable (UUID?) async -> Void)?
+    #endif
 
     init(
         gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
@@ -204,6 +273,70 @@ actor GitService {
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
     }
+
+    #if DEBUG
+        func setReceiptCreationFailureForTesting(
+            correlationID: UUID,
+            point: ReceiptCreationFailurePointForTesting?
+        ) {
+            receiptCreationFailureHook.set(correlationID: correlationID, point: point)
+        }
+
+        func setWorktreeMutationLockAcquiredHandlerForTesting(
+            _ handler: (@Sendable (UUID?) async -> Void)?
+        ) {
+            worktreeMutationLockAcquiredHandlerForTesting = handler
+        }
+
+        func waitForWorktreeMutationWaiterForTesting(at repoURL: URL) async {
+            let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
+                ?? repoURL.standardizedFileURL.path
+            await worktreeMutationCoordinator.waitForQueuedWaiterForTesting(key: mutationKey)
+        }
+
+        private nonisolated func consumeReceiptCreationFailureForTesting(
+            _ point: ReceiptCreationFailurePointForTesting,
+            correlationID: UUID?
+        ) -> Bool {
+            receiptCreationFailureHook.consume(point, correlationID: correlationID)
+        }
+
+        private nonisolated static func receiptMatch(
+            _ matches: Bool
+        ) -> WorktreeStartupInstrumentation.ReceiptMatchState {
+            matches ? .match : .mismatch
+        }
+
+        private nonisolated static func receiptAuthorityKeyDigest(
+            _ key: GitWorkspaceAuthorityRepositoryKey
+        ) -> String {
+            WorktreeStartupInstrumentation.receiptDecisionDigest(
+                [
+                    key.standardizedCommonDirectoryPath,
+                    key.standardizedGitDirectoryPath,
+                    key.commonDirectoryDevice.map(String.init) ?? "missing-device",
+                    key.commonDirectoryInode.map(String.init) ?? "missing-inode"
+                ].joined(separator: "\0"),
+                domain: .authorityKey
+            )
+        }
+
+        private nonisolated static func applyReceiptWitnessCoverage(
+            _ coverage: GitWorktreeCreationWitnessCoverage?,
+            to decision: inout WorktreeStartupInstrumentation.ReceiptCreationDecision
+        ) {
+            decision.witnessFinished = coverage != nil
+            guard let coverage else { return }
+            decision.witnessStartEventIDValid = coverage.startEventID > 0
+                && coverage.startEventID != UInt64.max
+            decision.witnessEndEventIDValid = coverage.endEventID > 0
+                && coverage.endEventID != UInt64.max
+            decision.witnessGap = coverage.hadGap
+            decision.witnessDrop = coverage.hadDrop
+            decision.witnessOverflow = coverage.overflowed
+            decision.witnessProvesInterval = coverage.provesCreationInterval
+        }
+    #endif
 
     struct UncommittedFile: Equatable {
         let path: String
@@ -360,188 +493,488 @@ actor GitService {
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
             ?? repoURL.standardizedFileURL.path
-
-        return try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
-            guard let self else {
-                throw GitError(message: "git service was released before worktree creation")
-            }
-            if let mainWorktreeRoot = request.mainWorktreeRoot {
-                try GitWorktreeDefaultPathPlanner.validate(
-                    path: request.path,
-                    mainWorktreeRoot: mainWorktreeRoot,
-                    knownWorktreeRoots: request.knownWorktreeRoots,
-                    appManagedContainer: request.appManagedContainer,
-                    allowExternalPath: request.allowExternalPath
+        let destinationIsAppManaged = request.appManagedContainer.map {
+            Self.isPath(request.path, equalToOrInside: $0)
+        } ?? false
+        let reusableReceiptDestinationIsEligible = destinationIsAppManaged
+            && request.copyWorktreeIncludeFiles
+        #if DEBUG
+            let initialReceiptDecision = initializationContext.map { context in
+                var decision = WorktreeStartupInstrumentation.ReceiptCreationDecision()
+                decision.sourceLayoutState = if let sourceLayout {
+                    sourceLayout.isLinkedWorktree ? .linkedWorktree : .mainCheckout
+                } else {
+                    .missing
+                }
+                decision.destinationEligibility = if !destinationIsAppManaged {
+                    .notAppManaged
+                } else if !request.copyWorktreeIncludeFiles {
+                    .includeCopyDisabled
+                } else {
+                    .eligible
+                }
+                decision.requestedPrefixDigest = WorktreeStartupInstrumentation.receiptDecisionDigest(
+                    context.repositoryRelativeRootPrefix.value,
+                    domain: .requestedPrefix
                 )
+                decision.includeCopyRequested = request.copyWorktreeIncludeFiles
+                decision.witnessRequested = false
+                decision.witnessStarted = false
+                if let sourceLayout {
+                    decision.sourceAuthorityKeyDigest = Self.receiptAuthorityKeyDigest(
+                        GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout)
+                    )
+                    decision.sourceCommonDirectoryDigest = WorktreeStartupInstrumentation.receiptDecisionDigest(
+                        sourceLayout.commonDir.standardizedFileURL.path,
+                        domain: .commonDirectory
+                    )
+                }
+                return decision
             }
+            let receiptCreationTerminalClaim = initializationContext.map { _ in
+                ReceiptCreationTerminalClaim()
+            }
+            let mutationLockAcquiredHandler = worktreeMutationLockAcquiredHandlerForTesting
+        #endif
 
-            let destinationIsAppManaged = request.appManagedContainer.map {
-                Self.isPath(request.path, equalToOrInside: $0)
-            } ?? false
-            let reusableReceiptDestinationIsEligible = destinationIsAppManaged
-                && request.copyWorktreeIncludeFiles
-            var parentEvidence: (
-                lease: GitWorkspaceAuthorityLease,
-                snapshot: WorkspaceRootReusableSnapshot,
-                baseTree: GitObjectID
-            )?
-            var witnessSession: WorkspaceRootCreationReceiptCoordinator.Session?
-            if let initializationContext,
-               initializationContext.observeReceipt,
-               reusableReceiptDestinationIsEligible,
-               let sourceLayout,
-               let reusableEvidence = try? await reusableParentEvidence(
-                   layout: sourceLayout,
-                   prefix: initializationContext.repositoryRelativeRootPrefix
-               ),
-               let targetTree = try? await resolveTreeOID(
-                   request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
-                   in: sourceLayout
-               )
-            {
-                parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
-                witnessSession = creationReceiptCoordinator.start(destinationURL: request.path)
-            }
-
-            let mutationToken: GitWorkspaceMutationToken? = if let sourceLayout {
-                await workspaceStateAuthority.beginMutation(
-                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout),
-                    kind: .worktreeCreate,
-                    correlationID: initializationContext?.correlationID
-                )
-            } else {
-                nil
-            }
-            do {
-                var args = ["worktree", "add"]
-                if request.force { args.append("--force") }
-                if request.detach { args.append("--detach") }
-                if let lockReason = request.lockReason {
-                    args.append("--lock")
-                    if !lockReason.isEmpty {
-                        args.append("--reason")
-                        args.append(lockReason)
+        do {
+            return try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before worktree creation")
+                }
+                #if DEBUG
+                    if let mutationLockAcquiredHandler {
+                        await mutationLockAcquiredHandler(initializationContext?.correlationID)
+                    }
+                    let parentLookupTrace = initializationContext.map { _ in ReceiptParentLookupTrace() }
+                    var receiptDecision = initialReceiptDecision
+                #endif
+                if let mainWorktreeRoot = request.mainWorktreeRoot {
+                    do {
+                        try GitWorktreeDefaultPathPlanner.validate(
+                            path: request.path,
+                            mainWorktreeRoot: mainWorktreeRoot,
+                            knownWorktreeRoots: request.knownWorktreeRoots,
+                            appManagedContainer: request.appManagedContainer,
+                            allowExternalPath: request.allowExternalPath
+                        )
+                    } catch {
+                        #if DEBUG
+                            if let initializationContext,
+                               var receiptDecision,
+                               receiptCreationTerminalClaim?.claim() == true
+                            {
+                                receiptDecision.outcome = .failed
+                                WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                                    correlationID: initializationContext.correlationID,
+                                    decision: receiptDecision,
+                                    terminal: true
+                                )
+                            }
+                        #endif
+                        throw error
                     }
                 }
-                if let branch = request.branch, !branch.isEmpty {
-                    args.append("-b")
-                    args.append(branch)
-                }
-                args.append(request.path.standardizedFileURL.path)
-                if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
-
-                let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
-                guard exitCode == 0 else {
-                    throw GitError(message: "git worktree add failed: \(stderr)")
-                }
-
-                await clearLayoutCache()
-                let createdPath = request.path.standardizedFileURL.path
-                let worktrees = try await listWorktrees(at: repoURL)
-                guard let created = worktrees.first(where: { $0.path == createdPath }) else {
-                    throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
-                }
-                let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
-                let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
-                    request: request,
-                    sourceRepoURL: repoURL,
-                    destinationURL: destinationURL
-                )
-
-                let targetLayout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: destinationURL)
-                let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
-                witnessSession = nil
-                if let mutationToken {
-                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .succeeded)
-                }
-                let targetAuthority: GitWorkspaceAuthoritySnapshot? = if let targetLayout,
-                                                                         let initializationContext,
-                                                                         parentEvidence != nil
+                var parentEvidence: (
+                    lease: GitWorkspaceAuthorityLease,
+                    snapshot: WorkspaceRootReusableSnapshot,
+                    baseTree: GitObjectID
+                )?
+                var witnessSession: WorkspaceRootCreationReceiptCoordinator.Session?
+                var reusableEvidence: (
+                    lease: GitWorkspaceAuthorityLease,
+                    snapshot: WorkspaceRootReusableSnapshot
+                )?
+                if let initializationContext,
+                   initializationContext.observeReceipt,
+                   reusableReceiptDestinationIsEligible,
+                   let sourceLayout
                 {
-                    try? await generationFencedAuthoritySnapshot(
-                        layout: targetLayout,
-                        prefix: initializationContext.repositoryRelativeRootPrefix
+                    #if DEBUG
+                        reusableEvidence = try? await Self.$currentReceiptParentLookupTrace.withValue(
+                            parentLookupTrace
+                        ) {
+                            try await self.reusableParentEvidence(
+                                layout: sourceLayout,
+                                prefix: initializationContext.repositoryRelativeRootPrefix
+                            )
+                        }
+                    #else
+                        reusableEvidence = try? await reusableParentEvidence(
+                            layout: sourceLayout,
+                            prefix: initializationContext.repositoryRelativeRootPrefix
+                        )
+                    #endif
+                }
+                if let initializationContext,
+                   let sourceLayout,
+                   let reusableEvidence
+                {
+                    #if DEBUG
+                        receiptDecision?.currentLeasePresent = parentLookupTrace?.currentLeasePresent
+                        receiptDecision?.currentLeaseCurrentAtSnapshotLookup = parentLookupTrace?
+                            .currentLeaseCurrentAtSnapshotLookup
+                        receiptDecision?.currentSnapshotPresent = parentLookupTrace?.currentSnapshotPresent
+                        receiptDecision?.currentSnapshotContentAddressValid = parentLookupTrace?
+                            .currentSnapshotContentAddressValid
+                        receiptDecision?.currentSnapshotSHA256 = parentLookupTrace?.currentSnapshotSHA256
+                        receiptDecision?.parentLookupRoute = parentLookupTrace?.route ?? .notAttempted
+                        receiptDecision?.parentLookupFailure = parentLookupTrace?.failure ?? .none
+                        receiptDecision?.parentAuthorityKeyMatch = Self.receiptMatch(
+                            reusableEvidence.lease.snapshot.repositoryKey
+                                == GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout)
+                        )
+                        receiptDecision?.parentPrefixMatch = Self.receiptMatch(
+                            reusableEvidence.lease.snapshot.repositoryRelativeRootPrefix
+                                == initializationContext.repositoryRelativeRootPrefix
+                        )
+                        receiptDecision?.repositoryNamespaceDigest = WorktreeStartupInstrumentation
+                            .receiptDecisionDigest(
+                                reusableEvidence.lease.snapshot.repositoryNamespace.rawValue,
+                                domain: .repositoryNamespace
+                            )
+                    #endif
+                    var targetTree = try? await resolveTreeOID(
+                        request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
+                        in: sourceLayout
+                    )
+                    #if DEBUG
+                        if consumeReceiptCreationFailureForTesting(
+                            .targetTreeUnavailable,
+                            correlationID: initializationContext.correlationID
+                        ) {
+                            targetTree = nil
+                        }
+                    #endif
+                    if let targetTree {
+                        #if DEBUG
+                            receiptDecision?.targetTreeResolution = .succeeded
+                            receiptDecision?.witnessRequested = true
+                        #endif
+                        parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
+                        witnessSession = creationReceiptCoordinator.start(destinationURL: request.path)
+                        #if DEBUG
+                            receiptDecision?.witnessStarted = witnessSession != nil
+                        #endif
+                    } else {
+                        #if DEBUG
+                            receiptDecision?.targetTreeResolution = .failed
+                        #endif
+                    }
+                }
+                #if DEBUG
+                    if parentEvidence == nil {
+                        receiptDecision?.currentLeasePresent = parentLookupTrace?.currentLeasePresent
+                        receiptDecision?.currentLeaseCurrentAtSnapshotLookup = parentLookupTrace?
+                            .currentLeaseCurrentAtSnapshotLookup
+                        receiptDecision?.currentSnapshotPresent = parentLookupTrace?.currentSnapshotPresent
+                        receiptDecision?.currentSnapshotContentAddressValid = parentLookupTrace?
+                            .currentSnapshotContentAddressValid
+                        receiptDecision?.currentSnapshotSHA256 = parentLookupTrace?.currentSnapshotSHA256
+                        receiptDecision?.parentLookupRoute = parentLookupTrace?.route ?? .notAttempted
+                        receiptDecision?.parentLookupFailure = parentLookupTrace?.failure ?? .none
+                    }
+                #endif
+
+                let mutationToken: GitWorkspaceMutationToken? = if let sourceLayout {
+                    await workspaceStateAuthority.beginMutation(
+                        repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout),
+                        kind: .worktreeCreate,
+                        correlationID: initializationContext?.correlationID
                     )
                 } else {
                     nil
                 }
-                let includeCopyHadFailures = includeCopyResult.map {
-                    !$0.skippedSummaries.isEmpty || !$0.errorSummaries.isEmpty
-                } ?? false
-                let includeCopyWasComplete = reusableReceiptDestinationIsEligible
-                    && !includeCopyHadFailures
-                    && (includeCopyResult.map {
-                        $0.copiedCount == $0.matchedCount
-                            && $0.copiedRelativePaths.count == $0.copiedCount
-                    } ?? true)
+                do {
+                    var args = ["worktree", "add"]
+                    if request.force { args.append("--force") }
+                    if request.detach { args.append("--detach") }
+                    if let lockReason = request.lockReason {
+                        args.append("--lock")
+                        if !lockReason.isEmpty {
+                            args.append("--reason")
+                            args.append(lockReason)
+                        }
+                    }
+                    if let branch = request.branch, !branch.isEmpty {
+                        args.append("-b")
+                        args.append(branch)
+                    }
+                    args.append(request.path.standardizedFileURL.path)
+                    if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                let receipt: GitWorktreeCreationReceipt? = if let initializationContext,
-                                                              let parentEvidence,
-                                                              let targetLayout,
-                                                              let targetAuthority,
-                                                              let witnessCoverage
-                {
-                    GitWorktreeCreationReceipt(
-                        id: UUID(),
-                        agentSessionID: initializationContext.agentSessionID,
-                        correlationID: initializationContext.correlationID,
-                        standardizedLogicalRootPath: initializationContext.standardizedLogicalRootPath,
-                        expectedOwnerBindingGeneration: initializationContext.expectedOwnerBindingGeneration,
-                        mutationID: mutationToken?.id ?? UUID(),
-                        parentSnapshotIdentity: parentEvidence.snapshot.identity,
-                        parentCompatibilityKey: parentEvidence.snapshot.compatibilityKey,
-                        parentAuthorityBefore: parentEvidence.lease.snapshot,
-                        targetAuthorityAfter: targetAuthority,
-                        requestedBaseRef: request.baseRef,
-                        resolvedBaseTreeOID: parentEvidence.baseTree,
-                        repositoryRelativeRootPrefix: initializationContext.repositoryRelativeRootPrefix,
-                        plannedTargetPath: request.path.standardizedFileURL.path,
-                        actualTargetPath: created.path,
-                        exactCopiedRelativePaths: includeCopyResult?.copiedRelativePaths ?? [],
-                        includeCopyHadFailures: includeCopyHadFailures,
-                        includeCopyWasComplete: includeCopyWasComplete,
-                        destinationIsAppManaged: destinationIsAppManaged,
-                        worktree: created,
-                        targetLayout: targetLayout,
-                        witnessCoverage: witnessCoverage,
-                        expiresAtUptimeNanoseconds: witnessCoverage.endedAtUptimeNanoseconds
-                            + UInt64(60 * NSEC_PER_SEC)
+                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    guard exitCode == 0 else {
+                        throw GitError(message: "git worktree add failed: \(stderr)")
+                    }
+
+                    await clearLayoutCache()
+                    let createdPath = request.path.standardizedFileURL.path
+                    let worktrees = try await listWorktrees(at: repoURL)
+                    guard let created = worktrees.first(where: { $0.path == createdPath }) else {
+                        throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
+                    }
+                    let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
+                    let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
+                        request: request,
+                        sourceRepoURL: repoURL,
+                        destinationURL: destinationURL
                     )
-                } else {
-                    nil
-                }
-                let initializationFallbackReason: WorkspaceRootSeedFallbackReason? = if initializationContext?.observeReceipt == true {
-                    if !destinationIsAppManaged {
-                        .unsupportedDestination
-                    } else if !includeCopyWasComplete {
-                        .includeCopyFailure
-                    } else if receipt == nil {
-                        .authorityUnstable
+
+                    var targetLayout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: destinationURL)
+                    #if DEBUG
+                        if consumeReceiptCreationFailureForTesting(
+                            .targetLayoutUnavailable,
+                            correlationID: initializationContext?.correlationID
+                        ) {
+                            targetLayout = nil
+                        }
+                    #endif
+                    var witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    witnessSession = nil
+                    #if DEBUG
+                        if consumeReceiptCreationFailureForTesting(
+                            .witnessCoverageInvalid,
+                            correlationID: initializationContext?.correlationID
+                        ), let coverage = witnessCoverage {
+                            witnessCoverage = GitWorktreeCreationWitnessCoverage(
+                                startedAtUptimeNanoseconds: coverage.startedAtUptimeNanoseconds,
+                                endedAtUptimeNanoseconds: coverage.endedAtUptimeNanoseconds,
+                                startEventID: coverage.startEventID,
+                                endEventID: coverage.endEventID,
+                                destinationRelativePaths: coverage.destinationRelativePaths,
+                                affectedDestinationRelativeDirectories: coverage.affectedDestinationRelativeDirectories,
+                                streamStartedBeforeMutation: coverage.streamStartedBeforeMutation,
+                                streamEndedAfterInitialization: coverage.streamEndedAfterInitialization,
+                                hadGap: true,
+                                hadDrop: coverage.hadDrop,
+                                overflowed: coverage.overflowed
+                            )
+                        }
+                        receiptDecision?.witnessFinished = witnessCoverage != nil
+                        if let witnessCoverage {
+                            receiptDecision?.witnessStartEventIDValid = witnessCoverage.startEventID > 0
+                                && witnessCoverage.startEventID != UInt64.max
+                            receiptDecision?.witnessEndEventIDValid = witnessCoverage.endEventID > 0
+                                && witnessCoverage.endEventID != UInt64.max
+                            receiptDecision?.witnessGap = witnessCoverage.hadGap
+                            receiptDecision?.witnessDrop = witnessCoverage.hadDrop
+                            receiptDecision?.witnessOverflow = witnessCoverage.overflowed
+                            receiptDecision?.witnessProvesInterval = witnessCoverage.provesCreationInterval
+                        }
+                    #endif
+                    if let mutationToken {
+                        await workspaceStateAuthority.finishMutation(mutationToken, outcome: .succeeded)
+                    }
+                    #if DEBUG
+                        let targetAuthorityWasAttempted = targetLayout != nil
+                            && initializationContext != nil
+                            && parentEvidence != nil
+                    #endif
+                    var targetAuthority: GitWorkspaceAuthoritySnapshot? = if let targetLayout,
+                                                                             let initializationContext,
+                                                                             parentEvidence != nil
+                    {
+                        try? await generationFencedAuthoritySnapshot(
+                            layout: targetLayout,
+                            prefix: initializationContext.repositoryRelativeRootPrefix
+                        )
                     } else {
                         nil
                     }
-                } else {
-                    nil
+                    #if DEBUG
+                        if consumeReceiptCreationFailureForTesting(
+                            .targetAuthorityUnavailable,
+                            correlationID: initializationContext?.correlationID
+                        ) {
+                            targetAuthority = nil
+                        }
+                        receiptDecision?.targetAuthorityCapture = if targetAuthorityWasAttempted {
+                            targetAuthority == nil ? .failed : .succeeded
+                        } else {
+                            .notAttempted
+                        }
+                    #endif
+                    let includeCopyHadFailures = includeCopyResult.map {
+                        !$0.skippedSummaries.isEmpty || !$0.errorSummaries.isEmpty
+                    } ?? false
+                    var includeCopyWasComplete = reusableReceiptDestinationIsEligible
+                        && !includeCopyHadFailures
+                        && (includeCopyResult.map {
+                            $0.copiedCount == $0.matchedCount
+                                && $0.copiedRelativePaths.count == $0.copiedCount
+                        } ?? true)
+                    #if DEBUG
+                        if consumeReceiptCreationFailureForTesting(
+                            .includeCopyIncomplete,
+                            correlationID: initializationContext?.correlationID
+                        ) {
+                            includeCopyWasComplete = false
+                        }
+                        receiptDecision?.includeCopyResultPresent = includeCopyResult != nil
+                        receiptDecision?.includeCopyComplete = includeCopyWasComplete
+                        receiptDecision?.includeCopyHadFailures = includeCopyHadFailures
+                        receiptDecision?.targetLayoutPresent = targetLayout != nil
+                        receiptDecision?.targetLayoutLinked = targetLayout?.isLinkedWorktree
+                        if let sourceLayout, let targetLayout {
+                            receiptDecision?.commonDirectoryMatch = Self.receiptMatch(
+                                sourceLayout.commonDir.standardizedFileURL.path
+                                    == targetLayout.commonDir.standardizedFileURL.path
+                            )
+                        }
+                        if let sourceDescriptor = worktrees.first(where: {
+                            $0.path == repoURL.standardizedFileURL.path
+                        }) {
+                            receiptDecision?.repositoryIDDigest = WorktreeStartupInstrumentation
+                                .receiptDecisionDigest(
+                                    sourceDescriptor.repository.repositoryID,
+                                    domain: .repositoryID
+                                )
+                            receiptDecision?.repositoryIDMatch = Self.receiptMatch(
+                                sourceDescriptor.repository.repositoryID == created.repository.repositoryID
+                            )
+                        }
+                        if let parentEvidence, let targetAuthority {
+                            receiptDecision?.repositoryNamespaceMatch = Self.receiptMatch(
+                                parentEvidence.lease.snapshot.repositoryNamespace
+                                    == targetAuthority.repositoryNamespace
+                            )
+                            receiptDecision?.targetPrefixMatch = Self.receiptMatch(
+                                targetAuthority.repositoryRelativeRootPrefix
+                                    == initializationContext?.repositoryRelativeRootPrefix
+                            )
+                            receiptDecision?.targetTreeAuthorityMatch = Self.receiptMatch(
+                                targetAuthority.treeOID == parentEvidence.baseTree
+                            )
+                        }
+                    #endif
+
+                    let receipt: GitWorktreeCreationReceipt? = if let initializationContext,
+                                                                  let parentEvidence,
+                                                                  let targetLayout,
+                                                                  let targetAuthority,
+                                                                  let witnessCoverage
+                    {
+                        GitWorktreeCreationReceipt(
+                            id: UUID(),
+                            agentSessionID: initializationContext.agentSessionID,
+                            correlationID: initializationContext.correlationID,
+                            standardizedLogicalRootPath: initializationContext.standardizedLogicalRootPath,
+                            expectedOwnerBindingGeneration: initializationContext.expectedOwnerBindingGeneration,
+                            mutationID: mutationToken?.id ?? UUID(),
+                            parentSnapshotIdentity: parentEvidence.snapshot.identity,
+                            parentCompatibilityKey: parentEvidence.snapshot.compatibilityKey,
+                            parentAuthorityBefore: parentEvidence.lease.snapshot,
+                            targetAuthorityAfter: targetAuthority,
+                            requestedBaseRef: request.baseRef,
+                            resolvedBaseTreeOID: parentEvidence.baseTree,
+                            repositoryRelativeRootPrefix: initializationContext.repositoryRelativeRootPrefix,
+                            plannedTargetPath: request.path.standardizedFileURL.path,
+                            actualTargetPath: created.path,
+                            exactCopiedRelativePaths: includeCopyResult?.copiedRelativePaths ?? [],
+                            includeCopyHadFailures: includeCopyHadFailures,
+                            includeCopyWasComplete: includeCopyWasComplete,
+                            destinationIsAppManaged: destinationIsAppManaged,
+                            worktree: created,
+                            targetLayout: targetLayout,
+                            witnessCoverage: witnessCoverage,
+                            expiresAtUptimeNanoseconds: witnessCoverage.endedAtUptimeNanoseconds
+                                + UInt64(60 * NSEC_PER_SEC)
+                        )
+                    } else {
+                        nil
+                    }
+                    let initializationFallbackReason: WorkspaceRootSeedFallbackReason? = if initializationContext?.observeReceipt == true {
+                        if !destinationIsAppManaged {
+                            .unsupportedDestination
+                        } else if !includeCopyWasComplete {
+                            .includeCopyFailure
+                        } else if receipt == nil {
+                            .authorityUnstable
+                        } else {
+                            nil
+                        }
+                    } else {
+                        nil
+                    }
+                    #if DEBUG
+                        if let initializationContext,
+                           var receiptDecision,
+                           receiptCreationTerminalClaim?.claim() == true
+                        {
+                            receiptDecision.receiptEmitted = receipt != nil
+                            receiptDecision.receiptFallbackReason = receipt?.fallbackReason()
+                            receiptDecision.initializationFallbackReason = initializationFallbackReason
+                            receiptDecision.outcome = receipt == nil ? .receiptAbsent : .receiptEmitted
+                            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                                correlationID: initializationContext.correlationID,
+                                decision: receiptDecision
+                            )
+                        }
+                    #endif
+                    return GitWorktreeCreateResult(
+                        descriptor: created,
+                        includeCopyResult: includeCopyResult,
+                        initializationReceipt: receipt,
+                        initializationFallbackReason: initializationFallbackReason
+                    )
+                } catch is CancellationError {
+                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    if let mutationToken {
+                        await workspaceStateAuthority.finishMutation(mutationToken, outcome: .cancelled)
+                    }
+                    #if DEBUG
+                        if let initializationContext,
+                           var receiptDecision,
+                           receiptCreationTerminalClaim?.claim() == true
+                        {
+                            Self.applyReceiptWitnessCoverage(witnessCoverage, to: &receiptDecision)
+                            receiptDecision.outcome = .cancelled
+                            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                                correlationID: initializationContext.correlationID,
+                                decision: receiptDecision,
+                                terminal: true
+                            )
+                        }
+                    #endif
+                    throw CancellationError()
+                } catch {
+                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    if let mutationToken {
+                        await workspaceStateAuthority.finishMutation(mutationToken, outcome: .failed)
+                    }
+                    #if DEBUG
+                        if let initializationContext,
+                           var receiptDecision,
+                           receiptCreationTerminalClaim?.claim() == true
+                        {
+                            Self.applyReceiptWitnessCoverage(witnessCoverage, to: &receiptDecision)
+                            receiptDecision.outcome = .failed
+                            WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                                correlationID: initializationContext.correlationID,
+                                decision: receiptDecision,
+                                terminal: true
+                            )
+                        }
+                    #endif
+                    throw error
                 }
-                return GitWorktreeCreateResult(
-                    descriptor: created,
-                    includeCopyResult: includeCopyResult,
-                    initializationReceipt: receipt,
-                    initializationFallbackReason: initializationFallbackReason
-                )
-            } catch is CancellationError {
-                if let witnessSession { _ = creationReceiptCoordinator.finish(witnessSession) }
-                if let mutationToken {
-                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .cancelled)
-                }
-                throw CancellationError()
-            } catch {
-                if let witnessSession { _ = creationReceiptCoordinator.finish(witnessSession) }
-                if let mutationToken {
-                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .failed)
-                }
-                throw error
             }
+        } catch {
+            #if DEBUG
+                if let initializationContext,
+                   var receiptDecision = initialReceiptDecision,
+                   receiptCreationTerminalClaim?.claim() == true
+                {
+                    receiptDecision.outcome = error is CancellationError ? .cancelled : .failed
+                    WorktreeStartupInstrumentation.recordReceiptCreationDecision(
+                        correlationID: initializationContext.correlationID,
+                        decision: receiptDecision,
+                        terminal: true
+                    )
+                }
+            #endif
+            throw error
         }
     }
 
@@ -549,25 +982,73 @@ actor GitService {
         layout: GitRepositoryLayout,
         prefix: GitRepositoryRelativeRootPrefix
     ) async throws -> (lease: GitWorkspaceAuthorityLease, snapshot: WorkspaceRootReusableSnapshot)? {
-        if let lease = try? await currentAuthorityLease(layout: layout, prefix: prefix),
-           let snapshot = await workspaceStateAuthority.currentReusableSnapshot(capturedUsing: lease)
-        {
-            return (lease, snapshot)
+        #if DEBUG
+            let diagnosticTrace = Self.currentReceiptParentLookupTrace
+        #endif
+        let currentLease = try? await currentAuthorityLease(layout: layout, prefix: prefix)
+        #if DEBUG
+            diagnosticTrace?.currentLeasePresent = currentLease != nil
+            if let currentLease {
+                diagnosticTrace?.currentLeaseCurrentAtSnapshotLookup = await workspaceStateAuthority.isCurrent(
+                    currentLease
+                )
+            }
+        #endif
+        if let currentLease {
+            let currentSnapshot = await workspaceStateAuthority.currentReusableSnapshot(capturedUsing: currentLease)
+            #if DEBUG
+                diagnosticTrace?.currentSnapshotPresent = currentSnapshot != nil
+                diagnosticTrace?.currentSnapshotContentAddressValid = currentSnapshot?.hasValidContentAddress()
+                diagnosticTrace?.currentSnapshotSHA256 = currentSnapshot?.identity.sha256
+            #endif
+            if let currentSnapshot {
+                #if DEBUG
+                    diagnosticTrace?.route = .currentAlias
+                    diagnosticTrace?.failure = .none
+                #endif
+                return (currentLease, currentSnapshot)
+            }
+            #if DEBUG
+                diagnosticTrace?.failure = .currentSnapshotUnavailable
+            #endif
+        } else {
+            #if DEBUG
+                diagnosticTrace?.currentLeaseCurrentAtSnapshotLookup = false
+                diagnosticTrace?.failure = .currentLeaseUnavailable
+            #endif
         }
 
         var discoveryObservation: GitWorkspaceMetadataMonitor.RetainToken?
         var replacementObservation: GitWorkspaceMetadataMonitor.RetainToken?
         do {
-            let discoveryToken = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+            let discoveryToken: GitWorkspaceMetadataMonitor.RetainToken
+            do {
+                discoveryToken = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+            } catch {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryObservationUnavailable
+                #endif
+                throw error
+            }
             discoveryObservation = discoveryToken
             let discovery = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
             let discoveredExternalPaths = Self.canonicalPathSet(
                 discovery.metadata.resolvedExternalAuthorityPaths
             )
-            let observation = try await workspaceStateAuthority.retainMetadataObservation(
-                for: layout,
-                additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
-            )
+            let observation: GitWorkspaceMetadataMonitor.RetainToken
+            do {
+                observation = try await workspaceStateAuthority.retainMetadataObservation(
+                    for: layout,
+                    additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
+                )
+            } catch {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryObservationUnavailable
+                #endif
+                throw error
+            }
             replacementObservation = observation
             await workspaceStateAuthority.releaseMetadataObservation(discoveryToken)
             discoveryObservation = nil
@@ -580,18 +1061,32 @@ actor GitService {
             switch await workspaceStateAuthority.beginCollection(scopeKey: scope) {
             case let .success(value): captureToken = value
             case .failure:
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryCollectionUnavailable
+                #endif
                 await workspaceStateAuthority.releaseMetadataObservation(observation)
                 return nil
             }
             let captured = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
-            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths,
-                  await workspaceStateAuthority.metadataObservationIsCurrent(
-                      observation,
-                      for: layout,
-                      additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
-                      expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
-                  )
-            else {
+            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths else {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .externalAuthorityChanged
+                #endif
+                await workspaceStateAuthority.releaseMetadataObservation(observation)
+                return nil
+            }
+            guard await workspaceStateAuthority.metadataObservationIsCurrent(
+                observation,
+                for: layout,
+                additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
+                expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
+            ) else {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryObservationStale
+                #endif
                 await workspaceStateAuthority.releaseMetadataObservation(observation)
                 return nil
             }
@@ -599,10 +1094,18 @@ actor GitService {
             switch await workspaceStateAuthority.install(captured.snapshot, capturedUsing: captureToken) {
             case let .success(value): lease = value
             case .failure:
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryInstallFailed
+                #endif
                 await workspaceStateAuthority.releaseMetadataObservation(observation)
                 return nil
             }
             guard let snapshot = await workspaceStateAuthority.reusableSnapshot(compatibleWith: captured.snapshot) else {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .compatibleSnapshotMissing
+                #endif
                 await workspaceStateAuthority.releaseMetadataObservation(observation)
                 return nil
             }
@@ -611,9 +1114,25 @@ actor GitService {
                 snapshot,
                 capturedUsing: lease,
                 observationToken: observation
-            ) else { return nil }
+            ) else {
+                #if DEBUG
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .recoveryAdmissionFailed
+                #endif
+                return nil
+            }
+            #if DEBUG
+                diagnosticTrace?.route = .recovered
+                diagnosticTrace?.failure = .none
+            #endif
             return (lease, snapshot)
         } catch {
+            #if DEBUG
+                if diagnosticTrace?.route != .failed {
+                    diagnosticTrace?.route = .failed
+                    diagnosticTrace?.failure = .unexpected
+                }
+            #endif
             if let discoveryObservation {
                 await workspaceStateAuthority.releaseMetadataObservation(discoveryObservation)
             }

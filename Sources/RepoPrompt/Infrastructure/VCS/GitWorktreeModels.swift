@@ -510,6 +510,11 @@ actor GitWorktreeMutationCoordinator {
 
     private var busyKeys: Set<String> = []
     private var waitersByKey: [String: [Waiter]] = [:]
+    #if DEBUG
+        private var queuedWaiterObservationContinuationsByKey: [
+            String: [CheckedContinuation<Void, Never>]
+        ] = [:]
+    #endif
 
     func withLock<T: Sendable>(
         key: String,
@@ -537,6 +542,13 @@ actor GitWorktreeMutationCoordinator {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 waitersByKey[key, default: []].append(Waiter(id: waiterID, continuation: continuation))
+                #if DEBUG
+                    let observationContinuations = queuedWaiterObservationContinuationsByKey
+                        .removeValue(forKey: key) ?? []
+                    for observationContinuation in observationContinuations {
+                        observationContinuation.resume()
+                    }
+                #endif
             }
         } onCancel: {
             Task { await self.cancelWaiter(key: key, id: waiterID) }
@@ -564,4 +576,13 @@ actor GitWorktreeMutationCoordinator {
         waitersByKey[key] = waiters.isEmpty ? nil : waiters
         waiter.continuation.resume(throwing: CancellationError())
     }
+
+    #if DEBUG
+        func waitForQueuedWaiterForTesting(key: String) async {
+            if waitersByKey[key]?.isEmpty == false { return }
+            await withCheckedContinuation { continuation in
+                queuedWaiterObservationContinuationsByKey[key, default: []].append(continuation)
+            }
+        }
+    #endif
 }
