@@ -17,48 +17,69 @@ extension FileSystemService {
         allowRepositoryMetadataAtRoot: Bool = true,
         limits: WorkspaceRootSeedPlannerLimits
     ) async throws -> [String: WorkspaceRootSeedVerificationFact] {
-        var candidates = Set<String>()
-        candidates.reserveCapacity(relativePaths.count)
+        guard WorkspaceRootByteExactPathSet(relativePaths) != nil,
+              WorkspaceRootByteExactPathSet(affectedDirectories) != nil
+        else { throw WorkspaceRootSeedVerificationError.invalidPath }
+        var candidatesByKey: [WorkspaceRootByteExactPathKey: String] = [:]
+        var canonicalCandidateKeys: [String: WorkspaceRootByteExactPathKey] = [:]
+        candidatesByKey.reserveCapacity(relativePaths.count)
+
+        func insertCandidate(_ path: String) throws {
+            let key = WorkspaceRootByteExactPathKey(path)
+            if let existing = canonicalCandidateKeys[path], existing != key {
+                throw WorkspaceRootSeedVerificationError.invalidPath
+            }
+            candidatesByKey[key] = path
+            canonicalCandidateKeys[path] = key
+        }
+
         for path in relativePaths {
             let standardized = StandardizedPath.relative(path)
             guard !standardized.isEmpty,
-                  standardized == path,
+                  WorkspaceRootByteExactPathKey(standardized) == WorkspaceRootByteExactPathKey(path),
                   standardized.utf8.count <= 16 * 1024,
                   standardized.split(separator: "/").count <= 512,
                   !standardized.hasPrefix("../"),
                   standardized != ".git",
                   !standardized.hasPrefix(".git/")
             else { throw WorkspaceRootSeedVerificationError.invalidPath }
-            candidates.insert(standardized)
+            try insertCandidate(standardized)
         }
 
         let fileManager = FileManager.default
-        var proofDirectories = affectedDirectories
-        for relativePath in candidates {
+        var proofDirectoryValues = Array(affectedDirectories)
+        for relativePath in candidatesByKey.values {
             try Task.checkCancellation()
             let absolutePath = rootURL.appendingPathComponent(relativePath).path
             var value = stat()
             if lstat(absolutePath, &value) == 0 {
                 if value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
-                    proofDirectories.insert(relativePath)
+                    proofDirectoryValues.append(relativePath)
                 }
             } else if errno != ENOENT, errno != ENOTDIR {
                 throw CocoaError(.fileReadUnknown)
             }
         }
-        guard proofDirectories.count <= limits.maximumVerificationPathCount else {
+        let standardizedProofDirectories = proofDirectoryValues.map(StandardizedPath.relative)
+        guard let exactProofDirectories = WorkspaceRootByteExactPathSet(standardizedProofDirectories) else {
+            throw WorkspaceRootSeedVerificationError.invalidPath
+        }
+        guard exactProofDirectories.count <= limits.maximumVerificationPathCount else {
             throw WorkspaceRootSeedVerificationError.limitExceeded
         }
 
-        let sortedProofDirectories = proofDirectories.map(StandardizedPath.relative).sorted {
+        let sortedProofDirectories = exactProofDirectories.sortedKeys.map(\.value).sorted {
             let lhsDepth = $0.split(separator: "/").count
             let rhsDepth = $1.split(separator: "/").count
-            return lhsDepth == rhsDepth ? $0 < $1 : lhsDepth < rhsDepth
+            return lhsDepth == rhsDepth
+                ? WorkspaceRootByteExactPathKey($0) < WorkspaceRootByteExactPathKey($1)
+                : lhsDepth < rhsDepth
         }
         var disjointProofDirectories: [String] = []
         for directory in sortedProofDirectories {
+            let directoryKey = WorkspaceRootByteExactPathKey(directory)
             if disjointProofDirectories.contains(where: { ancestor in
-                ancestor.isEmpty || directory == ancestor || directory.hasPrefix(ancestor + "/")
+                directoryKey.isSameOrDescendant(of: WorkspaceRootByteExactPathKey(ancestor))
             }) {
                 continue
             }
@@ -68,7 +89,7 @@ extension FileSystemService {
         for directory in disjointProofDirectories {
             try Task.checkCancellation()
             let standardized = StandardizedPath.relative(directory)
-            guard standardized == directory,
+            guard WorkspaceRootByteExactPathKey(standardized) == WorkspaceRootByteExactPathKey(directory),
                   standardized.utf8.count <= 16 * 1024,
                   standardized.split(separator: "/").count <= 512,
                   !standardized.hasPrefix("../"),
@@ -112,20 +133,21 @@ extension FileSystemService {
                 if values?.isSymbolicLink == true {
                     enumerator.skipDescendants()
                 }
-                candidates.insert(relative)
-                if candidates.count > limits.maximumVerificationPathCount {
+                try insertCandidate(relative)
+                if candidatesByKey.count > limits.maximumVerificationPathCount {
                     throw WorkspaceRootSeedVerificationError.limitExceeded
                 }
             }
             guard !enumerationFailed else { throw CocoaError(.fileReadUnknown) }
         }
-        guard candidates.count <= limits.maximumVerificationPathCount else {
+        guard candidatesByKey.count <= limits.maximumVerificationPathCount else {
             throw WorkspaceRootSeedVerificationError.limitExceeded
         }
 
         var facts: [String: WorkspaceRootSeedVerificationFact] = [:]
-        facts.reserveCapacity(candidates.count)
-        for relativePath in candidates.sorted() {
+        facts.reserveCapacity(candidatesByKey.count)
+        for pathKey in candidatesByKey.keys.sorted() {
+            let relativePath = pathKey.value
             try Task.checkCancellation()
             let absolutePath = rootURL.appendingPathComponent(relativePath).path
             var value = stat()
@@ -148,15 +170,20 @@ extension FileSystemService {
                 }
             }
             let isDirectory = kind == .directory
-            facts[relativePath] = await WorkspaceRootSeedVerificationFact(
+            let isIgnored = kind == .missing
+                ? false
+                : await isIgnoredHierarchical(
+                    relativePath: relativePath,
+                    isDirectory: isDirectory
+                )
+            let isIncludedInOrdinaryCrawl = isDirectory
+                ? await directoryIsIncludedInOrdinaryCrawl(relativePath: relativePath)
+                : false
+            facts[relativePath] = WorkspaceRootSeedVerificationFact(
                 relativePath: relativePath,
                 kind: kind,
-                isIgnored: kind == .missing
-                    ? false
-                    : isIgnoredHierarchical(
-                        relativePath: relativePath,
-                        isDirectory: isDirectory
-                    )
+                isIgnored: isIgnored,
+                isIncludedInOrdinaryCrawl: isIncludedInOrdinaryCrawl
             )
         }
         return facts
@@ -209,8 +236,8 @@ extension FileSystemService {
             let childRel = relFolder.isEmpty ? name : "\(relFolder)/\(name)"
             let isDirEntry = entry.isDir
 
-            // Skip directory symlinks if configured
-            if entry.isSym, skipSymlinks, isDirEntry {
+            // Skip all symlinks if configured
+            if entry.isSym, skipSymlinks {
                 continue
             }
 
@@ -459,7 +486,7 @@ extension FileSystemService {
             let childRel = folderRelPath.isEmpty ? name : "\(folderRelPath)/\(name)"
             let comps = pathCompsCache.components(for: childRel)
             let isDirEntry = entry.isDir
-            if entry.isSym, skipSymlinks, isDirEntry {
+            if entry.isSym, skipSymlinks {
                 continue
             }
             var ignoredAsDir = false
@@ -884,9 +911,9 @@ extension FileSystemService {
                 continue
             }
 
-            if isDirEntry {
-                if entry.isSym, skipSymlinks { continue }
+            if entry.isSym, skipSymlinks { continue }
 
+            if isDirEntry {
                 folders.append(
                     FSItemDTO(
                         relativePath: relativePath,
@@ -1125,7 +1152,7 @@ extension FileSystemService {
                     _ = fs.fileExists(atPath: url.path, isDirectory: &isDirFlag)
 
                     let isSym = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
-                    if skipSymlinks && isDirFlag.boolValue && isSym {
+                    if skipSymlinks && isSym {
                         continue
                     }
 

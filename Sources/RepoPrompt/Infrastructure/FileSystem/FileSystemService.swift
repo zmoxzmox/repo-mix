@@ -218,6 +218,7 @@ actor FileSystemService {
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
+    var catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
 
     var ignoreCacheStore = IgnoreCacheStore()
 
@@ -245,6 +246,7 @@ actor FileSystemService {
 
     /// Monotonic revision incremented each time ignore files change
     var ignoreRulesRevision: UInt64 = 0
+    var pendingIgnoreRulesRebuildCount = 0
     /// Directories affected by ignore file changes since last consumption
     var pendingIgnoreChangeDirs: Set<String> = []
 
@@ -351,11 +353,21 @@ actor FileSystemService {
             try? await Task.sleep(nanoseconds: nanoseconds)
         }
 
-        // Load fresh ignore rules from manager, no caching done by manager
-        ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+        // Load fresh ignore rules and the exact global-policy provenance together.
+        let resolvedIgnoreRules = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
             for: path,
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore
+        )
+        ignoreRules = resolvedIgnoreRules.rules
+        catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+            schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+            mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+            globalIgnoreDefaultsDigest: resolvedIgnoreRules.globalIgnoreDefaultsDigest,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            skipSymlinks: skipSymlinks
         )
 
         // Initialize root-level ignore rules in per-folder cache
@@ -435,9 +447,20 @@ actor FileSystemService {
                 visitedItems = items
             }
 
-            // Use test ignore rules or load fresh ones
+            // Use test ignore rules or load fresh rules with their exact global-policy provenance.
             if let rules = testIgnoreRules {
                 ignoreRules = rules
+                catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+                    schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+                    mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+                    globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
+                        for: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+                    ),
+                    respectRepoIgnore: respectRepoIgnore,
+                    respectCursorignore: respectCursorignore,
+                    enableHierarchicalIgnores: enableHierarchicalIgnores,
+                    skipSymlinks: skipSymlinks
+                )
             } else {
                 #if DEBUG
                     // Pass the fileManagerOverride to IgnoreRulesManager if we have one
@@ -445,10 +468,20 @@ actor FileSystemService {
                         await IgnoreRulesManager.shared.setFileManagerOverride(override)
                     }
                 #endif
-                ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+                let resolvedIgnoreRules = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
                     for: path,
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore
+                )
+                ignoreRules = resolvedIgnoreRules.rules
+                catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+                    schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+                    mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+                    globalIgnoreDefaultsDigest: resolvedIgnoreRules.globalIgnoreDefaultsDigest,
+                    respectRepoIgnore: respectRepoIgnore,
+                    respectCursorignore: respectCursorignore,
+                    enableHierarchicalIgnores: enableHierarchicalIgnores,
+                    skipSymlinks: skipSymlinks
                 )
             }
 

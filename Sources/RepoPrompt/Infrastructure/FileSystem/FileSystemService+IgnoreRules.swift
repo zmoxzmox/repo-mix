@@ -34,11 +34,12 @@ extension FileSystemService {
             perFolderIgnoreCache.removeAll()
             clearNoIgnoreFilesCache()
             do {
-                ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+                let resolved = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
                     for: path,
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore
                 )
+                installResolvedIgnoreRules(resolved)
                 cacheIgnoreRules(ignoreRules, for: "")
                 watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
             } catch {
@@ -53,11 +54,12 @@ extension FileSystemService {
             perFolderIgnoreCache.removeAll()
             clearNoIgnoreFilesCache()
             do {
-                ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+                let resolved = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
                     for: path,
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore
                 )
+                installResolvedIgnoreRules(resolved)
                 cacheIgnoreRules(ignoreRules, for: "")
                 watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
             } catch {
@@ -87,6 +89,35 @@ extension FileSystemService {
         watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
     }
 
+    private func installResolvedIgnoreRules(
+        _ resolved: IgnoreRulesManager.ResolvedIgnoreRules
+    ) {
+        ignoreRules = resolved.rules
+        catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+            schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+            mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+            globalIgnoreDefaultsDigest: resolved.globalIgnoreDefaultsDigest,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            skipSymlinks: skipSymlinks
+        )
+        ignoreRulesRevision &+= 1
+    }
+
+    private func refreshCatalogPolicyIdentityForConfigurationChange() {
+        catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+            schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+            mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+            globalIgnoreDefaultsDigest: catalogPolicyIdentity.globalIgnoreDefaultsDigest,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            skipSymlinks: skipSymlinks
+        )
+        ignoreRulesRevision &+= 1
+    }
+
     // MARK: - New prefix-based ignore check (cached in this actor)
 
     func cachedIgnoreRules(for directoryPath: String) -> IgnoreRules? {
@@ -101,6 +132,29 @@ extension FileSystemService {
             isDirectory: isDirectory,
             ignoreRules: ignoreRules
         )
+    }
+
+    func directoryIsIncludedInOrdinaryCrawl(relativePath: String) async -> Bool {
+        let rulesSnapshot: IgnoreRulesSnapshot
+        if enableHierarchicalIgnores {
+            let parentPath = parentDirectory(of: relativePath)
+            guard let rules = try? await FileSystemRulesProvider(service: self)
+                .rulesForDirectory(parentPath)
+            else { return false }
+            rulesSnapshot = rules.snapshot()
+        } else {
+            rulesSnapshot = ignoreRules.snapshot()
+        }
+
+        var localCache: [IgnoreCacheStore.PathKey: Bool] = [:]
+        let components = pathCompsCache.components(for: relativePath)
+        let ignored = IgnoreCacheStore.isIgnored(
+            components: components,
+            isDirectory: true,
+            ignoreRules: rulesSnapshot,
+            localCache: &localCache
+        )
+        return !ignored || rulesSnapshot.requiresTraversal(for: relativePath)
     }
 
     /// Check if a path is ignored using hierarchical rules (for delta events)
@@ -234,23 +288,38 @@ extension FileSystemService {
 
     public func updateRespectRepoIgnore(_ newValue: Bool) async throws {
         guard respectRepoIgnore != newValue else { return }
+        let resolved = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
+            for: path,
+            respectRepoIgnore: newValue,
+            respectCursorignore: respectCursorignore
+        )
         respectRepoIgnore = newValue
-        try await refreshIgnoreRules()
+        installResolvedIgnoreRules(resolved)
+        invalidateAllIgnoreCaches()
     }
 
     public func updateRespectCursorignore(_ newValue: Bool) async throws {
         guard respectCursorignore != newValue else { return }
+        let resolved = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
+            for: path,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: newValue
+        )
         respectCursorignore = newValue
-        try await refreshIgnoreRules()
+        installResolvedIgnoreRules(resolved)
+        invalidateAllIgnoreCaches()
     }
 
     public func updateSkipSymlinks(_ newValue: Bool) {
+        guard skipSymlinks != newValue else { return }
         skipSymlinks = newValue
+        refreshCatalogPolicyIdentityForConfigurationChange()
     }
 
     public func updateEnableHierarchicalIgnores(_ newValue: Bool) {
         guard enableHierarchicalIgnores != newValue else { return }
         enableHierarchicalIgnores = newValue
+        refreshCatalogPolicyIdentityForConfigurationChange()
         invalidateAllIgnoreCaches()
         if !newValue {
             // Clear the per-folder cache when disabling
@@ -260,11 +329,12 @@ extension FileSystemService {
 
     public func refreshIgnoreRules() async throws {
         let earlyFilterGeneration = watcherEarlyFilter.invalidate()
-        ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+        let resolved = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
             for: path,
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore
         )
+        installResolvedIgnoreRules(resolved)
         invalidateAllIgnoreCaches()
         watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
     }

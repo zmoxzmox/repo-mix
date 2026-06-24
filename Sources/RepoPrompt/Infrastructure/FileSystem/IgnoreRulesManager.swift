@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin // for stat()
@@ -105,6 +106,11 @@ enum IgnoreSettingsDefaults {
 
 /// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
 actor IgnoreRulesManager {
+    struct ResolvedIgnoreRules {
+        let rules: IgnoreRules
+        let globalIgnoreDefaultsDigest: String
+    }
+
     static let shared = IgnoreRulesManager()
     private let fileManager = FileManager.default
 
@@ -168,11 +174,11 @@ actor IgnoreRulesManager {
     }
 
     /// Loads .gitignore and/or .repo_ignore content from disk, merges them into a single IgnoreRules.
-    func getIgnoreRules(
+    func resolvedIgnoreRules(
         for path: String,
         respectRepoIgnore: Bool = true,
         respectCursorignore: Bool = true
-    ) async throws -> IgnoreRules {
+    ) async throws -> ResolvedIgnoreRules {
         let ignoreRules = IgnoreRules()
 
         let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
@@ -203,7 +209,28 @@ actor IgnoreRulesManager {
             }
         }
 
-        return ignoreRules
+        return ResolvedIgnoreRules(
+            rules: ignoreRules,
+            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent)
+        )
+    }
+
+    func getIgnoreRules(
+        for path: String,
+        respectRepoIgnore: Bool = true,
+        respectCursorignore: Bool = true
+    ) async throws -> IgnoreRules {
+        try await resolvedIgnoreRules(
+            for: path,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore
+        ).rules
+    }
+
+    nonisolated static func globalIgnoreDefaultsDigest(for content: String) -> String {
+        Data(SHA256.hash(data: Data(content.utf8)))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func loadFileContent(at path: String) async throws -> String {

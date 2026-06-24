@@ -150,6 +150,47 @@ extension FileSystemService {
         return isIgnored ? .ineligible(.ignored) : .eligible
     }
 
+    func currentWorkspaceRootCatalogPolicyIdentity() -> WorkspaceRootCatalogPolicyIdentity {
+        catalogPolicyIdentity
+    }
+
+    func catalogProjectionEvidence(
+        forCommittedRegularPaths paths: WorkspaceRootByteExactPathSet
+    ) async -> WorkspaceRootCatalogProjectionEvidence? {
+        guard pendingIgnoreRulesRebuildCount == 0 else { return nil }
+        let startingRevision = ignoreRulesRevision
+        let startingIdentity = catalogPolicyIdentity
+        var dispositions: [WorkspaceRootByteExactPathKey: WorkspaceRootCommittedRegularProjectionDisposition] = [:]
+        dispositions.reserveCapacity(paths.count)
+
+        for pathKey in paths.sortedKeys {
+            let relativePath = pathKey.value
+            guard WorkspaceRootByteExactPathKey(StandardizedPath.relative(relativePath)) == pathKey else {
+                dispositions[pathKey] = .ineligible(.invalidRelativePath)
+                continue
+            }
+            let eligibility = await catalogRegularFileEligibility(relativePath: relativePath)
+            switch eligibility {
+            case .eligible:
+                dispositions[pathKey] = .searchableRegularFile
+            case .ineligible(.ignored):
+                dispositions[pathKey] = .policyIgnoredRegularFile
+            case let .ineligible(reason):
+                dispositions[pathKey] = .ineligible(reason)
+            }
+        }
+
+        guard pendingIgnoreRulesRebuildCount == 0,
+              startingRevision == ignoreRulesRevision,
+              startingIdentity == catalogPolicyIdentity
+        else { return nil }
+        return WorkspaceRootCatalogProjectionEvidence(
+            policyIdentity: startingIdentity,
+            dispositionsByRelativePath: dispositions,
+            ignoreRulesRevision: startingRevision
+        )
+    }
+
     func registerExplicitlyManagedRegularFile(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
         let eligibility = await catalogRegularFileEligibility(relativePath: rawRelativePath)
         switch eligibility {
@@ -1580,14 +1621,22 @@ extension FileSystemService {
             ignoreRulesRevision &+= 1
             pendingIgnoreChangeDirs.formUnion(changedIgnoreDirs)
             let dirs = changedIgnoreDirs // capture before escaping
+            pendingIgnoreRulesRebuildCount += 1
             #if DEBUG
                 if isTestMode {
                     await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                    pendingIgnoreRulesRebuildCount -= 1
                 } else {
-                    Task { await rebuildPerFolderIgnoreCache(changedDirs: dirs) }
+                    Task {
+                        await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                        pendingIgnoreRulesRebuildCount -= 1
+                    }
                 }
             #else
-                Task { await rebuildPerFolderIgnoreCache(changedDirs: dirs) }
+                Task {
+                    await rebuildPerFolderIgnoreCache(changedDirs: dirs)
+                    pendingIgnoreRulesRebuildCount -= 1
+                }
             #endif
         }
 

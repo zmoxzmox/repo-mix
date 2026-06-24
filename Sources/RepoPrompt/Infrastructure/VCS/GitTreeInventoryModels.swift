@@ -41,8 +41,23 @@ struct GitRepositoryRelativeRootPrefix: Hashable {
         self.value = value
     }
 
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.value.utf8.elementsEqual(rhs.value.utf8)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(value.utf8.count)
+        for byte in value.utf8 {
+            hasher.combine(byte)
+        }
+    }
+
     func contains(_ repositoryRelativePath: String) -> Bool {
-        value.isEmpty || repositoryRelativePath == value || repositoryRelativePath.hasPrefix(value + "/")
+        let pathBytes = Array(repositoryRelativePath.utf8)
+        let prefixBytes = Array(value.utf8)
+        guard !prefixBytes.isEmpty else { return true }
+        if pathBytes == prefixBytes { return true }
+        return pathBytes.starts(with: prefixBytes + [UInt8(ascii: "/")])
     }
 }
 

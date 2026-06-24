@@ -2775,6 +2775,7 @@ actor WorkspaceFileContextStore {
                 baseRelativeFilePaths: plan.baseRelativeFilePaths,
                 changedRelativeFilePaths: replayChanged,
                 tombstonedBaseRelativeFilePaths: plan.baseRelativeFilePaths.subtracting(replay.relativeFilePaths),
+                policyIgnoredTrackedRelativeFilePaths: plan.policyIgnoredTrackedRelativeFilePaths,
                 verifiedPathCount: plan.verifiedPathCount
             )
             pendingSeededRootsByID[pendingID]?.phase = .preparingShard
@@ -3458,10 +3459,21 @@ actor WorkspaceFileContextStore {
                             fallback: reason
                         )
                     case let .planned(plan):
-                        let authoritativeFiles = Set(state.fileIDsByRelativePath.keys)
-                        let authoritativeFolders = Set(state.folderIDsByRelativePath.keys.filter { !$0.isEmpty })
-                        let matches = authoritativeFiles == plan.relativeFilePaths
-                            && authoritativeFolders == plan.relativeFolderPaths
+                        let authoritativeFiles = state.fileIDsByRelativePath.compactMap { relativePath, fileID in
+                            isDiscoverableFileID(fileID) ? relativePath : nil
+                        }
+                        let authoritativeFolders = state.folderIDsByRelativePath.compactMap { relativePath, folderID in
+                            !relativePath.isEmpty && isDiscoverableFolderID(folderID) ? relativePath : nil
+                        }
+                        let authoritativeExactFiles = WorkspaceRootByteExactPathSet(authoritativeFiles)
+                        let plannedExactFiles = WorkspaceRootByteExactPathSet(plan.relativeFilePaths)
+                        let authoritativeExactFolders = WorkspaceRootByteExactPathSet(authoritativeFolders)
+                        let plannedExactFolders = WorkspaceRootByteExactPathSet(plan.relativeFolderPaths)
+                        let matches = authoritativeExactFiles != nil
+                            && authoritativeExactFiles == plannedExactFiles
+                            && authoritativeExactFolders != nil
+                            && authoritativeExactFolders == plannedExactFolders
+                            && plan.policyIgnoredTrackedRelativeFilePaths.isDisjoint(with: plan.relativeFilePaths)
                         WorktreeStartupInstrumentation.recordInventoryComparison(matched: matches)
                         if matches,
                            let snapshot = await workspaceStateAuthority.reusableSnapshot(
@@ -4779,11 +4791,21 @@ actor WorkspaceFileContextStore {
             return .failed(.init(stage: .initialCurrentness, cause: cause))
         }
         let rootURL = URL(fileURLWithPath: expectedStandardizedPath).standardizedFileURL
-        let authoritativeRelativeFilePaths = Set(state.fileIDsByRelativePath.keys)
+        let authoritativeRelativeFilePaths = state.fileIDsByRelativePath.compactMap { relativePath, fileID in
+            isDiscoverableFileID(fileID) ? relativePath : nil
+        }
+        let service = state.service
+        let catalogPolicyIdentity = await service.currentWorkspaceRootCatalogPolicyIdentity()
 
         let result = await rootReusableSnapshotCoordinator.observeAuthoritativeFullLoad(
             rootURL: rootURL,
             authoritativeRelativeFilePaths: authoritativeRelativeFilePaths,
+            catalogPolicyIdentity: catalogPolicyIdentity,
+            catalogEvidenceProvider: { missingCommittedRegularPaths in
+                await service.catalogProjectionEvidence(
+                    forCommittedRegularPaths: missingCommittedRegularPaths
+                )
+            },
             currentnessValidator: { [weak self] in
                 guard let self else { return .stale(.loadedRootOwnerStale) }
                 return await loadedRootReusableSnapshotCurrentness(currentness)

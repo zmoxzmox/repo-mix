@@ -7,6 +7,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
     }
 
     typealias CurrentnessValidator = @Sendable () async -> CurrentnessValidation
+    typealias CatalogEvidenceProvider = @Sendable (WorkspaceRootByteExactPathSet) async -> WorkspaceRootCatalogProjectionEvidence?
 
     enum ObservationFailureStage: String, Equatable {
         case loadedRootValidation = "loaded_root_validation"
@@ -17,6 +18,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         case collection
         case capturedAuthority = "captured_authority"
         case treeInventory = "tree_inventory"
+        case catalogClassification = "catalog_classification"
         case admissionPreparation = "admission_preparation"
         case preparedAdmissionCurrentness = "prepared_admission_currentness"
         case admissionCommit = "admission_commit"
@@ -90,9 +92,14 @@ actor WorkspaceRootReusableSnapshotCoordinator {
 
     func observeAuthoritativeFullLoad(
         rootURL: URL,
-        authoritativeRelativeFilePaths: Set<String>,
+        authoritativeRelativeFilePaths: some Sequence<String>,
+        catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity = .canonicalDefaults,
+        catalogEvidenceProvider: CatalogEvidenceProvider? = nil,
         currentnessValidator: @escaping CurrentnessValidator = { .current }
     ) async -> ObservationResult {
+        guard let authoritativeExactPaths = WorkspaceRootByteExactPathSet(authoritativeRelativeFilePaths) else {
+            return .catalogMismatch
+        }
         if let failure = await Self.currentnessFailure(
             stage: .initialCurrentness,
             validator: currentnessValidator
@@ -227,6 +234,60 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.releaseMetadataObservation(observation)
                 return failure
             }
+
+            guard let committedRegularRelativePaths = Self.committedRegularRelativePaths(in: tree) else {
+                await authority.releaseMetadataObservation(observation)
+                return .catalogMismatch
+            }
+            let missingCommittedRegularPaths = committedRegularRelativePaths
+                .subtracting(authoritativeExactPaths)
+            guard let emptyExactPaths = WorkspaceRootByteExactPathSet([String]()) else {
+                await authority.releaseMetadataObservation(observation)
+                return .catalogMismatch
+            }
+            var policyIgnoredCommittedRegularPaths = emptyExactPaths
+            if !missingCommittedRegularPaths.isEmpty {
+                activeStage = .catalogClassification
+                if let failure = await Self.currentnessFailure(
+                    stage: .catalogClassification,
+                    validator: currentnessValidator
+                ) {
+                    await authority.releaseMetadataObservation(observation)
+                    return failure
+                }
+                guard let catalogEvidenceProvider else {
+                    await authority.releaseMetadataObservation(observation)
+                    return .catalogMismatch
+                }
+                guard let evidence = await catalogEvidenceProvider(missingCommittedRegularPaths) else {
+                    await authority.releaseMetadataObservation(observation)
+                    return .failed(.init(stage: .catalogClassification, cause: .loadedRootCatalogStale))
+                }
+                guard evidence.policyIdentity == catalogPolicyIdentity else {
+                    await authority.releaseMetadataObservation(observation)
+                    return .failed(.init(stage: .catalogClassification, cause: .loadedRootCatalogStale))
+                }
+                guard Set(evidence.dispositionsByRelativePath.keys) == missingCommittedRegularPaths.keys,
+                      evidence.dispositionsByRelativePath.values.allSatisfy({ $0 == .policyIgnoredRegularFile })
+                else {
+                    await authority.releaseMetadataObservation(observation)
+                    return .catalogMismatch
+                }
+                policyIgnoredCommittedRegularPaths = missingCommittedRegularPaths
+                if let failure = await Self.currentnessFailure(
+                    stage: .catalogClassification,
+                    validator: currentnessValidator
+                ) {
+                    await authority.releaseMetadataObservation(observation)
+                    return failure
+                }
+            }
+
+            let validatedCatalogProjection = WorkspaceRootValidatedCatalogProjection(
+                discoverableRelativeFilePaths: authoritativeExactPaths,
+                policyIgnoredCommittedRegularRelativePaths: policyIgnoredCommittedRegularPaths,
+                policyIdentity: catalogPolicyIdentity
+            )
             let lease: GitWorkspaceAuthorityLease
             switch await authority.install(captured.snapshot, capturedUsing: captureToken) {
             case let .success(installed):
@@ -245,7 +306,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             guard let snapshot = WorkspaceRootReusableSnapshot.make(
                 authority: captured.snapshot,
                 tree: tree,
-                authoritativeRelativeFilePaths: authoritativeRelativeFilePaths
+                catalogProjection: validatedCatalogProjection
             ) else {
                 await authority.releaseMetadataObservation(observation)
                 return .catalogMismatch
@@ -351,6 +412,22 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         }
     #endif
 
+    private nonisolated static func committedRegularRelativePaths(
+        in tree: GitTreeInventorySnapshot
+    ) -> WorkspaceRootByteExactPathSet? {
+        WorkspaceRootByteExactPathSet(tree.entries.compactMap { entry in
+            guard entry.kind == .blob,
+                  entry.mode == "100644" || entry.mode == "100755",
+                  let relativePath = WorkspaceRootByteExactPathKey.rootRelativePath(
+                      repositoryRelativePath: entry.repositoryRelativePath,
+                      prefix: tree.rootPrefix
+                  ),
+                  !relativePath.isEmpty
+            else { return nil }
+            return relativePath
+        })
+    }
+
     private nonisolated static func canonicalPathSet(_ paths: [URL]) -> Set<String> {
         Set(paths.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
     }
@@ -392,12 +469,17 @@ actor WorkspaceRootReusableSnapshotCoordinator {
     ) throws -> GitRepositoryRelativeRootPrefix {
         let rootPath = rootURL.standardizedFileURL.path
         let worktreePath = layout.workTreeRoot.standardizedFileURL.path
-        guard rootPath == worktreePath || rootPath.hasPrefix(worktreePath + "/") else {
+        let rootBytes = Array(rootPath.utf8)
+        let worktreeBytes = Array(worktreePath.utf8)
+        if rootBytes == worktreeBytes {
+            return try GitRepositoryRelativeRootPrefix("")
+        }
+        let requiredPrefix = worktreeBytes + [UInt8(ascii: "/")]
+        guard rootBytes.starts(with: requiredPrefix), rootBytes.count > requiredPrefix.count else {
             throw GitWorktreeInitializationError.invalidRootPrefix
         }
-        let relative = rootPath == worktreePath
-            ? ""
-            : String(rootPath.dropFirst(worktreePath.count + 1))
-        return try GitRepositoryRelativeRootPrefix(relative)
+        return try GitRepositoryRelativeRootPrefix(
+            String(decoding: rootBytes.dropFirst(requiredPrefix.count), as: UTF8.self)
+        )
     }
 }

@@ -30,7 +30,7 @@ struct GitWorkspaceSearchABIIdentity: Hashable {
 
     static let current = GitWorkspaceSearchABIIdentity(
         matcherSchemaVersion: 1,
-        projectedKeySchemaVersion: 1,
+        projectedKeySchemaVersion: 3,
         comparatorSchemaVersion: 1,
         pathNormalizationSchemaVersion: 1
     )

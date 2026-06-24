@@ -1,8 +1,159 @@
 import CryptoKit
 import Foundation
 
+struct WorkspaceRootByteExactPathKey: Hashable, Comparable {
+    let value: String
+    private let bytes: [UInt8]
+
+    init(_ value: String) {
+        self.value = value
+        bytes = Array(value.utf8)
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.bytes == rhs.bytes
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.bytes.lexicographicallyPrecedes(rhs.bytes)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(bytes.count)
+        for byte in bytes {
+            hasher.combine(byte)
+        }
+    }
+
+    static func rootRelativePath(
+        repositoryRelativePath: String,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) -> String? {
+        let pathBytes = Array(repositoryRelativePath.utf8)
+        let prefixBytes = Array(prefix.value.utf8)
+        guard !prefixBytes.isEmpty else { return repositoryRelativePath }
+        let requiredPrefix = prefixBytes + [UInt8(ascii: "/")]
+        guard pathBytes.starts(with: requiredPrefix), pathBytes.count > requiredPrefix.count else {
+            return nil
+        }
+        return String(decoding: pathBytes.dropFirst(requiredPrefix.count), as: UTF8.self)
+    }
+
+    var parent: Self? {
+        guard let slash = bytes.lastIndex(of: UInt8(ascii: "/")), slash > bytes.startIndex else {
+            return nil
+        }
+        return Self(String(decoding: bytes[..<slash], as: UTF8.self))
+    }
+
+    func isSameOrDescendant(of ancestor: Self) -> Bool {
+        if ancestor.bytes.isEmpty { return true }
+        if bytes == ancestor.bytes { return true }
+        return bytes.starts(with: ancestor.bytes + [UInt8(ascii: "/")])
+    }
+}
+
+struct WorkspaceRootByteExactPathSet: Equatable {
+    private let valuesByKey: [WorkspaceRootByteExactPathKey: String]
+
+    init?(
+        _ paths: some Sequence<String>,
+        rejectExactDuplicates: Bool = false
+    ) {
+        var valuesByKey: [WorkspaceRootByteExactPathKey: String] = [:]
+        var canonicalRepresentatives: [String: WorkspaceRootByteExactPathKey] = [:]
+        for path in paths {
+            let key = WorkspaceRootByteExactPathKey(path)
+            if valuesByKey[key] != nil {
+                if rejectExactDuplicates { return nil }
+                continue
+            }
+            if let existing = canonicalRepresentatives[path], existing != key {
+                return nil
+            }
+            valuesByKey[key] = path
+            canonicalRepresentatives[path] = key
+        }
+        self.valuesByKey = valuesByKey
+    }
+
+    private init(valuesByKey: [WorkspaceRootByteExactPathKey: String]) {
+        self.valuesByKey = valuesByKey
+    }
+
+    var count: Int {
+        valuesByKey.count
+    }
+
+    var isEmpty: Bool {
+        valuesByKey.isEmpty
+    }
+
+    var keys: Set<WorkspaceRootByteExactPathKey> {
+        Set(valuesByKey.keys)
+    }
+
+    var sortedKeys: [WorkspaceRootByteExactPathKey] {
+        valuesByKey.keys.sorted()
+    }
+
+    var stringValues: [String] {
+        sortedKeys.map(\.value)
+    }
+
+    func contains(_ key: WorkspaceRootByteExactPathKey) -> Bool {
+        valuesByKey[key] != nil
+    }
+
+    func subtracting(_ other: Self) -> Self {
+        Self(valuesByKey: valuesByKey.filter { !other.contains($0.key) })
+    }
+}
+
+struct WorkspaceRootCatalogPolicyIdentity: Hashable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let mandatoryIgnorePolicyIdentity: String
+    let globalIgnoreDefaultsDigest: String
+    let respectRepoIgnore: Bool
+    let respectCursorignore: Bool
+    let enableHierarchicalIgnores: Bool
+    let skipSymlinks: Bool
+
+    static let canonicalDefaults = WorkspaceRootCatalogPolicyIdentity(
+        schemaVersion: currentSchemaVersion,
+        mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+        globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
+            for: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+        ),
+        respectRepoIgnore: true,
+        respectCursorignore: true,
+        enableHierarchicalIgnores: true,
+        skipSymlinks: true
+    )
+}
+
+enum WorkspaceRootCommittedRegularProjectionDisposition: Equatable {
+    case searchableRegularFile
+    case policyIgnoredRegularFile
+    case ineligible(CatalogRegularFileIneligibilityReason)
+}
+
+struct WorkspaceRootCatalogProjectionEvidence: Equatable {
+    let policyIdentity: WorkspaceRootCatalogPolicyIdentity
+    let dispositionsByRelativePath: [WorkspaceRootByteExactPathKey: WorkspaceRootCommittedRegularProjectionDisposition]
+    let ignoreRulesRevision: UInt64
+}
+
+struct WorkspaceRootValidatedCatalogProjection {
+    let discoverableRelativeFilePaths: WorkspaceRootByteExactPathSet
+    let policyIgnoredCommittedRegularRelativePaths: WorkspaceRootByteExactPathSet
+    let policyIdentity: WorkspaceRootCatalogPolicyIdentity
+}
+
 struct WorkspaceRootSeedCompatibilityKey: Hashable {
-    static let currentInventorySchemaVersion = 1
+    static let currentInventorySchemaVersion = 3
 
     let repositoryNamespace: GitBlobRepositoryNamespace
     let objectFormat: GitObjectFormat
@@ -50,6 +201,12 @@ struct RootNeutralTreeInventoryEntry: Hashable {
         case committedTree
     }
 
+    enum CatalogProjection: String, Hashable {
+        case searchableRegularFile
+        case policyIgnoredRegularFile
+        case nonRegularTopology
+    }
+
     let ordinal: Int
     let parentOrdinal: Int?
     let relativePath: String
@@ -57,9 +214,39 @@ struct RootNeutralTreeInventoryEntry: Hashable {
     let kind: GitTreeEntryKind
     let objectID: GitObjectID
     let provenance: Provenance
+    let catalogProjection: CatalogProjection
+
+    init(
+        ordinal: Int,
+        parentOrdinal: Int?,
+        relativePath: String,
+        mode: String,
+        kind: GitTreeEntryKind,
+        objectID: GitObjectID,
+        provenance: Provenance,
+        catalogProjection: CatalogProjection? = nil
+    ) {
+        self.ordinal = ordinal
+        self.parentOrdinal = parentOrdinal
+        self.relativePath = relativePath
+        self.mode = mode
+        self.kind = kind
+        self.objectID = objectID
+        self.provenance = provenance
+        self.catalogProjection = catalogProjection
+            ?? (
+                kind == .blob && (mode == "100644" || mode == "100755")
+                    ? .searchableRegularFile
+                    : .nonRegularTopology
+            )
+    }
+
+    var isCommittedRegularFile: Bool {
+        kind == .blob && (mode == "100644" || mode == "100755")
+    }
 
     var isSearchableFile: Bool {
-        kind == .blob && mode != "120000"
+        isCommittedRegularFile && catalogProjection == .searchableRegularFile
     }
 }
 
@@ -87,95 +274,122 @@ final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
     let compatibilityKey: WorkspaceRootSeedCompatibilityKey
     let inventory: RootNeutralTreeInventory
     let searchBase: WorkspaceSearchRelativePathBase
+    let catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
     let estimatedByteCount: Int
 
     init(
         compatibilityKey: WorkspaceRootSeedCompatibilityKey,
-        inventory: RootNeutralTreeInventory
+        inventory: RootNeutralTreeInventory,
+        catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity = .canonicalDefaults
     ) {
         self.compatibilityKey = compatibilityKey
         self.inventory = inventory
+        self.catalogPolicyIdentity = catalogPolicyIdentity
         let searchable = inventory.entries.filter(\.isSearchableFile)
         searchBase = WorkspaceSearchRelativePathBase(
             relativePaths: searchable.map(\.relativePath),
             stableOrdinals: searchable.map(\.ordinal)
         )
         identity = WorkspaceRootReusableSnapshotIdentity(
-            sha256: Self.contentDigest(compatibilityKey: compatibilityKey, inventory: inventory),
+            sha256: Self.contentDigest(
+                compatibilityKey: compatibilityKey,
+                inventory: inventory,
+                catalogPolicyIdentity: catalogPolicyIdentity
+            ),
             searchABI: compatibilityKey.searchABI
         )
         estimatedByteCount = inventory.entries.reduce(0) { partial, entry in
-            partial + entry.relativePath.utf8.count + entry.mode.utf8.count + entry.objectID.lowercaseHex.utf8.count + 96
+            partial + entry.relativePath.utf8.count + entry.mode.utf8.count
+                + entry.objectID.lowercaseHex.utf8.count + entry.catalogProjection.rawValue.utf8.count + 96
         } + searchBase.relativePaths.reduce(0) { $0 + $1.utf8.count + 48 }
     }
 
     func hasValidContentAddress() -> Bool {
         identity.searchABI == compatibilityKey.searchABI
-            && identity.sha256 == Self.contentDigest(compatibilityKey: compatibilityKey, inventory: inventory)
+            && identity.sha256 == Self.contentDigest(
+                compatibilityKey: compatibilityKey,
+                inventory: inventory,
+                catalogPolicyIdentity: catalogPolicyIdentity
+            )
     }
 
     static func make(
         authority: GitWorkspaceAuthoritySnapshot,
         tree: GitTreeInventorySnapshot,
-        authoritativeRelativeFilePaths: Set<String>
+        catalogProjection: WorkspaceRootValidatedCatalogProjection
     ) -> WorkspaceRootReusableSnapshot? {
         guard authority.treeOID == tree.treeOID,
               authority.repositoryRelativeRootPrefix == tree.rootPrefix,
               authority.policyIdentity.searchABI == .current
         else { return nil }
 
-        let prefix = tree.rootPrefix.value
-        var relativeEntries: [(source: GitTreeInventoryEntry, relativePath: String)] = []
+        var relativeEntries: [(source: GitTreeInventoryEntry, pathKey: WorkspaceRootByteExactPathKey)] = []
         relativeEntries.reserveCapacity(tree.entries.count)
         for entry in tree.entries {
-            let relativePath: String
-            if prefix.isEmpty {
-                relativePath = entry.repositoryRelativePath
-            } else {
-                let requiredPrefix = prefix + "/"
-                guard entry.repositoryRelativePath.hasPrefix(requiredPrefix) else { continue }
-                relativePath = String(entry.repositoryRelativePath.dropFirst(requiredPrefix.count))
-            }
-            guard !relativePath.isEmpty else { continue }
-            relativeEntries.append((entry, relativePath))
+            guard let relativePath = WorkspaceRootByteExactPathKey.rootRelativePath(
+                repositoryRelativePath: entry.repositoryRelativePath,
+                prefix: tree.rootPrefix
+            ), !relativePath.isEmpty else { continue }
+            relativeEntries.append((entry, WorkspaceRootByteExactPathKey(relativePath)))
         }
-        relativeEntries.sort { $0.relativePath < $1.relativePath }
+        guard WorkspaceRootByteExactPathSet(
+            relativeEntries.map(\.pathKey.value),
+            rejectExactDuplicates: true
+        ) != nil else {
+            return nil
+        }
+        relativeEntries.sort { $0.pathKey < $1.pathKey }
 
-        var ordinalByPath: [String: Int] = [:]
+        var ordinalByPath: [WorkspaceRootByteExactPathKey: Int] = [:]
         var entries: [RootNeutralTreeInventoryEntry] = []
         entries.reserveCapacity(relativeEntries.count)
         for (ordinal, value) in relativeEntries.enumerated() {
-            let parentPath = (value.relativePath as NSString).deletingLastPathComponent
-            let parentOrdinal = parentPath.isEmpty || parentPath == "." ? nil : ordinalByPath[parentPath]
+            let parentOrdinal = value.pathKey.parent.flatMap { ordinalByPath[$0] }
+            let committedRegular = value.source.kind == .blob
+                && (value.source.mode == "100644" || value.source.mode == "100755")
+            let entryCatalogProjection: RootNeutralTreeInventoryEntry.CatalogProjection
+            if committedRegular {
+                let isDiscoverable = catalogProjection.discoverableRelativeFilePaths.contains(value.pathKey)
+                let isPolicyIgnored = catalogProjection.policyIgnoredCommittedRegularRelativePaths
+                    .contains(value.pathKey)
+                switch (isDiscoverable, isPolicyIgnored) {
+                case (true, false):
+                    entryCatalogProjection = .searchableRegularFile
+                case (false, true):
+                    entryCatalogProjection = .policyIgnoredRegularFile
+                case (false, false), (true, true):
+                    return nil
+                }
+            } else {
+                entryCatalogProjection = .nonRegularTopology
+            }
             let projected = RootNeutralTreeInventoryEntry(
                 ordinal: ordinal,
                 parentOrdinal: parentOrdinal,
-                relativePath: value.relativePath,
+                relativePath: value.pathKey.value,
                 mode: value.source.mode,
                 kind: value.source.kind,
                 objectID: value.source.objectID,
-                provenance: .committedTree
+                provenance: .committedTree,
+                catalogProjection: entryCatalogProjection
             )
-            if projected.isSearchableFile,
-               !authoritativeRelativeFilePaths.contains(StandardizedPath.relative(projected.relativePath))
-            {
-                return nil
-            }
             entries.append(projected)
-            ordinalByPath[value.relativePath] = ordinal
+            ordinalByPath[value.pathKey] = ordinal
         }
         return WorkspaceRootReusableSnapshot(
             compatibilityKey: WorkspaceRootSeedCompatibilityKey(authority: authority),
-            inventory: RootNeutralTreeInventory(entries: entries)
+            inventory: RootNeutralTreeInventory(entries: entries),
+            catalogPolicyIdentity: catalogProjection.policyIdentity
         )
     }
 
     private static func contentDigest(
         compatibilityKey: WorkspaceRootSeedCompatibilityKey,
-        inventory: RootNeutralTreeInventory
+        inventory: RootNeutralTreeInventory,
+        catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
     ) -> String {
         var writer = CanonicalWriter()
-        writer.append("workspace-root-reusable-snapshot-v1")
+        writer.append("workspace-root-reusable-snapshot-v3")
         writer.append(compatibilityKey.repositoryNamespace.rawValue)
         writer.append(compatibilityKey.objectFormat.rawValue)
         writer.append(compatibilityKey.treeOID.lowercaseHex)
@@ -190,11 +404,20 @@ final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
         writer.append(compatibilityKey.searchABI.projectedKeySchemaVersion)
         writer.append(compatibilityKey.searchABI.comparatorSchemaVersion)
         writer.append(compatibilityKey.searchABI.pathNormalizationSchemaVersion)
+        writer.append(catalogPolicyIdentity.schemaVersion)
+        writer.append(catalogPolicyIdentity.mandatoryIgnorePolicyIdentity)
+        writer.append(catalogPolicyIdentity.globalIgnoreDefaultsDigest)
+        writer.append(catalogPolicyIdentity.respectRepoIgnore ? "1" : "0")
+        writer.append(catalogPolicyIdentity.respectCursorignore ? "1" : "0")
+        writer.append(catalogPolicyIdentity.enableHierarchicalIgnores ? "1" : "0")
+        writer.append(catalogPolicyIdentity.skipSymlinks ? "1" : "0")
         writer.append(contentIdentity: compatibilityKey.policyIdentity.resolvedExcludesFileIdentity)
         writer.append(contentIdentity: compatibilityKey.policyIdentity.resolvedAttributesFileIdentity)
         for control in compatibilityKey.policyIdentity.prefixControlIdentities.sorted(by: {
-            if $0.repositoryRelativePath != $1.repositoryRelativePath {
-                return $0.repositoryRelativePath < $1.repositoryRelativePath
+            let lhsPath = WorkspaceRootByteExactPathKey($0.repositoryRelativePath)
+            let rhsPath = WorkspaceRootByteExactPathKey($1.repositoryRelativePath)
+            if lhsPath != rhsPath {
+                return lhsPath < rhsPath
             }
             return $0.kind.rawValue < $1.kind.rawValue
         }) {
@@ -211,6 +434,7 @@ final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
             writer.append(entry.objectID.objectFormat.rawValue)
             writer.append(entry.objectID.lowercaseHex)
             writer.append(entry.provenance.rawValue)
+            writer.append(entry.catalogProjection.rawValue)
         }
         return Data(SHA256.hash(data: writer.data)).map { String(format: "%02x", $0) }.joined()
     }
@@ -340,6 +564,20 @@ struct WorkspaceRootSeedVerificationFact: Equatable {
     let relativePath: String
     let kind: WorkspaceRootSeedVerifiedPathKind
     let isIgnored: Bool
+    let isIncludedInOrdinaryCrawl: Bool
+
+    init(
+        relativePath: String,
+        kind: WorkspaceRootSeedVerifiedPathKind,
+        isIgnored: Bool,
+        isIncludedInOrdinaryCrawl: Bool? = nil
+    ) {
+        self.relativePath = relativePath
+        self.kind = kind
+        self.isIgnored = isIgnored
+        self.isIncludedInOrdinaryCrawl = isIncludedInOrdinaryCrawl
+            ?? (kind == .directory && !isIgnored)
+    }
 }
 
 struct WorkspaceRootSeedPlan: Equatable {
@@ -350,7 +588,30 @@ struct WorkspaceRootSeedPlan: Equatable {
     let baseRelativeFilePaths: Set<String>
     let changedRelativeFilePaths: Set<String>
     let tombstonedBaseRelativeFilePaths: Set<String>
+    let policyIgnoredTrackedRelativeFilePaths: Set<String>
     let verifiedPathCount: Int
+
+    init(
+        snapshotIdentity: WorkspaceRootReusableSnapshotIdentity,
+        targetTreeOID: GitObjectID,
+        relativeFilePaths: Set<String>,
+        relativeFolderPaths: Set<String>,
+        baseRelativeFilePaths: Set<String>,
+        changedRelativeFilePaths: Set<String>,
+        tombstonedBaseRelativeFilePaths: Set<String>,
+        policyIgnoredTrackedRelativeFilePaths: Set<String> = [],
+        verifiedPathCount: Int
+    ) {
+        self.snapshotIdentity = snapshotIdentity
+        self.targetTreeOID = targetTreeOID
+        self.relativeFilePaths = relativeFilePaths
+        self.relativeFolderPaths = relativeFolderPaths
+        self.baseRelativeFilePaths = baseRelativeFilePaths
+        self.changedRelativeFilePaths = changedRelativeFilePaths
+        self.tombstonedBaseRelativeFilePaths = tombstonedBaseRelativeFilePaths
+        self.policyIgnoredTrackedRelativeFilePaths = policyIgnoredTrackedRelativeFilePaths
+        self.verifiedPathCount = verifiedPathCount
+    }
 
     var overlayRelativeFilePaths: Set<String> {
         changedRelativeFilePaths.intersection(relativeFilePaths)

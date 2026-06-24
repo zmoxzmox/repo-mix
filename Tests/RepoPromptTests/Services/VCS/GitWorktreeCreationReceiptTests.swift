@@ -26,6 +26,119 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         XCTAssertTrue(coverage(start: 10, end: 11).provesCreationInterval)
     }
 
+    func testLoadedRootAdmissionAllowsPolicyIgnoredCommittedFilesButRejectsMissingDiscoverableCommittedFiles() async throws {
+        let fixture = try ReceiptFixture()
+        defer { fixture.cleanup() }
+        try fixture.write(".repo_ignore", "Generated/\nIgnoredUntracked.tmp\n")
+        try fixture.write("Visible.swift", "let committed = true\n")
+        try fixture.write("Generated/Committed.swift", "let ignoredCommitted = true\n")
+        try fixture.git(["add", ".repo_ignore", "Visible.swift"])
+        try fixture.git(["add", "-f", "Generated/Committed.swift"])
+        try fixture.git(["commit", "-m", "force-add policy ignored regular file"])
+        let headBlobOID = try fixture.gitOutput(["rev-parse", "HEAD:Visible.swift"])
+
+        try fixture.write("Visible.swift", "let dirtyWorktreeBytes = true\n")
+        try fixture.write("VisibleUntracked.swift", "let overlayOnly = true\n")
+        try fixture.write("IgnoredUntracked.tmp", "ignored untracked\n")
+        let dirtyBlobOID = try fixture.gitOutput(["hash-object", "Visible.swift"])
+        XCTAssertNotEqual(headBlobOID, dirtyBlobOID)
+
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: fixture.root.path, kind: .sessionWorktree)
+        addTeardownBlock { await store.unloadRoot(id: record.id) }
+        guard case .materialized = try await store.materializeCatalogFileAfterDiskWrite(
+            rootID: record.id,
+            relativePath: "Generated/Committed.swift"
+        ) else {
+            return XCTFail("Expected ignored committed path to materialize as managed-only")
+        }
+
+        let admission = try await store.admitReusableSnapshotForLoadedRoot(
+            rootID: record.id,
+            expectedStandardizedPath: record.standardizedFullPath
+        )
+        guard case let .admitted(identity) = admission else {
+            return XCTFail("Expected policy-ignored committed file admission, got \(admission)")
+        }
+
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.root))
+        let prefix = try GitRepositoryRelativeRootPrefix("")
+        let sharedAuthority = GitWorkspaceStateAuthority.shared
+        let git = GitService(workspaceStateAuthority: sharedAuthority)
+        let captured = try await git.workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+        let snapshot = await sharedAuthority.reusableSnapshot(
+            identity: identity,
+            expectedCompatibilityKey: WorkspaceRootSeedCompatibilityKey(authority: captured.snapshot)
+        )
+        let reusable = try XCTUnwrap(snapshot)
+        let visibleCommitted: Set = [
+            ".gitignore", ".repo_ignore", ".worktreeinclude", "Tracked.swift", "Visible.swift"
+        ]
+        XCTAssertEqual(Set(reusable.searchBase.relativePaths), visibleCommitted)
+        XCTAssertEqual(
+            Set(reusable.inventory.entries.filter(\.isSearchableFile).map(\.relativePath)),
+            visibleCommitted
+        )
+        let ignoredEntry = try XCTUnwrap(reusable.inventory.entries.first {
+            $0.relativePath == "Generated/Committed.swift"
+        })
+        XCTAssertEqual(ignoredEntry.catalogProjection, .policyIgnoredRegularFile)
+        XCTAssertFalse(ignoredEntry.isSearchableFile)
+        XCTAssertFalse(reusable.inventory.entries.contains { $0.relativePath == "VisibleUntracked.swift" })
+        XCTAssertFalse(reusable.inventory.entries.contains { $0.relativePath == "IgnoredUntracked.tmp" })
+        let dirtyEntry = try XCTUnwrap(reusable.inventory.entries.first { $0.relativePath == "Visible.swift" })
+        XCTAssertEqual(dirtyEntry.objectID.lowercaseHex, headBlobOID)
+        XCTAssertNotEqual(dirtyEntry.objectID.lowercaseHex, dirtyBlobOID)
+
+        let discoverable = await Set(store.files(inRoot: record.id).map(\.standardizedRelativePath))
+        XCTAssertTrue(discoverable.contains("VisibleUntracked.swift"))
+        XCTAssertFalse(discoverable.contains("Generated/Committed.swift"))
+        XCTAssertFalse(discoverable.contains("IgnoredUntracked.tmp"))
+        let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+        let service = try XCTUnwrap(loadedService)
+        let catalogPolicyIdentity = await service.currentWorkspaceRootCatalogPolicyIdentity()
+        let rejectingAuthority = GitWorkspaceStateAuthority()
+        let rejectingCoordinator = WorkspaceRootReusableSnapshotCoordinator(
+            gitService: GitService(workspaceStateAuthority: rejectingAuthority),
+            authority: rejectingAuthority
+        )
+        let rejection = await rejectingCoordinator.observeAuthoritativeFullLoad(
+            rootURL: fixture.root,
+            authoritativeRelativeFilePaths: discoverable.subtracting(["Visible.swift"]),
+            catalogPolicyIdentity: catalogPolicyIdentity,
+            catalogEvidenceProvider: { paths in
+                await service.catalogProjectionEvidence(forCommittedRegularPaths: paths)
+            }
+        )
+        XCTAssertEqual(rejection, .catalogMismatch)
+    }
+
+    func testCatalogAdmissionRejectsCanonicalEquivalentByteDistinctGitPaths() async throws {
+        let fixture = try ReceiptFixture()
+        defer { fixture.cleanup() }
+        let composed = "Caf\u{00E9}.swift"
+        let decomposed = "Cafe\u{0301}.swift"
+        XCTAssertEqual(composed, decomposed)
+        XCTAssertNotEqual(Array(composed.utf8), Array(decomposed.utf8))
+
+        try fixture.git(["config", "core.precomposeunicode", "false"])
+        let blobOID = try fixture.gitOutput(["rev-parse", "HEAD:Tracked.swift"])
+        try fixture.git(["update-index", "--add", "--cacheinfo", "100644,\(blobOID),\(composed)"])
+        try fixture.git(["update-index", "--add", "--cacheinfo", "100644,\(blobOID),\(decomposed)"])
+        try fixture.git(["commit", "-m", "byte-distinct unicode catalog collision"])
+
+        let authority = GitWorkspaceStateAuthority()
+        let coordinator = WorkspaceRootReusableSnapshotCoordinator(
+            gitService: GitService(workspaceStateAuthority: authority),
+            authority: authority
+        )
+        let result = await coordinator.observeAuthoritativeFullLoad(
+            rootURL: fixture.root,
+            authoritativeRelativeFilePaths: fixture.authoritativeRelativeFilePaths
+        )
+        XCTAssertEqual(result, .catalogMismatch)
+    }
+
     func testSubdirectoryReceiptPlansOnlyCorrespondingPhysicalRoot() async throws {
         let fixture = try ReceiptFixture()
         defer { fixture.cleanup() }
@@ -100,6 +213,158 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         XCTAssertEqual(WorktreeStartupInstrumentation.snapshot().shadow.inventoryMatches, 1)
         await materializer.abort(preparation)
         await store.unloadRoot(id: logicalRecord.id)
+    }
+
+    func testPolicyProjectedLinkedWorktreeSubdirectoryMatchesOrdinaryCatalogExactly() async throws {
+        let fixture = try ReceiptFixture()
+        defer { fixture.cleanup() }
+        try fixture.write(
+            "Subdir/.repo_ignore",
+            "Ignored/\nVisibleOnly/*.tmp\nVisibleSymlinkParent/IgnoredDirLink\n"
+        )
+        try fixture.write("Subdir/MiXeD.swift", "let mixedCase = true\n")
+        try fixture.write("Subdir/文件.swift", "let unicode = true\n")
+        try fixture.write("Subdir/Ignored/Committed.swift", "let ignoredCommitted = true\n")
+        try fixture.write("Subdir/VisibleOnly/OnlyIgnored.tmp", "ignored file only\n")
+        try fixture.write("Sibling.swift", "let sibling = true\n")
+        let links = fixture.root.appendingPathComponent("Subdir/Links", isDirectory: true)
+        try FileManager.default.createDirectory(at: links, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            atPath: links.appendingPathComponent("Current").path,
+            withDestinationPath: "../MiXeD.swift"
+        )
+        let visibleSymlinkParent = fixture.root
+            .appendingPathComponent("Subdir/VisibleSymlinkParent", isDirectory: true)
+        try FileManager.default.createDirectory(at: visibleSymlinkParent, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            atPath: visibleSymlinkParent.appendingPathComponent("IgnoredDirLink").path,
+            withDestinationPath: "../Ignored"
+        )
+        try fixture.git([
+            "add", "Subdir/.repo_ignore", "Subdir/MiXeD.swift", "Subdir/文件.swift",
+            "Subdir/Links/Current", "Sibling.swift"
+        ])
+        try fixture.git([
+            "add", "-f", "Subdir/Ignored/Committed.swift", "Subdir/VisibleOnly/OnlyIgnored.tmp",
+            "Subdir/VisibleSymlinkParent/IgnoredDirLink"
+        ])
+        try fixture.git(["commit", "-m", "subdirectory catalog policy fixture"])
+
+        let logicalRoot = fixture.root.appendingPathComponent("Subdir", isDirectory: true)
+        let prefix = try GitRepositoryRelativeRootPrefix("Subdir")
+        let sourceStore = WorkspaceFileContextStore()
+        let sourceRecord = try await sourceStore.loadRoot(path: logicalRoot.path, kind: .sessionWorktree)
+        addTeardownBlock { await sourceStore.unloadRoot(id: sourceRecord.id) }
+        guard case .materialized = try await sourceStore.materializeCatalogFileAfterDiskWrite(
+            rootID: sourceRecord.id,
+            relativePath: "Ignored/Committed.swift"
+        ) else {
+            return XCTFail("Expected ignored source file to materialize as managed-only")
+        }
+        let admission = try await sourceStore.admitReusableSnapshotForLoadedRoot(
+            rootID: sourceRecord.id,
+            expectedStandardizedPath: sourceRecord.standardizedFullPath
+        )
+        guard case let .admitted(snapshotIdentity) = admission else {
+            return XCTFail("Expected subdirectory snapshot admission, got \(admission)")
+        }
+
+        let authority = GitWorkspaceStateAuthority.shared
+        let git = GitService(workspaceStateAuthority: authority)
+        let result = try await git.createWorktreeWithResult(
+            request: fixture.createRequest(),
+            at: fixture.root,
+            initializationContext: GitWorktreeInitializationContext(
+                agentSessionID: fixture.agentSessionID,
+                correlationID: fixture.correlationID,
+                logicalRootPath: logicalRoot.path,
+                expectedOwnerBindingGeneration: fixture.expectedOwnerBindingGeneration,
+                repositoryRelativeRootPrefix: prefix,
+                observeReceipt: true
+            )
+        )
+        let receipt = try XCTUnwrap(result.initializationReceipt)
+        XCTAssertEqual(receipt.parentSnapshotIdentity, snapshotIdentity)
+        XCTAssertEqual(receipt.repositoryRelativeRootPrefix, prefix)
+        let physicalRoot = URL(fileURLWithPath: result.descriptor.path, isDirectory: true)
+            .appendingPathComponent(prefix.value, isDirectory: true)
+            .standardizedFileURL.path
+        let binding = AgentSessionWorktreeBinding(
+            id: "policy-prefix-binding",
+            repositoryID: result.descriptor.repository.repositoryID,
+            repoKey: result.descriptor.repository.repoKey,
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: logicalRoot.lastPathComponent,
+            worktreeID: result.descriptor.worktreeID,
+            worktreeRootPath: physicalRoot,
+            source: "test"
+        )
+        let hint = WorkspaceRootMaterializationHint(
+            bindingID: binding.id,
+            standardizedTargetPath: physicalRoot,
+            creationReceipt: receipt,
+            correlationID: fixture.correlationID
+        ).validated(
+            matching: binding,
+            sessionID: fixture.agentSessionID,
+            startupContext: fixture.startupContext()
+        )
+        XCTAssertNil(hint.validationFallbackReason)
+
+        let targetStore = WorkspaceFileContextStore()
+        let targetRecord = try await targetStore.loadRoot(path: physicalRoot, kind: .sessionWorktree)
+        addTeardownBlock { await targetStore.unloadRoot(id: targetRecord.id) }
+        let loadedTargetService = await targetStore.fileSystemServiceForTesting(rootID: targetRecord.id)
+        let targetService = try XCTUnwrap(loadedTargetService)
+        let planner = WorkspaceRootSeedPlanner(gitService: git, authority: authority)
+        let planning = await planner.plan(hint: hint, service: targetService)
+        guard case let .planned(plan) = planning else {
+            return XCTFail("Expected linked-subdirectory policy plan, got \(planning)")
+        }
+
+        let ordinaryFiles = await Set(targetStore.files(inRoot: targetRecord.id).map(\.standardizedRelativePath))
+        let ordinaryFolders = await Set(targetStore.folders(inRoot: targetRecord.id).map(\.standardizedRelativePath))
+            .subtracting([""])
+        let expectedFiles: Set = [".repo_ignore", "MiXeD.swift", "文件.swift"]
+        XCTAssertEqual(ordinaryFiles, expectedFiles)
+        XCTAssertEqual(ordinaryFolders, ["Links", "VisibleOnly", "VisibleSymlinkParent"])
+        XCTAssertEqual(plan.relativeFilePaths, ordinaryFiles)
+        XCTAssertEqual(plan.relativeFolderPaths, ordinaryFolders)
+        XCTAssertEqual(plan.policyIgnoredTrackedRelativeFilePaths, [
+            "Ignored/Committed.swift", "VisibleOnly/OnlyIgnored.tmp"
+        ])
+        XCTAssertTrue(plan.overlayRelativeFilePaths.isEmpty)
+        XCTAssertTrue(plan.relativeFilePaths.isDisjoint(with: plan.policyIgnoredTrackedRelativeFilePaths))
+
+        let snapshot = await authority.reusableSnapshot(
+            identity: receipt.parentSnapshotIdentity,
+            expectedCompatibilityKey: receipt.parentCompatibilityKey
+        )
+        let reusable = try XCTUnwrap(snapshot)
+        XCTAssertEqual(Set(reusable.searchBase.relativePaths), expectedFiles)
+        XCTAssertTrue(reusable.inventory.entries.contains {
+            $0.relativePath == "Ignored/Committed.swift"
+                && $0.catalogProjection == .policyIgnoredRegularFile
+        })
+        XCTAssertTrue(reusable.inventory.entries.contains {
+            $0.relativePath == "Links/Current"
+                && $0.mode == "120000"
+                && $0.catalogProjection == .nonRegularTopology
+        })
+        XCTAssertTrue(reusable.inventory.entries.contains {
+            $0.relativePath == "VisibleOnly/OnlyIgnored.tmp"
+                && $0.catalogProjection == .policyIgnoredRegularFile
+        })
+        XCTAssertTrue(reusable.inventory.entries.contains {
+            $0.relativePath == "VisibleSymlinkParent/IgnoredDirLink"
+                && $0.mode == "120000"
+                && $0.catalogProjection == .nonRegularTopology
+        })
+        XCTAssertFalse(reusable.searchBase.relativePaths.contains("Links/Current"))
+        XCTAssertFalse(reusable.inventory.entries.contains { $0.relativePath == "Sibling.swift" })
+        XCTAssertFalse(reusable.inventory.entries.contains {
+            $0.relativePath == ".git" || $0.relativePath.hasPrefix(".git/")
+        })
     }
 
     func testReceiptKeepsReusableParentWhenRequestedTargetTreeDiffers() async throws {
@@ -1124,6 +1389,10 @@ private struct ReceiptFixture {
     }
 
     func git(_ arguments: [String]) throws {
+        _ = try gitOutput(arguments)
+    }
+
+    func gitOutput(_ arguments: [String]) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = arguments
@@ -1132,8 +1401,9 @@ private struct ReceiptFixture {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0"
         ]) { _, new in new }
+        let stdout = Pipe()
         let stderr = Pipe()
-        process.standardOutput = Pipe()
+        process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
         process.waitUntilExit()
@@ -1145,6 +1415,8 @@ private struct ReceiptFixture {
                 userInfo: [NSLocalizedDescriptionKey: detail]
             )
         }
+        return String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     func cleanup() {

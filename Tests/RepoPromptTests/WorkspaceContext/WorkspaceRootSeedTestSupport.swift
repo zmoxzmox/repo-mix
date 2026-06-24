@@ -52,7 +52,9 @@ enum WorkspaceRootSeedTestSupport {
     static func snapshot(
         paths: [(String, String)],
         treeOID: GitObjectID = oid(),
-        prefix: GitRepositoryRelativeRootPrefix = try! GitRepositoryRelativeRootPrefix("")
+        prefix: GitRepositoryRelativeRootPrefix = try! GitRepositoryRelativeRootPrefix(""),
+        policyIgnoredPaths: Set<String> = [],
+        catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity = .canonicalDefaults
     ) -> WorkspaceRootReusableSnapshot {
         let entries = paths.enumerated().map { ordinal, value in
             RootNeutralTreeInventoryEntry(
@@ -62,12 +64,16 @@ enum WorkspaceRootSeedTestSupport {
                 mode: value.1,
                 kind: .blob,
                 objectID: oid(Character(String((ordinal % 8) + 1))),
-                provenance: .committedTree
+                provenance: .committedTree,
+                catalogProjection: policyIgnoredPaths.contains(value.0)
+                    ? .policyIgnoredRegularFile
+                    : nil
             )
         }
         return WorkspaceRootReusableSnapshot(
             compatibilityKey: compatibilityKey(treeOID: treeOID, prefix: prefix),
-            inventory: RootNeutralTreeInventory(entries: entries)
+            inventory: RootNeutralTreeInventory(entries: entries),
+            catalogPolicyIdentity: catalogPolicyIdentity
         )
     }
 
@@ -136,8 +142,14 @@ enum WorkspaceRootSeedTestSupport {
     static func fact(
         _ path: String,
         kind: WorkspaceRootSeedVerifiedPathKind = .regularFile(isExecutable: false),
-        ignored: Bool = false
+        ignored: Bool = false,
+        includedInOrdinaryCrawl: Bool? = nil
     ) -> WorkspaceRootSeedVerificationFact {
-        WorkspaceRootSeedVerificationFact(relativePath: path, kind: kind, isIgnored: ignored)
+        WorkspaceRootSeedVerificationFact(
+            relativePath: path,
+            kind: kind,
+            isIgnored: ignored,
+            isIncludedInOrdinaryCrawl: includedInOrdinaryCrawl
+        )
     }
 }
