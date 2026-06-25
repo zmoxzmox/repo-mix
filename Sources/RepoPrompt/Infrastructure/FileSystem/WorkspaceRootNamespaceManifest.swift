@@ -128,11 +128,23 @@ enum WorkspaceRootNamespaceManifestError: Error, Equatable {
     case io(operation: String, code: Int32)
 }
 
-/// A validated, forward-only reader. `next()` returns `nil` only after the
-/// footer, counts, ordering, and whole-manifest digest have been verified.
+enum WorkspaceRootNamespaceManifestReaderValidationState: Equatable {
+    case reading
+    case verified
+    case failed
+}
+
+struct WorkspaceRootNamespaceManifestReaderConsumptionToken: Equatable {
+    fileprivate let id: UUID
+}
+
+/// A forward-only reader over one identity-validated descriptor. Yielded
+/// records remain provisional until `next()` returns `nil`, at which point the
+/// footer, counts, ordering, artifact identity, and exact EOF are verified.
 final class WorkspaceRootNamespaceManifestReader: @unchecked Sendable {
     let header: WorkspaceRootNamespaceManifestHeader
     private(set) var footer: WorkspaceRootNamespaceManifestFooter?
+    private(set) var validationState: WorkspaceRootNamespaceManifestReaderValidationState = .reading
 
     private let descriptor: Int32
     private let retainedLease: WorkspaceRootNamespaceManifestLease
@@ -142,7 +154,7 @@ final class WorkspaceRootNamespaceManifestReader: @unchecked Sendable {
     private var fileCount: UInt64 = 0
     private var directoryCount: UInt64 = 0
     private var payloadByteCount: UInt64 = 0
-    private var reachedFooter = false
+    private var exclusiveConsumerID: UUID?
     private let lock = NSLock()
 
     init(descriptor: Int32, lease: WorkspaceRootNamespaceManifestLease) throws {
@@ -156,6 +168,7 @@ final class WorkspaceRootNamespaceManifestReader: @unchecked Sendable {
         digest.update(data: headerFrame.encodedFrame)
         self.digest = digest
         header = headerFrame.header
+        try retainedLease.validateOpenDescriptor(descriptor)
     }
 
     deinit {
@@ -165,7 +178,96 @@ final class WorkspaceRootNamespaceManifestReader: @unchecked Sendable {
     func next() throws -> WorkspaceRootNamespaceRecord? {
         lock.lock()
         defer { lock.unlock() }
-        guard !reachedFooter else { return nil }
+        guard exclusiveConsumerID == nil else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "reader is owned by an exclusive transaction"
+            )
+        }
+        return try nextLocked()
+    }
+
+    func beginExclusiveConsumption() throws -> WorkspaceRootNamespaceManifestReaderConsumptionToken {
+        lock.lock()
+        defer { lock.unlock() }
+        guard exclusiveConsumerID == nil else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "reader is owned by an exclusive transaction"
+            )
+        }
+        guard validationState == .reading,
+              recordCount == 0,
+              previousPath == nil
+        else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "reader transaction requires a pristine source"
+            )
+        }
+        let token = WorkspaceRootNamespaceManifestReaderConsumptionToken(id: UUID())
+        exclusiveConsumerID = token.id
+        return token
+    }
+
+    func next(
+        exclusive token: WorkspaceRootNamespaceManifestReaderConsumptionToken
+    ) throws -> WorkspaceRootNamespaceRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard exclusiveConsumerID == token.id else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "invalid reader transaction ownership"
+            )
+        }
+        return try nextLocked()
+    }
+
+    func completeExclusiveConsumption(
+        _ token: WorkspaceRootNamespaceManifestReaderConsumptionToken
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard exclusiveConsumerID == token.id else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "invalid reader transaction ownership"
+            )
+        }
+        guard validationState == .verified else {
+            throw WorkspaceRootNamespaceManifestError.corrupt(
+                "source reader did not reach verified EOF"
+            )
+        }
+        exclusiveConsumerID = nil
+    }
+
+    func abandonExclusiveConsumption(
+        _ token: WorkspaceRootNamespaceManifestReaderConsumptionToken
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        if exclusiveConsumerID == token.id {
+            exclusiveConsumerID = nil
+        }
+    }
+
+    private func nextLocked() throws -> WorkspaceRootNamespaceRecord? {
+        switch validationState {
+        case .verified:
+            return nil
+        case .failed:
+            throw WorkspaceRootNamespaceManifestError.corrupt("reader validation already failed")
+        case .reading:
+            break
+        }
+
+        do {
+            return try readNext()
+        } catch {
+            validationState = .failed
+            throw error
+        }
+    }
+
+    private func readNext() throws -> WorkspaceRootNamespaceRecord? {
+        try retainedLease.validateOpenDescriptor(descriptor)
 
         let marker = try WorkspaceRootNamespaceManifestCodec.readExact(descriptor, count: 1)
         guard let byte = marker.first else {
@@ -229,8 +331,9 @@ final class WorkspaceRootNamespaceManifestReader: @unchecked Sendable {
             guard trailing == 0 else {
                 throw WorkspaceRootNamespaceManifestError.corrupt("trailing bytes")
             }
+            try retainedLease.validateOpenDescriptor(descriptor)
             footer = parsed
-            reachedFooter = true
+            validationState = .verified
             return nil
 
         default:

@@ -210,7 +210,62 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         XCTAssertNotEqual(input[input.count - 2].relativePathBytes, input[input.count - 1].relativePathBytes)
     }
 
-    func testReaderRejectsCorruptionAndTruncationBeforeYieldingRecords() async throws {
+    func testGenericSpillMigrationPreservesExactNamespaceFormatBytes() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-format-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-format-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let records = [
+            WorkspaceRootNamespaceRecord(
+                relativePath: "z-file",
+                kind: .file,
+                isSymbolicLink: false,
+                fileSystemMode: 0o100755
+            ),
+            WorkspaceRootNamespaceRecord(
+                relativePath: "a-directory",
+                kind: .directory,
+                isSymbolicLink: false,
+                fileSystemMode: 0o040755
+            )
+        ]
+        let writer = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 32, batchRecords: 1, openRuns: 2)
+        )
+        try await writer.append(contentsOf: records)
+        let lease = try await writer.finish()
+
+        let sorted = records.sorted {
+            $0.relativePathBytes.lexicographicallyPrecedes($1.relativePathBytes)
+        }
+        var expected = WorkspaceRootNamespaceManifestCodec.encodeHeader(lease.header)
+        var digest = SHA256()
+        digest.update(data: expected)
+        var payloadByteCount: UInt64 = 0
+        for record in sorted {
+            let payload = try WorkspaceRootNamespaceManifestCodec.encodeRecord(record)
+            let frame = try WorkspaceRootNamespaceManifestCodec.recordFrame(record)
+            expected.append(frame)
+            digest.update(data: frame)
+            payloadByteCount += UInt64(payload.count)
+        }
+        let footer = WorkspaceRootNamespaceManifestFooter(
+            recordCount: 2,
+            fileCount: 1,
+            directoryCount: 1,
+            recordPayloadByteCount: payloadByteCount,
+            digest: Data(digest.finalize())
+        )
+        expected.append(WorkspaceRootNamespaceManifestCodec.encodeFooter(footer))
+
+        XCTAssertEqual(lease.header.schemaVersion, 1)
+        XCTAssertEqual(lease.footer, footer)
+        XCTAssertEqual(try Data(contentsOf: lease.fileURL), expected)
+    }
+
+    func testReaderFailsTerminallyWhenOpenArtifactIsMutatedOrTruncated() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-corrupt-root")
         let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-corrupt-store")
         let store = try WorkspaceRootNamespaceManifestStore(
@@ -218,9 +273,18 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         )
         let corruptLease = try await makeManifest(in: store, root: root, count: 12)
         let truncateLease = try await makeManifest(in: store, root: root, count: 12)
+        let corruptReader = try corruptLease.makeReader()
+        let truncateReader = try truncateLease.makeReader()
 
         try flipByte(in: corruptLease.fileURL)
-        XCTAssertThrowsError(try corruptLease.makeReader())
+        XCTAssertThrowsError(try corruptReader.next())
+        XCTAssertEqual(corruptReader.validationState, .failed)
+        XCTAssertThrowsError(try corruptReader.next()) { error in
+            XCTAssertEqual(
+                error as? WorkspaceRootNamespaceManifestError,
+                .corrupt("reader validation already failed")
+            )
+        }
 
         let attributes = try FileManager.default.attributesOfItem(atPath: truncateLease.fileURL.path)
         let byteCount = try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value
@@ -228,7 +292,313 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         try handle.truncate(atOffset: byteCount - 7)
         try handle.synchronize()
         try handle.close()
-        XCTAssertThrowsError(try truncateLease.makeReader())
+        XCTAssertThrowsError(try truncateReader.next())
+        XCTAssertEqual(truncateReader.validationState, .failed)
+    }
+
+    func testForwardReaderRejectsPathReplacementAfterYieldingProvisionalRecord() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-replace-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-replace-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let lease = try await makeManifest(in: store, root: root, count: 12)
+        let reader = try lease.makeReader()
+
+        XCTAssertNotNil(try reader.next())
+        XCTAssertEqual(reader.validationState, .reading)
+        try replaceFileWithCopy(at: lease.fileURL)
+        defer { try? FileManager.default.removeItem(at: lease.fileURL) }
+
+        XCTAssertThrowsError(try reader.next()) { error in
+            XCTAssertEqual(
+                error as? WorkspaceRootNamespaceManifestError,
+                .corrupt("artifact identity changed")
+            )
+        }
+        XCTAssertEqual(reader.validationState, .failed)
+        XCTAssertNil(reader.footer)
+    }
+
+    func testTransactionalForwardingAbortsDerivedArtifactOnSourceMutation() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-transaction-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-transaction-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let source = try await makeManifest(in: store, root: root, count: 12)
+        let reader = try source.makeReader()
+        let derivedWriter = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 64, batchRecords: 1, openRuns: 2)
+        )
+        let gate = NamespaceManifestTransactionGate()
+        await derivedWriter.setTransactionDidStageRecordHandlerForTesting {
+            await gate.pause()
+        }
+        let forwarding = Task {
+            try await derivedWriter.appendValidatedContents(from: reader)
+        }
+        await gate.waitUntilPaused()
+        try flipLastByte(in: source.fileURL)
+        await gate.release()
+
+        do {
+            try await forwarding.value
+            XCTFail("Expected source mutation to abort transactional forwarding")
+        } catch let error as WorkspaceRootNamespaceManifestError {
+            XCTAssertEqual(error, .corrupt("artifact identity changed"))
+        }
+        XCTAssertEqual(reader.validationState, .failed)
+        XCTAssertEqual(store.activeArtifactURLs, [source.fileURL])
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: store.directoryURL.path),
+            [source.fileURL.lastPathComponent]
+        )
+        do {
+            _ = try await derivedWriter.finish()
+            XCTFail("Expected the aborted derived writer to remain closed")
+        } catch let error as WorkspaceRootNamespaceManifestError {
+            XCTAssertEqual(error, .closed)
+        }
+    }
+
+    func testTransactionalForwardingExclusivelyOwnsPristineReaderAcrossSuspension() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-exclusive-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-exclusive-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let source = try await makeManifest(in: store, root: root, count: 12)
+        let reader = try source.makeReader()
+        let writer = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 64, batchRecords: 1, openRuns: 2)
+        )
+        let competingWriter = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 64, batchRecords: 1, openRuns: 2)
+        )
+        let gate = NamespaceManifestTransactionGate()
+        await writer.setTransactionDidAcquireSourceHandlerForTesting {
+            await gate.pause()
+        }
+        let forwarding = Task {
+            try await writer.appendValidatedContents(from: reader)
+        }
+        await gate.waitUntilPaused()
+
+        XCTAssertThrowsError(try reader.next()) { error in
+            XCTAssertEqual(
+                error as? WorkspaceRootNamespaceManifestError,
+                .corrupt("reader is owned by an exclusive transaction")
+            )
+        }
+        do {
+            try await competingWriter.appendValidatedContents(from: reader)
+            XCTFail("Expected competing transaction to reject the owned reader")
+        } catch let error as WorkspaceRootNamespaceManifestError {
+            XCTAssertEqual(
+                error,
+                .corrupt("reader is owned by an exclusive transaction")
+            )
+        }
+        await competingWriter.cancel()
+
+        await gate.release()
+        try await forwarding.value
+        let derived = try await writer.finish()
+        XCTAssertEqual(try readAll(derived).count, 12)
+    }
+
+    func testConcurrentFinishCannotPublishUnverifiedTransactionalRecords() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-finish-race-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-finish-race-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let source = try await makeManifest(in: store, root: root, count: 12)
+        let reader = try source.makeReader()
+        let writer = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 64, batchRecords: 1, openRuns: 2)
+        )
+        let gate = NamespaceManifestTransactionGate()
+        await writer.setTransactionDidStageRecordHandlerForTesting {
+            await gate.pause()
+        }
+        let forwarding = Task {
+            try await writer.appendValidatedContents(from: reader)
+        }
+        await gate.waitUntilPaused()
+
+        do {
+            _ = try await writer.finish()
+            XCTFail("Expected finish to reject unverified transactional records")
+        } catch let error as WorkspaceRootNamespaceManifestError {
+            XCTAssertEqual(error, .closed)
+        }
+        XCTAssertEqual(store.activeArtifactURLs, [source.fileURL])
+
+        await gate.release()
+        try await forwarding.value
+        XCTAssertEqual(store.activeArtifactURLs, [source.fileURL])
+        let derived = try await writer.finish()
+        XCTAssertEqual(try readAll(derived).count, 12)
+    }
+
+    func testConcurrentCancelCannotAbortIsolatedTransactionalForwarding() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-cancel-race-root")
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-cancel-race-store")
+        let store = try WorkspaceRootNamespaceManifestStore(
+            directoryURL: storeRoot.appendingPathComponent("manifests", isDirectory: true)
+        )
+        let source = try await makeManifest(in: store, root: root, count: 12)
+        let reader = try source.makeReader()
+        let writer = try store.makeWriter(
+            identity: identity(root),
+            resourcePolicy: policy(bufferBytes: 64, batchRecords: 1, openRuns: 2)
+        )
+        let gate = NamespaceManifestTransactionGate()
+        await writer.setTransactionDidStageRecordHandlerForTesting {
+            await gate.pause()
+        }
+        let forwarding = Task {
+            try await writer.appendValidatedContents(from: reader)
+        }
+        await gate.waitUntilPaused()
+
+        await writer.cancel()
+        XCTAssertEqual(store.activeArtifactURLs, [source.fileURL])
+
+        await gate.release()
+        try await forwarding.value
+        let derived = try await writer.finish()
+        XCTAssertEqual(try readAll(derived).count, 12)
+    }
+
+    func testGenericSpillRejectsEncodedRecordsBeyondFormatAndByteBudgets() async throws {
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-malicious-record")
+        let store = try SpillBackedSortedArtifactStore(
+            directoryURL: storeRoot.appendingPathComponent("spill", isDirectory: true),
+            defaultDirectoryStem: "unused"
+        )
+        let formatBoundWriter = try store.makeWriter(
+            format: NamespaceManifestMaliciousSpillFormat(recordBound: 4),
+            header: Data([0x48]),
+            resourcePolicy: maliciousSpillPolicy(bufferBytes: 16)
+        )
+        do {
+            try await formatBoundWriter.append(Data(repeating: 0x52, count: 5))
+            XCTFail("Expected encoded record format-bound rejection")
+        } catch let error as NamespaceManifestMaliciousSpillError {
+            XCTAssertEqual(
+                error,
+                .failure(.corrupt("encoded record exceeds configured bound"))
+            )
+        }
+
+        let byteBudgetWriter = try store.makeWriter(
+            format: NamespaceManifestMaliciousSpillFormat(recordBound: 16),
+            header: Data([0x48]),
+            resourcePolicy: maliciousSpillPolicy(bufferBytes: 4)
+        )
+        do {
+            try await byteBudgetWriter.append(Data(repeating: 0x52, count: 5))
+            XCTFail("Expected encoded record byte-budget rejection")
+        } catch let error as NamespaceManifestMaliciousSpillError {
+            XCTAssertEqual(error, .failure(.resourceAdmission))
+        }
+
+        XCTAssertTrue(store.activeArtifactURLs.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: store.directoryURL.path).isEmpty)
+    }
+
+    func testGenericSpillRejectsOversizedControlFramesAndIntegerOverflow() async throws {
+        let storeRoot = try temporaryRoots.makeRoot(suiteName: "WorkspaceRootNamespaceManifest-malicious-frame")
+        let store = try SpillBackedSortedArtifactStore(
+            directoryURL: storeRoot.appendingPathComponent("spill", isDirectory: true),
+            defaultDirectoryStem: "unused"
+        )
+        let policy = maliciousSpillPolicy(bufferBytes: 16)
+
+        XCTAssertThrowsError(try store.makeWriter(
+            format: NamespaceManifestMaliciousSpillFormat(
+                recordBound: Int(UInt32.max)
+            ),
+            header: Data([0x48]),
+            resourcePolicy: policy
+        )) { error in
+            XCTAssertEqual(
+                error as? NamespaceManifestMaliciousSpillError,
+                .failure(.invalidConfiguration)
+            )
+        }
+
+        let oversizedHeader = try store.makeWriter(
+            format: NamespaceManifestMaliciousSpillFormat(
+                recordBound: 16,
+                headerBound: 1
+            ),
+            header: Data([0x48, 0x48]),
+            resourcePolicy: policy
+        )
+        try await oversizedHeader.append(Data([0x52]))
+        do {
+            _ = try await oversizedHeader.finish()
+            XCTFail("Expected oversized header rejection")
+        } catch let error as NamespaceManifestMaliciousSpillError {
+            XCTAssertEqual(
+                error,
+                .failure(.corrupt("encoded header exceeds configured bound"))
+            )
+        }
+
+        let oversizedFooter = try store.makeWriter(
+            format: NamespaceManifestMaliciousSpillFormat(
+                recordBound: 16,
+                footerBound: 1,
+                footerFrame: Data([0x46, 0x46])
+            ),
+            header: Data([0x48]),
+            resourcePolicy: policy
+        )
+        try await oversizedFooter.append(Data([0x52]))
+        do {
+            _ = try await oversizedFooter.finish()
+            XCTFail("Expected oversized footer rejection")
+        } catch let error as NamespaceManifestMaliciousSpillError {
+            XCTAssertEqual(
+                error,
+                .failure(.corrupt("encoded footer exceeds configured bound"))
+            )
+        }
+
+        let format = NamespaceManifestMaliciousSpillFormat(recordBound: 16)
+        XCTAssertThrowsError(try SpillBackedSortedArtifactChecked.uint32Length(
+            Int(UInt32.max),
+            label: "test record",
+            format: format
+        )) { error in
+            XCTAssertEqual(
+                error as? NamespaceManifestMaliciousSpillError,
+                .failure(.corrupt("test record length overflow"))
+            )
+        }
+        XCTAssertThrowsError(try SpillBackedSortedArtifactChecked.add(
+            UInt64.max,
+            1,
+            label: "test catalog byte count",
+            format: format
+        )) { error in
+            XCTAssertEqual(
+                error as? NamespaceManifestMaliciousSpillError,
+                .failure(.corrupt("test catalog byte count overflow"))
+            )
+        }
+
+        XCTAssertTrue(store.activeArtifactURLs.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: store.directoryURL.path).isEmpty)
     }
 
     func testFooterCountOverflowReturnsTypedCorruption() throws {
@@ -430,6 +800,18 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         )
     }
 
+    private func maliciousSpillPolicy(
+        bufferBytes: Int
+    ) -> SpillBackedSortedArtifactResourcePolicy {
+        SpillBackedSortedArtifactResourcePolicy(
+            maximumBufferedRecordBytes: bufferBytes,
+            maximumRecordsPerBatch: 1,
+            maximumRecordByteCount: 64,
+            maximumOpenRuns: 2,
+            minimumFreeDiskBytes: 0
+        )
+    }
+
     private func makeManifest(
         in store: WorkspaceRootNamespaceManifestStore,
         root: URL,
@@ -464,7 +846,16 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
     private func flipByte(in url: URL) throws {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let byteCount = try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value
-        let offset = byteCount / 2
+        try flipByte(in: url, at: byteCount / 2)
+    }
+
+    private func flipLastByte(in url: URL) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let byteCount = try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value
+        try flipByte(in: url, at: byteCount - 1)
+    }
+
+    private func flipByte(in url: URL, at offset: UInt64) throws {
         let handle = try FileHandle(forUpdating: url)
         try handle.seek(toOffset: offset)
         let byte = try XCTUnwrap(try handle.read(upToCount: 1)?.first)
@@ -472,6 +863,21 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
         try handle.write(contentsOf: Data([byte ^ 0xFF]))
         try handle.synchronize()
         try handle.close()
+    }
+
+    private func replaceFileWithCopy(at url: URL) throws {
+        let replacement = url.deletingLastPathComponent().appendingPathComponent(
+            ".replacement-\(UUID().uuidString.lowercased())"
+        )
+        try Data(contentsOf: url).write(to: replacement, options: .withoutOverwriting)
+        guard chmod(replacement.path, 0o600) == 0 else {
+            throw WorkspaceRootNamespaceManifestError.io(operation: "replacement-chmod", code: errno)
+        }
+        guard rename(replacement.path, url.path) == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: replacement)
+            throw WorkspaceRootNamespaceManifestError.io(operation: "replacement-rename", code: code)
+        }
     }
 
     private func createRawFile(named bytes: [UInt8], in root: URL) throws -> Bool {
@@ -499,6 +905,124 @@ final class WorkspaceRootNamespaceManifestTests: XCTestCase {
             result.append(contentsOf: bytes.map(CChar.init(bitPattern:)))
             result.append(0)
             return result
+        }
+    }
+}
+
+private enum NamespaceManifestMaliciousSpillError: Error, Equatable {
+    case failure(SpillBackedSortedArtifactFailure)
+}
+
+private struct NamespaceManifestMaliciousSpillFormat: SpillBackedSortedArtifactFormat {
+    let fileExtension = "malicious"
+    let recordBound: Int
+    let finalRecordBound: Int
+    let maximumEncodedHeaderByteCount: Int
+    let maximumEncodedFooterByteCount: Int
+    let footerFrame: Data
+
+    init(
+        recordBound: Int,
+        finalRecordBound: Int? = nil,
+        headerBound: Int = 16,
+        footerBound: Int = 16,
+        footerFrame: Data = Data([0x46])
+    ) {
+        self.recordBound = recordBound
+        self.finalRecordBound = finalRecordBound ?? recordBound
+        maximumEncodedHeaderByteCount = headerBound
+        maximumEncodedFooterByteCount = footerBound
+        self.footerFrame = footerFrame
+    }
+
+    func error(_ failure: SpillBackedSortedArtifactFailure) -> any Error {
+        NamespaceManifestMaliciousSpillError.failure(failure)
+    }
+
+    func validate(_: Data, maximumRecordByteCount _: Int) throws {}
+
+    func encodeRecord(_ record: Data) throws -> Data {
+        record
+    }
+
+    func decodeRecord(_ payload: Data) throws -> Data {
+        payload
+    }
+
+    func maximumEncodedRecordByteCount(maximumRecordByteCount _: Int) -> Int {
+        recordBound
+    }
+
+    func maximumEncodedFinalRecordByteCount(maximumRecordByteCount _: Int) -> Int {
+        finalRecordBound
+    }
+
+    func ordering(_ lhs: Data, _ rhs: Data) -> SpillBackedSortedArtifactOrdering {
+        if lhs == rhs { return .same }
+        return lhs.lexicographicallyPrecedes(rhs) ? .ascending : .descending
+    }
+
+    func encodeFinalHeader(_ header: Data) throws -> Data {
+        header
+    }
+
+    func encodeFinalRecord(_: Data, encodedRecord: Data) throws -> Data {
+        encodedRecord
+    }
+
+    func makeFinalAccumulator() -> UInt64 {
+        0
+    }
+
+    func accumulateFinalRecord(
+        _: Data,
+        encodedRecordByteCount _: Int,
+        into accumulator: inout UInt64
+    ) throws {
+        accumulator += 1
+    }
+
+    func makeFinalFooter(accumulator _: UInt64, digest _: Data) throws -> Data {
+        footerFrame
+    }
+
+    func encodeFinalFooter(_ footer: Data) throws -> Data {
+        footer
+    }
+}
+
+private actor NamespaceManifestTransactionGate {
+    private var isPaused = false
+    private var isReleased = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pause() async {
+        isPaused = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilPaused() async {
+        guard !isPaused else { return }
+        await withCheckedContinuation { continuation in
+            pauseWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 }
