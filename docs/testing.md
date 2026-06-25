@@ -193,6 +193,350 @@ python3 -m py_compile Scripts/benchmark_agent_mode_file_tools.py Scripts/test_ag
 python3 Scripts/test_agent_mode_file_tools_benchmark.py
 ```
 
+## Live large-workspace worktree-startup diagnostic
+
+`Scripts/worktree_startup_live_benchmark.py` is the reusable validation lane for
+large-root and linked-worktree startup. It drives `rpce-cli-debug` and the
+DEBUG-only `worktree_startup_benchmark` diagnostics. It never builds, installs,
+launches, stops, or relaunches RepoPrompt. A fresh-process (cold) run therefore
+requires a separately approved relaunch before invoking the script; label a run
+`cold` only when that boundary is true. An aged run requires the configured
+minimum existing Agent Mode session count and keeps aged and warm samples in
+separate distributions.
+
+This is a runtime diagnostic, not XCTest coverage. It does not add executable
+test IDs and must not change the curated test ledger.
+
+### Dedicated workspace and plan
+
+Use a disposable workspace whose name starts with `RPCE 8E Bench `. Never use
+the active development checkout: the driver rejects its own repository root.
+Create/open a separate disposable root with `rpce-cli-debug`, bind the benchmark
+tab, and record its exact window, workspace, context, and root IDs. A name or
+current selection is not proof of isolation. Create an exclusive root marker
+with a new owner UUID after those stable IDs exist:
+
+```bash
+OWNER_TOKEN="$(uuidgen)"
+python3 Scripts/worktree_startup_live_benchmark.py create-marker \
+  --root-path /absolute/path/to/disposable/large/repository \
+  --workspace-id '<workspace-uuid>' \
+  --root-id '<root-uuid>' \
+  --owner-token "$OWNER_TOKEN" \
+  --confirm-disposable-root
+```
+
+The marker binds its canonical root, workspace UUID, root UUID, owner token,
+disposable purpose, and SHA-256 digest. Preflight/run/smoke/cleanup also resolve
+the workspace by UUID through `manage_workspaces`, require the exact name and
+root membership, and require the planned root to be the sole root before and
+after the campaign. A missing, changed, renamed, system/current-only, or
+operator-named substitute is rejected. Workspace creation, root
+addition/removal, and visible window changes can request app approval; prepare
+the workspace before the campaign.
+
+Write an immutable plan without contacting the app:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py plan \
+  --workspace-name "RPCE 8E Bench 20260625T120000Z" \
+  --window-id 3 \
+  --workspace-id '<workspace-uuid>' \
+  --context-id '<context-uuid>' \
+  --root-id '<root-uuid>' \
+  --root-path /absolute/path/to/large/repository \
+  --owner-token "$OWNER_TOKEN" \
+  --dataset-label rpce-large \
+  --asserted-file-count 100000 \
+  --base-ref HEAD \
+  --search-marker WorkspaceRootSeedPlanner \
+  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-marker WorkspaceRootSeedPlanner \
+  --invocations-per-series 3 \
+  --output /tmp/rpce-worktree-startup-plan.json
+```
+
+`asserted_file_count` is operator-supplied provenance, not an app measurement.
+The plan freezes the ownership-marker digest; do not recreate or edit the marker
+between cohorts.
+The plan records the complete required matrix: baseline, forced-full, and
+projected routes; cold, warm, and aged processes; main checkout and linked
+worktree; widths 1/2/4/8; nested inherited-worktree Agent Mode; selection and
+`get_code_structure`; exact-root/cross-root negatives; non-Git behavior;
+watcher create/edit/rename/delete; and ordinary/worktree root churn while
+agents remain active and while file/search/selection/codemap calls are in
+flight.
+
+Run schema discovery and exact-scope verification before mutation:
+
+Explicitly enable the DEBUG-only gate for the campaign; the harness verifies it
+but never changes this global setting on the operator's behalf:
+
+```bash
+rpce-cli-debug -w 3 -c app_settings -j \
+  '{"op":"set","key":"agent_mode.worktree_startup_benchmark_diagnostics_enabled","value":true}'
+```
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py preflight \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --confirm-live-debug-app
+```
+
+Preflight freezes SHA-256 hashes for the relevant CLI schemas and requires the
+DEBUG benchmark token plus `manage_workspaces.remove_folder`. A schema or scope
+change invalidates the campaign; do not silently substitute IDs.
+Restore the gate to its prior value after all run/smoke cleanup completes.
+
+### Route and concurrency cohorts
+
+Run one route/process/checkout/width series at a time. Every retained series
+uses one excluded warmup and 3–5 normal samples; five is the release-gate
+default. The plan defaults to exactly three invocation artifacts per matrix
+cell. Valid slow samples remain included. A rerun gets a new invocation ID and
+never replaces the old artifact; an unplanned extra invocation makes the
+campaign incomplete rather than supplying replacement samples.
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py run \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --route forced-full \
+  --process-state warm \
+  --checkout-kind linked-worktree \
+  --width 4 \
+  --invocation 1 \
+  --warmups 1 \
+  --samples 5 \
+  --confirm-live-debug-app \
+  --confirm-process-state
+```
+
+Repeat for `baseline`, `forced-full`, and `projected`; process states `cold`,
+`warm`, and `aged`; and widths 1/2/4/8. Automated route samples are always
+app-created `linked-worktree` starts. `baseline` is the ordinary automatic
+full-crawl control.
+`forced-full` forces that safe route. `projected` is valid only when the export
+contains exactly one `diffSeedServing` publication, no `fullCrawl`, and no
+fallback. Observation/full-crawl data is work-attribution evidence, not a
+projected-serving latency sample.
+
+Actual-route accounting is exact: baseline and forced-full each require exactly
+`{"fullCrawl":1}`, projected requires exactly `{"diffSeedServing":1}`, and
+every cohort requires an empty fallback map. Configured route names alone never
+satisfy the gate.
+
+The current DEBUG token does not measure initial main-workspace opening. Capture
+main-checkout cold/warm root-ready/search/read separately from the existing
+restore/readiness diagnostics and retain it beside the campaign; the driver
+does not offer a label-only `main` route that could be mistaken for a real
+measurement. If that evidence is absent, the final decision is `incomplete`,
+never a pass.
+Record reviewed external evidence in the same plan namespace rather than
+putting an unstructured claim in the scoreboard:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py record-evidence \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --scenario cold-main-workspace-open-root-ready \
+  --status pass \
+  --details /tmp/cold-main-sanitized-details.json \
+  --output /tmp/cold-main-evidence.json
+```
+
+Also record `main-checkout-cold-warm-root-search-read`. The other required
+records are `fresh-process-provenance`,
+`aged-process-session-and-thread-inventory`, and
+`host-sleep-and-thermal-validity`. `aggregate --evidence <file>` accepts each
+reviewed record; missing or plan-mismatched evidence keeps the gate incomplete.
+
+Each sample records correlation-scoped:
+
+- p50/p95 materialize-to-root-ready, first-search completion, and first-read
+  completion;
+- first search/read tool duration;
+- configured and actual route plus every fallback reason;
+- Git command count, family, priority, duration, and queue wait;
+- filesystem operation/item/duration counts and codemap attribution;
+- process CPU, average/peak core utilization, peak and retained resident memory,
+  and peak and retained physical footprint;
+- content oracles, receipt ambiguity/eviction, and cleanup state.
+
+Every sample record, diagnostic export, and ordinal has a one-to-one mapping
+to a unique correlation UUID and unique Agent Mode session UUID. Aggregation
+rejects reuse, disagreement between record/export IDs, duplicate ordinals,
+mixed artifact/cohort identities, and extra or missing invocation/sample
+counts. Any attempted sample—including an excluded warmup—with route,
+attribution, or correctness failure invalidates the cohort and campaign; valid
+extras cannot mask it.
+
+### Correctness, watchers, and root churn
+
+Run the smoke lane after route sampling:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py smoke \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --confirm-live-debug-app \
+  --confirm-dedicated-workspace
+```
+
+The smoke lane uses a script-owned app worktree and temporary roots. It checks:
+
+- a nested child started from the parent context has the exact parent session
+  and inherited worktree, reaches terminal `completed`, returns the expected
+  marker, and has one ordered inherited-root `file_search` plus `read_file`
+  tool-call/result pair in its structured transcript. Prompt/request text,
+  assistant prose, missing result payloads, or non-success tool status cannot
+  satisfy this check;
+- selection and explicit/selected `get_code_structure` return the exact planned
+  canonical root UUID/path/type and exact file path/type/content in structured
+  MCP JSON, and exclude cross-root/non-Git records;
+- main/worktree/non-Git marker searches do not leak across explicit root filters;
+- non-Git search/read work and codemap returns an explicit typed unavailable
+  status and issue code rather than a
+  graph from another root, with exactly one attributed `get_code_structure`
+  work record and zero Git commands;
+- watcher create, edit, rename, and delete converge via bounded polling of
+  structured exact-root success/empty records;
+- before, during, and after every ordinary/linked-worktree add/remove, the
+  parent remains `running` on the identical context and the during-poll overlaps
+  the mutation interval;
+- added roots appear in the exact workspace inventory and pass search/read,
+  selection, and codemap checks; removed roots disappear from inventory and
+  revoke search/read/selection/codemap state;
+- add/remove overlaps at least one in-flight `file_search`, `read_file`,
+  selection, or `get_code_structure` subprocess call, rather than claiming a
+  race from calls that already completed;
+- removed-root search/read/codemap calls retain successful CLI/tool transport
+  and return an explicit `not_found`, `unavailable`, or `removed` status plus a
+  recognized typed issue code for the exact former root UUID/path. Generic CLI,
+  transport, or tool failure is a test failure; surviving roots must still be
+  usable through exact-root structured records.
+
+The harness records and checks parent and child terminal status, removes only
+roots it added, cancels/waits only sessions it started, and removes registered,
+clean, script-owned worktrees only after every relevant agent is terminal or
+cancelled. Cleanup evidence must include terminal agents, removed secondary
+roots/worktrees, restored route control, unchanged benchmark setting, successful
+diagnostic reset, stopped resource sampling, and restoration to the sole planned
+root. Dirty, nonterminal, missing-identity, or otherwise ambiguous resources are
+preserved for manual cleanup. Resume interrupted cleanup with:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py cleanup \
+  --artifact /tmp/rpce-worktree-startup/v1/<run> \
+  --confirm-live-debug-app \
+  --confirm-owned-resources
+```
+
+Resumed cleanup always sends a memory-sampler stop request and follows it with
+an explicit current-state query. Both calls must succeed and report
+`running:false`; a stale state-file flag is not accepted. Worktree removal still
+occurs only after all recorded agents are terminal/cancelled.
+
+Raw CLI responses may contain paths or source snippets. Run directories are
+created non-overwriting with mode `0700`; files use `0600`. Review before
+sharing. Summary/scoreboard output must not be treated as privacy-scrubbed raw
+evidence.
+
+### Aggregation, thresholds, and append-only scoreboard
+
+Aggregate offline after collecting every matrix cell and correctness smoke:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py aggregate \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --artifact /tmp/rpce-worktree-startup/v1/<run-1> \
+  --artifact /tmp/rpce-worktree-startup/v1/<run-2> \
+  --evidence /tmp/cold-main-evidence.json \
+  --output /tmp/rpce-worktree-startup-aggregate
+```
+
+The aggregate emits `summary.json` and a reviewable
+`scoreboard-section.md`. After reviewing evidence and paths, append—never
+rewrite—the candidate to
+`prompt-exports/optimize-content-addressed-codemaps-runs.md`. The explicit
+automation path is guarded and append-only:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py aggregate \
+  ... \
+  --append-scoreboard prompt-exports/optimize-content-addressed-codemaps-runs.md \
+  --confirm-append-scoreboard
+```
+
+The production-enable gate is all-or-nothing:
+
+1. zero file/folder/search/read/selection/codemap/watcher/root-lifecycle
+   correctness mismatches;
+2. zero eligible projected fallbacks after warmup;
+3. projected p95 improves at least 40% over forced-full for root-ready,
+   first-search, and first-read;
+4. every other latency p95 regresses no more than 5%;
+5. absolute peak/final RSS and physical-footprint growth are each no more than
+   10%, including width 8 and aged-app cohorts; signed deltas are report-only,
+   and missing, zero, negative, or non-finite control baselines fail closed;
+6. artifact IDs, cohort/invocation keys, sample ordinals, correlation UUIDs,
+   and session UUIDs are unique, one-to-one, and cannot mix reruns; planned
+   invocation and sample counts are exact;
+7. every documented CPU/RSS, Git, filesystem, actual-route, and fallback field
+   is present and valid: availability is explicit; counts are nonnegative
+   integers; Git family and priority totals equal command count; filesystem
+   operation/item counts and duration are typed and internally consistent;
+   RSS/physical-footprint absolutes are positive finite values with coherent
+   peaks/deltas; CPU totals, sample count, duration, and average/peak core
+   utilization are finite, ranged, and internally consistent;
+8. teardown evidence is complete: agents terminal, secondary roots/worktrees
+   removed, memory sampling stopped and independently verified, route/settings
+   restored or unchanged, diagnostics reset, and the sole planned root restored.
+
+Missing matrix cells, CPU/physical-footprint data, cold main-root evidence, or
+correctness evidence yields `incomplete`. Any recorded invalid attempt yields
+`fail`; it is never silently excluded from campaign validity. Never infer a gate
+from configured route names, untyped text, generic tool failures, or additional
+valid samples.
+
+### 100k and 1M synthetic hooks
+
+The routine namespace-manifest scale contract generates 100,000 records and
+asserts exact record/read counts, more than 100 initial spill runs, and bounded
+buffer bytes:
+
+```bash
+make dev-test \
+  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+```
+
+The opt-in one-million-record version uses the same executable oracle and
+resource policy; keep it separate from ordinary root-suite timing:
+
+```bash
+REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 \
+  make dev-test \
+  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes
+```
+
+These hooks validate spill/streaming scale, not live Agent Mode latency. The
+live 100k/1M workspace campaign still needs the route, resource, correctness,
+and teardown thresholds above.
+
+Script-only validation, with no app or CLI calls:
+
+```bash
+python3 -m py_compile Scripts/worktree_startup_live_benchmark.py
+python3 Scripts/worktree_startup_live_benchmark.py --help
+python3 Scripts/worktree_startup_live_benchmark.py create-marker --help
+python3 Scripts/worktree_startup_live_benchmark.py self-test
+python3 Scripts/worktree_startup_live_benchmark.py self-test --help
+python3 Scripts/worktree_startup_live_benchmark.py plan --help
+python3 Scripts/worktree_startup_live_benchmark.py record-evidence --help
+python3 Scripts/worktree_startup_live_benchmark.py preflight --help
+python3 Scripts/worktree_startup_live_benchmark.py run --help
+python3 Scripts/worktree_startup_live_benchmark.py smoke --help
+python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
+python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
+```
+
 ## Handoff checklist
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.
