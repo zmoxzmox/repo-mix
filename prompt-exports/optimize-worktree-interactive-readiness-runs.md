@@ -505,3 +505,156 @@ evidence**, points to the recorded forced-full and projected artifacts, and
 marks the measurement **incomplete**. This correction changes only the campaign
 index row; it does not replace or reinterpret any raw sample or appended
 iteration-1 measurement detail above.
+
+## 2026-06-26 — Oracle iteration-1 disposition (append-only)
+
+- Oracle chat `readiness-optimization-66CC5D` decision: **RETAIN iteration 1**.
+- This retains the single streamed loaded-root Git authority evidence change;
+  it is not a performance-gate pass and does not reinterpret the invalid prior
+  timing ordinals. The implementation removed the attributed 10,000-record
+  authority blocker, retained fail-closed behavior, and passed its focused
+  boundedness/currentness evidence.
+- The prior live run could not decide primary performance because the harness
+  coupled completed root/search/read timing to codemap/tree/selection follow-on
+  acceptance. The approved measurement-support correction is to preserve a
+  correlation-bound `primary_performance` result independently while keeping
+  failed `follow_on_acceptance` visible and campaign-blocking.
+- Campaign status remains **incomplete** until a fresh same-build forced-full
+  and projected one-plus-five width-1 series establishes valid primary values,
+  exact routes with empty fallbacks, separate follow-on status, resource and
+  cleanup proof, and any required high-CV confirmation. No production
+  scheduling, Git locking, seed planning, codemap behavior, or threshold change
+  is authorized by this disposition.
+
+## 2026-06-26 — Iteration-1 measurement-support rerun (append-only)
+
+### Frozen build, scope, plans, and preflights
+
+- Single approved coordinated relaunch: ticket
+  `7063e284-c1c0-44a6-b660-f46ea70692d2`, PID `45589`.
+- Build/checkout identity: CLI SHA-256
+  `4fdd50df7891d354d9ea3cfcd4f447e8d028e458a8f451f2965c2fa1500873d8`,
+  HEAD `be61584899ed2ef5623817b2ad80815c13e4cbeb`, 2,141 tracked files.
+- Window/workspace/control-context/current-root:
+  `1` / `163E658F-4313-4894-B003-595287E59AE9` /
+  `E7BC2FDA-0CBD-4DE9-9C94-C31984E5F783` /
+  `8377314A-3965-414D-A5A4-BFCE60810763`. Runtime showed the fully loaded
+  real root current with no session-worktree owners.
+- Fresh primary/confirmation plans:
+  `/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/primary-plan.json`
+  (`dea1b3b16557a6d13dfba7b46c16184485355ab0884ca4deeab704e1e198d367`)
+  and `confirmation-plan.json`
+  (`bb46ca42c3c083719a6cfed0cf74fdc257f473009739d7ba29d7ab0d7d5d550b`).
+  Both used search marker `WorkspaceRootSeedPlanner`, first-80-line read marker
+  `import CryptoKit`, and read blob SHA-256
+  `72df72ed69de7c24a1efbdfa7ffee41f0b32815b5b3ec303c95dc1c0bb7a5aba`.
+- Fresh preflights passed at
+  `/tmp/rpce-worktree-startup/v1/20260626T182307Z-preflight-ef10ec53`
+  and `/tmp/rpce-worktree-startup/v1/20260626T182308Z-preflight-d374efd7`.
+
+### Forced-full primary performance and separate follow-on status
+
+Artifact:
+`/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414`
+
+- One excluded warmup plus all five retained ordinals completed; no replacement
+  or retry occurred. Corrected primary revalidation is preserved separately at
+  `/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/forced-full-primary-revalidation.json`.
+- Retained primary raw values: `[898.364, 1021.922, 972.808, 946.328,
+  866.379] ms`.
+- Primary p50 / nearest-rank p95 / population CV:
+  `946.328 ms` / `1021.922 ms` / `0.058147`.
+- Warmup primary value: `726.572 ms` (excluded).
+- Every checkpoint independently passed correlation/session/child-context and
+  frozen-scope identity, build/invocation/ordinal, ordered root/search/read
+  boundaries, direct structured search+read logical/physical worktree binding,
+  committed path/content, terminal receipt, actual route `{"fullCrawl":1}`,
+  `{}` fallbacks, resource evidence, and cleanup.
+- The original artifact summary recorded primary invalid because the first
+  harness revision compared the diagnostic's frozen control-scope context to
+  the separate child context and required the non-live sampler spelling
+  `physical_footprint_available`. The immutable checkpoints/resources were
+  revalidated only after correcting those two validators; no ordinal or raw
+  value was rewritten.
+- `follow_on_acceptance`: **failed for all six attempts** and remains
+  campaign-blocking. Passive tree omitted the required exact current
+  marker/legend and selection evidence omitted structured `worktree_scope`;
+  the initial collector also mislabeled successful codemap evidence until its
+  success default was corrected. Final diagnostic reason was
+  `content_oracle_mismatch`. Thus these valid primary values do not make the
+  campaign acceptable.
+- Resource session: 2,352 samples over 243.4 s; average/peak core
+  123.2%/370.1%; resident baseline/peak/final 306.2/390.1/390.1 MiB
+  (peak/retained delta 83.9 MiB); physical footprint baseline/peak/final
+  117.8/193.3/193.3 MiB (peak/retained delta 75.5 MiB); CPU 299,833.7 ms.
+
+### Projected primary/follow-on status and confirmation rule
+
+Artifact:
+`/tmp/rpce-worktree-startup/v1/20260626T183107Z-warm-projected-w1-79fadf26`
+
+- The single predeclared projected invocation timed out after 300 seconds while
+  awaiting correlation-scoped `set_flags`. No sample, route, fallback, or
+  primary value was produced; acquired session/worktree/resource counts were
+  zero and cleanup completed. It was not retried or replaced.
+- Projected retained primary raw values: `[]`; p50/p95/CV unavailable.
+  Therefore no forced-full/projected improvement claim is possible.
+- The predeclared confirmation plan was not run: projected primary CV does not
+  exist, so the `>50%` confirmation trigger cannot be evaluated. Series were
+  not pooled.
+
+### Transcript/direct-probe smoke and cleanup
+
+- Smoke artifact:
+  `/tmp/rpce-worktree-startup/v1/20260626T183642Z-correctness-smoke-4bed38a5`.
+  The run timed out after 300 seconds at watcher `apply_edits`, so it is failed
+  evidence. The completed parent emitted only eight alternating calls and no
+  paired result events; direct structured search passed exact logical/physical
+  scope, while direct read lacked unambiguous path attribution. Evidence:
+  `/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/smoke-transcript-direct-probe-evidence.json`.
+- Both smoke-owned sessions are terminal, the owned parent worktree/branch and
+  temporary roots/directories are absent, and raw workspace inventory again
+  shows the sole real root. Forced-full and projected cleanup were complete;
+  the dedicated diagnostic scope was reset. The exact ownership marker was
+  deleted only after purpose/path/workspace/root/owner verification. Proof:
+  `/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/final-owned-cleanup-proof.json`.
+- Final campaign disposition: **incomplete / fail closed**. Iteration 1 remains
+  retained per the Oracle disposition above, but projected primary performance,
+  all follow-on acceptance, transcript/direct-probe smoke, and the same-build
+  comparison are not established.
+
+## Iteration 1 measurement-support P1 closure correction — 2026-06-26
+
+- Correction to the projected wording above: the 300-second `set_flags`
+  timeout was **scope-bound and pre-correlation**, not correlation-scoped. No
+  benchmark arm token/correlation was established and no sample, route,
+  fallback, or primary value was produced. This wording correction does not
+  change the incomplete/fail-closed campaign disposition.
+- Reproducible offline primary revalidation provenance is persisted at
+  `prompt-exports/worktree-readiness-iteration1-forced-full-revalidation-provenance.json`.
+  It records SHA-256 hashes for the frozen plan, artifact plan, summary,
+  `samples.ndjson`, resources, cleanup, every source record, and every primary
+  checkpoint; validator source SHA-256
+  `1ce57f9421137aacc5f0140eae183ea27edf7540b372b9c4c9e7ae73579eef85`
+  at validator version 1; and the exact offline command/cwd.
+- Source and revalidated retained values are independently recorded as the
+  unchanged ordered list `[898.364, 1021.922, 972.808, 946.328, 866.379] ms`;
+  the excluded warmup remains `[726.572] ms`. Six unique
+  correlation/session identities, exact ordinals 1–6, matching source and
+  revalidated checkpoint hashes, exact artifact identity, valid resources,
+  and complete cleanup prove the values were neither rewritten nor mixed.
+- The harness now fails primary validity for either a false recorded concurrent
+  outcome/mark failure or non-overlapping search/read intervals; applies an
+  exact single-terminal receipt oracle; and fails follow-on acceptance closed
+  on incomplete typed operation/mark/failure inventories or selection
+  completion before selection-get. Follow-on failure remains visible and
+  campaign-blocking without erasing a valid primary value.
+- Closure validation was limited to
+  `python3 -m py_compile Scripts/worktree_startup_live_benchmark.py` and
+  `python3 Scripts/worktree_startup_live_benchmark.py self-test`; both passed,
+  including sequential-operation, receipt, follow-on totalization, provenance,
+  cleanup, and unchanged high-CV confirmation-policy cases. No live run,
+  relaunch, production edit, broad test, retry/replacement, or commit occurred.
+- Oracle iteration-1 decision remains **RETAIN**. Work stops here for independent
+  re-review; campaign acceptance remains incomplete because follow-ons and the
+  projected comparison are not established.

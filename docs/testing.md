@@ -225,6 +225,28 @@ values, p50, nearest-rank p95, and sample CV. CV above 50% requires a distinct
 predeclared confirmation plan with another one-plus-five series; do not pool the
 series, and accept a direction only when both agree.
 
+Primary performance validity is intentionally separate from follow-on
+acceptance. Immediately after concurrent direct search/read, the harness takes
+a correlation-bound diagnostic checkpoint. `primary_performance` requires the
+exact correlation/session/context/invocation/ordinal/build identity, ordered
+root/search/read boundaries, both the recorded concurrent outcome with empty
+mark failures and strict cross-operation interval overlap, successful structured direct probes with logical
+canonical display plus exact physical `worktree_scope`, the frozen committed
+path/blob markers, exactly one unambiguous correlation-bound receipt decision
+at the consumption terminal stage with route-specific creation/coordinator/
+projection/consumption semantics, the exact actual route, no
+fallbacks, and final resource/cleanup proof. Codemap, passive tree, and
+selection are stored under `follow_on_acceptance`. A follow-on failure remains
+campaign-blocking and visible but does not discard a valid primary value.
+Follow-on collection is total: timeout/malformed results are typed, every
+configured operation records exact start/completion mark outcomes, a failed
+start mark cannot be replaced by validator success, selection completes only
+after its selection-get result is recorded, later follow-ons still run, and the
+final diagnostic export is attempted once without retry or ordinal replacement.
+Acceptance validates the exact typed operation and failure inventory plus the
+collection-completed mark. `get_code_structure` keeps its internal 10-second
+deadline; the harness supplies no model-controlled wait field.
+
 Plan and preflight the real root with explicit ownership and dedicated-workspace
 confirmation:
 
@@ -245,7 +267,7 @@ python3 Scripts/worktree_startup_live_benchmark.py plan \
   --asserted-file-count '<exact-git-ls-files-count>' --base-ref HEAD \
   --search-marker WorkspaceRootSeedPlanner \
   --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
-  --read-marker WorkspaceRootSeedPlanner --invocations-per-series 1 \
+  --read-marker 'import CryptoKit' --invocations-per-series 1 \
   --confirm-real-repository-benchmark --confirm-dedicated-workspace \
   --output /tmp/rpce-real-readiness-iteration-0.json
 
@@ -253,6 +275,23 @@ python3 Scripts/worktree_startup_live_benchmark.py preflight \
   --plan /tmp/rpce-real-readiness-iteration-0.json \
   --confirm-live-debug-app --confirm-dedicated-workspace
 ```
+
+For an offline revalidation of an immutable forced-full one-plus-five artifact,
+persist the exact artifact-file hashes, per-sample checkpoint and source-record
+hashes, harness/validator source hash and version, exact command, sample
+identities, and unchanged warmup/retained raw values:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py revalidate-primary \
+  --plan '<frozen-primary-plan.json>' \
+  --artifact '<forced-full-artifact-directory>' \
+  --output '<primary-revalidation-provenance.json>'
+```
+
+This command is offline and accepts only an exact width-1 forced-full artifact
+with one warmup and five retained ordinals. It fails closed on mixed identities,
+changed raw values, missing hashes, invalid primary checkpoints, resource
+failure, or incomplete cleanup; it does not rewrite the source artifact.
 
 Run width 1 forced-full, then projected. Do not run widths 4/8 or aged until
 width-1 projected has exactly `{"diffSeedServing":1}` and an empty fallback map:
@@ -268,17 +307,18 @@ for ROUTE in forced-full projected; do
 done
 ```
 
-Timing evidence comes from correlation-bound diagnostics and direct structured
-tool results, not inference wall time or assistant prose. Session-bound tools
+Timing evidence comes from the correlation-bound primary checkpoint and direct
+structured tool results, not inference wall time or assistant prose. Session-bound tools
 must keep CE's logical canonical root display while `worktree_scope` proves the
 exact physical binding by worktree ID; never require the displayed root path to
 equal the app-managed worktree path. Schema-v5 samples require every readiness
 boundary, monotonic phase order, duration consistency, attributed passive-tree
 work, and configured marker-publication evidence. The small inference gate
 separately checks exact raw tool-call/result order and forbidden-tool absence.
-Retain root/search/read, first and warm codemap, passive tree, selection,
-Git/filesystem/planner/lock, CPU/RSS/physical-footprint, cleanup, and actual-route
-evidence. Append iteration results to
+Retain root/search/read in `primary_performance`; retain first and warm codemap,
+passive tree, selection, Git/filesystem/planner/lock, and marker evidence in
+`follow_on_acceptance`; retain CPU/RSS/physical-footprint, cleanup, and
+actual-route evidence for both validity decisions. Append iteration results to
 `prompt-exports/optimize-worktree-interactive-readiness-runs.md`.
 
 ### Dedicated workspace and plan

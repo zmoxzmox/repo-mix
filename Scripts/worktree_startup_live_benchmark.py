@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -31,6 +32,7 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 DIAGNOSTIC_SCHEMA_VERSION = 5
+PRIMARY_REVALIDATION_VERSION = 1
 DEBUG_TOOL = "__repoprompt_debug_diagnostics"
 WORKSPACE_PREFIXES = ("RPCE 8E Bench ", "RPCE Search Bench ")
 DEFAULT_OUTPUT_ROOT = "/tmp/rpce-worktree-startup/v1"
@@ -102,6 +104,20 @@ REQUIRED_BOUNDARY_KEYS = (
     "passiveBenchmarkTreeStarted", "passiveBenchmarkTreeCompleted",
     "benchmarkSelectionStarted", "benchmarkSelectionCompleted",
 )
+PRIMARY_BOUNDARY_KEYS = (
+    "bindingTransitionStarted", "rootReady",
+    "firstBenchmarkSearchStarted", "firstBenchmarkSearchCompleted",
+    "firstBenchmarkReadStarted", "firstBenchmarkReadCompleted",
+)
+PRIMARY_DURATION_METRICS = (
+    "materialize_to_root_ready", "materialize_to_first_search",
+    "materialize_to_first_read", "first_search", "first_read",
+)
+FOLLOW_ON_OPERATION_ORDER = (
+    "first_codemap", "warm_codemap", "passive_tree", "selection",
+)
+FOLLOW_ON_FAILURE_TYPES = {"timeout", "malformed", "transport_error", "mark_error"}
+RECEIPT_TERMINAL_STAGE = "consumption"
 BOUNDARY_DURATION_PAIRS = {
     "materialize_to_root_ready": ("bindingTransitionStarted", "rootReady"),
     "materialize_to_first_search": ("bindingTransitionStarted", "firstBenchmarkSearchCompleted"),
@@ -1630,6 +1646,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
 
     correlation = str(uuid.uuid4()).upper()
     session = str(uuid.uuid4()).upper()
+    context_id = str(uuid.uuid4()).upper()
     fixture_root = Path("/tmp/rpce-benchmark-structured-fixture").resolve()
     fixture_file = fixture_root / "Fixture.swift"
     fixture_root_id = str(uuid.uuid4()).upper()
@@ -2144,6 +2161,90 @@ def self_test_command(_args: argparse.Namespace) -> int:
         expected_file_path=str(fixture_file),
     )["ok"]
 
+    def receipt_fixture(route: str) -> dict[str, Any]:
+        consumption: dict[str, Any] = {
+            "owner_generation_match": "notEvaluated",
+            "hint_session_match": "notEvaluated",
+            "hint_correlation_match": "notEvaluated",
+            "hint_owner_match": "notEvaluated",
+            "ownership_reused": False,
+            "pending_seeded_preparation_result": None,
+        }
+        decision: dict[str, Any] = {
+            "correlation_id": correlation,
+            "ambiguous_or_duplicate": False,
+            "terminal_stage": RECEIPT_TERMINAL_STAGE,
+            "creation_attempt_count": 0,
+            "creation": None,
+            "coordinator": {
+                "create_result_receipt_count": 0,
+                "hint_count": 0,
+                "binding_count": 1,
+                "hint_keyed_by_created_binding": "notEvaluated",
+                "creation_fallback_observed": None,
+            },
+            "projection": {
+                "supplied_hint_count": 0,
+                "matched_hint_count": 0,
+                "all_hint_keys_matched_bindings": True,
+                "validation_fallback": None,
+            },
+            "consumption": consumption,
+        }
+        if route == "baseline":
+            consumption.update({
+                "selected_route": "fullCrawl",
+                "full_crawl_performed": True,
+                "initial_hint_observation": {"state": "disabled"},
+                "final_observation": {"state": "disabled"},
+            })
+        elif route == "forced-full":
+            consumption.update({
+                "selected_route": "fullCrawl",
+                "full_crawl_performed": True,
+                "initial_hint_observation": {
+                    "state": "fallback", "fallback_reason": "noReceipt",
+                },
+                "final_observation": {
+                    "state": "fallback", "fallback_reason": "noReceipt",
+                },
+            })
+        else:
+            decision.update({
+                "creation_attempt_count": 1,
+                "creation": {
+                    "receipt_emitted": True,
+                    "outcome": "receiptEmitted",
+                    "receipt_fallback_reason": None,
+                    "initialization_fallback_reason": None,
+                },
+                "coordinator": {
+                    "create_result_receipt_count": 1,
+                    "hint_count": 1,
+                    "binding_count": 1,
+                    "hint_keyed_by_created_binding": "match",
+                    "creation_fallback_observed": None,
+                },
+                "projection": {
+                    "supplied_hint_count": 1,
+                    "matched_hint_count": 1,
+                    "all_hint_keys_matched_bindings": True,
+                    "validation_fallback": None,
+                },
+            })
+            consumption.update({
+                "selected_route": "diffSeedServing",
+                "full_crawl_performed": False,
+                "owner_generation_match": "match",
+                "hint_session_match": "match",
+                "hint_correlation_match": "match",
+                "hint_owner_match": "match",
+                "initial_hint_observation": {"state": "eligible"},
+                "pending_seeded_preparation_result": {"state": "eligible"},
+                "final_observation": {"state": "eligible"},
+            })
+        return decision
+
     def export_fixture(route: str) -> dict[str, Any]:
         boundaries = {
             "bindingTransitionStarted": 0, "rootReady": 100,
@@ -2163,6 +2264,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
         }
         return {
             "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "scope": {"context_id": context_id},
             "sample": {
                 "valid": True,
                 "configured_route": ROUTES[route]["expected"],
@@ -2170,6 +2272,9 @@ def self_test_command(_args: argparse.Namespace) -> int:
                 "agent_session_id": session,
                 "invocation": 1,
                 "ordinal": 1,
+                "root_ready": True,
+                "first_search_complete": True,
+                "first_read_complete": True,
                 "route_counts": EXPECTED_ACTUAL_ROUTE_COUNTS[route],
                 "fallback_counts": {},
                 "durations_us": durations,
@@ -2178,6 +2283,11 @@ def self_test_command(_args: argparse.Namespace) -> int:
                 "boundary_evidence_available": True,
                 "boundary_invalid_reasons": [],
             },
+            "receipt_decision_count": 1,
+            "terminal_receipt_decision_count": 1,
+            "receipt_decision_buffer_evicted": False,
+            "receipt_decision_ambiguous": False,
+            "receipt_decisions": [receipt_fixture(route)],
             "git": {
                 "available": True, "command_count": 1, "families": {"test": 1},
                 "priorities": {"test": 1}, "queue_wait_us": 0, "duration_us": 1,
@@ -2219,6 +2329,336 @@ def self_test_command(_args: argparse.Namespace) -> int:
             expected_correlation=correlation, expected_session=session,
             expected_invocation=1, expected_ordinal=1,
         )
+
+    primary_build = {"cli_sha256": "a" * 64, "base_commit_oid": "b" * 40}
+    primary_fixture_identity = {
+        "base_commit_oid": "b" * 40,
+        "read_blob_sha256": "c" * 64,
+        "read_path": "Fixture.swift",
+        "search_marker": marker,
+        "read_marker": "import CryptoKit",
+    }
+
+    def primary_fixture(route: str = "baseline") -> dict[str, Any]:
+        return {
+            "identity": {
+                "correlation_id": correlation,
+                "session_id": session,
+                "context_id": context_id,
+                "invocation": 1,
+                "ordinal": 1,
+                "build": primary_build,
+            },
+            "committed_fixture": primary_fixture_identity,
+            "direct_tool_evidence": {
+                "concurrent": True,
+                "mark_failures": [],
+                "search": {"ok": True},
+                "read": {"ok": True},
+            },
+            "diagnostic_checkpoint": export_fixture(route),
+            "checkpoint_capture": {"ok": True, "type": "success"},
+            "resource_cleanup": None,
+            "valid": False,
+            "invalid_reasons": ["resource_cleanup_pending"],
+        }
+
+    def finalize_primary_fixture(
+        primary: dict[str, Any], *, route: str = "baseline", cleanup_complete: bool = True
+    ) -> None:
+        finalize_primary_performance(
+            primary, route=route,
+            expected_correlation=correlation, expected_session=session,
+            expected_context=context_id, expected_scope_context=context_id,
+            expected_invocation=1, expected_ordinal=1,
+            expected_build=primary_build, expected_fixture=primary_fixture_identity,
+            resource_failures=[], cleanup_complete=cleanup_complete,
+            build_unchanged=True,
+        )
+
+    codemap_timeout_primary = primary_fixture()
+    finalize_primary_fixture(codemap_timeout_primary)
+    codemap_timeout_follow_on = {
+        "accepted": False,
+        "invalid_reasons": ["missing_first_codemap"],
+        "collection": {
+            "ok": False, "completed": True,
+            "failures": [{"operation": "first_codemap", "type": "timeout"}],
+        },
+    }
+    checks["codemap_timeout_retains_primary"] = (
+        codemap_timeout_primary["valid"] is True
+        and codemap_timeout_follow_on["accepted"] is False
+    )
+    failed_read_primary = primary_fixture()
+    failed_read_primary["direct_tool_evidence"]["read"] = {
+        "ok": False, "type": "malformed", "error": "missing committed marker",
+    }
+    finalize_primary_fixture(failed_read_primary)
+    checks["failed_read_invalidates_primary"] = (
+        failed_read_primary["valid"] is False
+        and "direct_content_oracle_mismatch" in failed_read_primary["invalid_reasons"]
+    )
+    route_mismatch_primary = primary_fixture("projected")
+    route_mismatch_primary["diagnostic_checkpoint"]["sample"]["route_counts"] = {"fullCrawl": 1}
+    route_mismatch_primary["diagnostic_checkpoint"]["sample"]["fallback_counts"] = {"fallback": 1}
+    finalize_primary_fixture(route_mismatch_primary, route="projected")
+    checks["route_fallback_mismatch_invalidates_primary"] = (
+        route_mismatch_primary["valid"] is False
+        and "actual_route_counts_mismatch" in route_mismatch_primary["invalid_reasons"]
+        and "unexpected_fallback" in route_mismatch_primary["invalid_reasons"]
+    )
+    cleanup_failure_primary = primary_fixture()
+    finalize_primary_fixture(cleanup_failure_primary, cleanup_complete=False)
+    checks["cleanup_failure_invalidates_cohort"] = (
+        cleanup_failure_primary["valid"] is False
+        and "cleanup_incomplete" in cleanup_failure_primary["invalid_reasons"]
+    )
+
+    nonconcurrent_primary = primary_fixture()
+    nonconcurrent_primary["direct_tool_evidence"]["concurrent"] = False
+    finalize_primary_fixture(nonconcurrent_primary)
+    checks["recorded_sequential_search_read_rejected"] = (
+        "primary_direct_concurrency_unproven" in nonconcurrent_primary["invalid_reasons"]
+    )
+    nonoverlap_primary = primary_fixture()
+    nonoverlap_sample = nonoverlap_primary["diagnostic_checkpoint"]["sample"]
+    nonoverlap_sample["operation_boundaries_us"].update({
+        "firstBenchmarkSearchCompleted": 115,
+        "firstBenchmarkReadStarted": 120,
+    })
+    nonoverlap_sample["durations_us"].update({
+        "materialize_to_first_search": 115,
+        "first_search": 5,
+    })
+    finalize_primary_fixture(nonoverlap_primary)
+    checks["interval_sequential_search_read_rejected"] = (
+        "primary_search_read_intervals_do_not_overlap"
+        in nonoverlap_primary["invalid_reasons"]
+    )
+
+    receipt_identity_primary = primary_fixture()
+    receipt_identity_primary["diagnostic_checkpoint"]["receipt_decisions"][0][
+        "correlation_id"
+    ] = str(uuid.uuid4()).upper()
+    finalize_primary_fixture(receipt_identity_primary)
+    checks["receipt_identity_mismatch_rejected"] = (
+        "receipt_decision_identity_or_terminal_mismatch"
+        in receipt_identity_primary["invalid_reasons"]
+    )
+    receipt_terminal_primary = primary_fixture()
+    receipt_terminal_primary["diagnostic_checkpoint"]["receipt_decisions"][0][
+        "terminal_stage"
+    ] = "projection"
+    finalize_primary_fixture(receipt_terminal_primary)
+    checks["receipt_nonconsumption_terminal_rejected"] = (
+        "receipt_decision_identity_or_terminal_mismatch"
+        in receipt_terminal_primary["invalid_reasons"]
+    )
+    receipt_route_primary = primary_fixture("projected")
+    receipt_route_primary["diagnostic_checkpoint"]["receipt_decisions"][0][
+        "consumption"
+    ]["selected_route"] = "fullCrawl"
+    finalize_primary_fixture(receipt_route_primary, route="projected")
+    checks["receipt_route_semantics_rejected"] = (
+        "receipt_projected_decision_contract_mismatch"
+        in receipt_route_primary["invalid_reasons"]
+    )
+
+    def receipt_failures(checkpoint: dict[str, Any], route: str) -> list[str]:
+        return validate_receipt_oracle(
+            checkpoint, checkpoint["sample"], route,
+            expected_correlation=correlation, expected_session=session,
+            expected_invocation=1, expected_ordinal=1,
+        )
+
+    for source_route in ROUTES:
+        for validated_route in ROUTES:
+            route_failures = receipt_failures(
+                export_fixture(source_route), validated_route
+            )
+            check_name = (
+                f"receipt_route_matrix_{source_route.replace('-', '_')}_as_"
+                f"{validated_route.replace('-', '_')}"
+            )
+            expected_contract_failure = (
+                f"receipt_{validated_route.replace('-', '_')}_decision_contract_mismatch"
+            )
+            checks[check_name] = (
+                not route_failures if source_route == validated_route
+                else expected_contract_failure in route_failures
+            )
+
+    for nonprojected_route in ("baseline", "forced-full"):
+        mixed_checkpoint = export_fixture(nonprojected_route)
+        projected_decision = receipt_fixture("projected")
+        mixed_checkpoint["receipt_decisions"][0]["coordinator"] = projected_decision[
+            "coordinator"
+        ]
+        mixed_checkpoint["receipt_decisions"][0]["projection"] = projected_decision[
+            "projection"
+        ]
+        checks[f"receipt_{nonprojected_route.replace('-', '_')}_rejects_projected_evidence"] = (
+            f"receipt_{nonprojected_route.replace('-', '_')}_decision_contract_mismatch"
+            in receipt_failures(mixed_checkpoint, nonprojected_route)
+        )
+
+    projected_mutations = {
+        "creation": ("creation", "receipt_emitted", False),
+        "coordinator": ("coordinator", "hint_count", 0),
+        "projection": ("projection", "matched_hint_count", 0),
+        "consumption": ("consumption", "selected_route", "fullCrawl"),
+    }
+    for name, (section, field, value) in projected_mutations.items():
+        malformed = export_fixture("projected")
+        malformed["receipt_decisions"][0][section][field] = value
+        checks[f"receipt_projected_exact_{name}_required"] = (
+            "receipt_projected_decision_contract_mismatch"
+            in receipt_failures(malformed, "projected")
+        )
+    projected_mixed_attempt = export_fixture("projected")
+    projected_mixed_attempt["receipt_decisions"][0]["creation_attempt_count"] = 2
+    projected_mixed_attempt["receipt_decisions"][0]["extra_attempt"] = {
+        "outcome": "fallback"
+    }
+    checks["receipt_projected_extra_mixed_attempt_rejected"] = (
+        "receipt_projected_decision_contract_mismatch"
+        in receipt_failures(projected_mixed_attempt, "projected")
+    )
+    duplicated_terminal = export_fixture("projected")
+    duplicated_terminal["receipt_decision_count"] = 2
+    duplicated_terminal["terminal_receipt_decision_count"] = 2
+    duplicated_terminal["receipt_decisions"].append(receipt_fixture("projected"))
+    checks["receipt_duplicate_terminal_decision_rejected"] = (
+        "terminal_receipt_evidence_invalid"
+        in receipt_failures(duplicated_terminal, "projected")
+    )
+
+    def follow_on_fixture() -> dict[str, Any]:
+        def operation(name: str) -> dict[str, Any]:
+            return {
+                "operation": name,
+                "start_mark_attempted": True,
+                "start_marked": True,
+                "completion_mark_attempted": True,
+                "completion_marked": True,
+                "ok": True,
+                "type": "success",
+            }
+
+        selection = operation("selection")
+        selection.update({
+            "set_attempted": True,
+            "get_attempted": True,
+            "get_result_recorded": True,
+            "get_finished_ns": 100,
+            "completion_mark_attempted_ns": 101,
+        })
+        return {
+            "ok": True,
+            "completed": True,
+            "codemap": [operation("first_codemap"), operation("warm_codemap")],
+            "tree": operation("passive_tree"),
+            "selection": selection,
+            "failures": [],
+        }
+
+    checks["follow_on_exact_inventory_accepted"] = not validate_follow_on_collection(
+        follow_on_fixture()
+    )
+    start_mark_failure = follow_on_fixture()
+    start_mark_failure["codemap"][0]["start_marked"] = False
+    checks["follow_on_start_mark_failure_not_overwritten"] = (
+        "first_codemap_start_marked_missing"
+        in validate_follow_on_collection(start_mark_failure)
+    )
+    early_selection_completion = follow_on_fixture()
+    early_selection_completion["selection"]["completion_mark_attempted_ns"] = 99
+    checks["selection_completion_requires_get_result"] = (
+        "selection_completed_before_get_result"
+        in validate_follow_on_collection(early_selection_completion)
+    )
+    missing_follow_on = follow_on_fixture()
+    missing_follow_on["codemap"].pop()
+    checks["follow_on_exact_operation_inventory_required"] = (
+        "follow_on_operation_inventory_mismatch"
+        in validate_follow_on_collection(missing_follow_on)
+    )
+
+    provenance_samples = [
+        {
+            "ordinal": ordinal,
+            "warmup": ordinal == 1,
+            "correlation_id": str(uuid.uuid4()).upper(),
+            "session_id": str(uuid.uuid4()).upper(),
+            "source_record_sha256": f"{ordinal:x}" * 64,
+            "checkpoint_sha256": f"{ordinal + 6:x}" * 64,
+            "revalidated_checkpoint_sha256": f"{ordinal + 6:x}" * 64,
+            "raw_primary_ms": float(700 + ordinal),
+            "revalidated_primary_ms": float(700 + ordinal),
+            "primary_valid": True,
+            "invalid_reasons": [],
+        }
+        for ordinal in range(1, 7)
+    ]
+    provenance_retained = [item["raw_primary_ms"] for item in provenance_samples[1:]]
+    provenance_fixture = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "primary-performance-offline-revalidation",
+        "validator": {
+            "version": PRIMARY_REVALIDATION_VERSION,
+            "source_path": "Scripts/worktree_startup_live_benchmark.py",
+            "source_sha256": "a" * 64,
+        },
+        "command": {"cwd": "/tmp/repo", "exact": "python3 Scripts/harness.py revalidate-primary"},
+        "artifact": {
+            "artifact_id": "forced-full-fixture",
+            "plan_sha256": "c" * 64,
+            "route": "forced-full",
+            "width": 1,
+            "invocation": 1,
+            "build_identity": {"cli_sha256": "d" * 64, "base_commit_oid": "e" * 40},
+        },
+        "inputs": {
+            name: {"path": f"/tmp/{name}", "sha256": "b" * 64}
+            for name in (
+                "plan_argument", "artifact_plan", "summary", "samples_ndjson",
+                "resources", "cleanup",
+            )
+        },
+        "samples": provenance_samples,
+        "raw_values_ms": {
+            "source_warmup": [provenance_samples[0]["raw_primary_ms"]],
+            "source_retained": provenance_retained,
+            "revalidated_retained": list(provenance_retained),
+        },
+        "proof": {
+            "plan_content_matches_artifact": True,
+            "artifact_identity_exact": True,
+            "exact_sample_accounting": True,
+            "checkpoint_hashes_recorded": True,
+            "source_raw_values_equal_revalidated": True,
+            "no_mixed_samples": True,
+            "cleanup_complete": True,
+            "resource_evidence_valid": True,
+        },
+    }
+    checks["revalidation_provenance_exact_fixture_accepted"] = (
+        not validate_primary_revalidation_provenance(provenance_fixture)
+    )
+    changed_provenance = json.loads(json.dumps(provenance_fixture))
+    changed_provenance["raw_values_ms"]["revalidated_retained"][0] += 1
+    checks["revalidation_provenance_changed_raw_rejected"] = (
+        "revalidation_raw_values_changed_or_mixed"
+        in validate_primary_revalidation_provenance(changed_provenance)
+    )
+    mixed_provenance = json.loads(json.dumps(provenance_fixture))
+    mixed_provenance["samples"][5]["session_id"] = mixed_provenance["samples"][4]["session_id"]
+    mixed_provenance["samples"][5]["correlation_id"] = mixed_provenance["samples"][4]["correlation_id"]
+    checks["revalidation_provenance_mixed_identity_rejected"] = (
+        "revalidation_sample_identity_reused"
+        in validate_primary_revalidation_provenance(mixed_provenance)
+    )
 
     schema_export = export_fixture("baseline")
     schema_export["schema_version"] = 4
@@ -2505,6 +2945,13 @@ def self_test_command(_args: argparse.Namespace) -> int:
         "sample_count": 3, "duration_seconds": 1.0,
     }
     checks["resource_values_validated"] = not validate_resource_evidence(resource_fixture)
+    live_resource_fixture = dict(resource_fixture)
+    live_resource_fixture["phys_footprint_available"] = live_resource_fixture.pop(
+        "physical_footprint_available"
+    )
+    checks["live_resource_availability_alias_validated"] = not validate_resource_evidence(
+        live_resource_fixture
+    )
     checks["resource_core_range_rejected"] = "invalid_resource_core_utilization" in validate_resource_evidence(
         dict(resource_fixture, peak_interval_core_utilization_percent=10.0)
     )
@@ -2798,6 +3245,14 @@ def self_test_command(_args: argparse.Namespace) -> int:
         {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
         None, minimum_improvement=0.30,
     )["status"] == "high-variance/inconclusive"
+    checks["high_cv_confirmation_policy_unchanged"] = confirmation_policy(
+        {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.500001, "candidate_cv": 0.50},
+        None, minimum_improvement=0.30,
+    ) == {
+        "status": "high-variance/inconclusive",
+        "direction": "pass",
+        "confirmation_required": True,
+    }
     checks["directional_confirmation_agrees"] = confirmation_policy(
         {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
         {"control_p95": 200, "candidate_p95": 130}, minimum_improvement=0.30,
@@ -3060,6 +3515,52 @@ def mark(runner: CLIRunner, plan: dict[str, Any], correlation: str, phase: str) 
     )
 
 
+def safe_mark(
+    runner: CLIRunner, plan: dict[str, Any], correlation: str, phase: str
+) -> dict[str, str] | None:
+    try:
+        mark(runner, plan, correlation, phase)
+        return None
+    except BaseException as error:
+        return {"phase": phase, "type": "mark_error", "error": repr(error)}
+
+
+def operation_failure_type(error: BaseException | str) -> str:
+    text = str(error).lower()
+    if isinstance(error, subprocess.TimeoutExpired) or "timeout" in text or "timed out" in text:
+        return "timeout"
+    if isinstance(error, str):
+        return "malformed"
+    if isinstance(error, BenchmarkError):
+        return "malformed"
+    return "transport_error"
+
+
+def capture_diagnostic(
+    runner: CLIRunner,
+    plan: dict[str, Any],
+    correlation: str,
+    *,
+    action: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        response = runner.call(
+            label, DEBUG_TOOL,
+            diagnostic_payload(plan, action, correlation_id=correlation),
+            check=False,
+        )
+        if not call_succeeded(response):
+            raise BenchmarkError("diagnostic call failed or returned malformed output")
+        return find_object(response, "sample"), {"ok": True, "type": "success"}
+    except BaseException as error:
+        return {}, {
+            "ok": False,
+            "type": operation_failure_type(error),
+            "error": repr(error),
+        }
+
+
 def first_search_read(
     runner: CLIRunner,
     plan: dict[str, Any],
@@ -3080,52 +3581,87 @@ def first_search_read(
         "path": plan["scope"]["root_path"],
         "type": "primary_workspace",
     }
-    mark(runner, plan, correlation, "first_search_started")
-    mark(runner, plan, correlation, "first_read_started")
+    marker_failures = [
+        failure for failure in (
+            safe_mark(runner, plan, correlation, "first_search_started"),
+            safe_mark(runner, plan, correlation, "first_read_started"),
+        ) if failure is not None
+    ]
     calls: dict[str, TimedCall] = {}
+    call_failures: dict[str, dict[str, str]] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
             pool.submit(
                 runner.timed_call, "first-search", "file_search",
                 {"pattern": plan["dataset"]["search_marker"], "regex": False, "mode": "content",
                  "filter": {"paths": [plan["dataset"]["read_path"]]}, "max_results": 20, **routed},
+                check=False,
                 context_id=context_id,
             ): "search",
             pool.submit(
                 runner.timed_call, "first-read", "read_file",
                 {"path": plan["dataset"]["read_path"], "start_line": 1, "limit": 80, **routed},
+                check=False,
                 context_id=context_id,
             ): "read",
         }
         for future in as_completed(futures):
             name = futures[future]
-            calls[name] = future.result()
-            mark(runner, plan, correlation, f"first_{name}_completed")
-    search_evidence = structured_success_evidence(
-        calls["search"].response, "file_search", expected_root_id=root_identity["id"],
-        expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
-        expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
-        expected_content=plan["dataset"]["search_marker"],
-        expected_worktree_id=worktree_id,
-        expected_physical_worktree_path=str(worktree_path),
-    )
-    read_evidence = structured_success_evidence(
-        calls["read"].response, "read_file", expected_root_id=root_identity["id"],
-        expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
-        expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
-        expected_content=plan["dataset"]["read_marker"],
-        expected_worktree_id=worktree_id,
-        expected_physical_worktree_path=str(worktree_path),
-    )
+            try:
+                calls[name] = future.result()
+            except BaseException as error:
+                call_failures[name] = {
+                    "type": operation_failure_type(error), "error": repr(error),
+                }
+            finally:
+                completion_failure = safe_mark(
+                    runner, plan, correlation, f"first_{name}_completed"
+                )
+                if completion_failure is not None:
+                    marker_failures.append(completion_failure)
+
+    def direct_evidence(name: str, tool: str, marker: str) -> dict[str, Any]:
+        if name in call_failures:
+            return {"ok": False, **call_failures[name]}
+        timed = calls.get(name)
+        if timed is None:
+            return {"ok": False, "type": "malformed", "error": "missing direct call result"}
+        evidence = structured_success_evidence(
+            timed.response, tool, expected_root_id=root_identity["id"],
+            expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+            expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
+            expected_content=marker, expected_worktree_id=worktree_id,
+            expected_physical_worktree_path=str(worktree_path),
+        )
+        if evidence.get("ok") is not True:
+            evidence["type"] = operation_failure_type(str(evidence.get("error") or "malformed"))
+        return evidence
+
+    search_evidence = direct_evidence("search", "file_search", plan["dataset"]["search_marker"])
+    read_evidence = direct_evidence("read", "read_file", plan["dataset"]["read_marker"])
+    concurrent = False
+    if set(calls) == {"search", "read"}:
+        concurrent = max(calls["search"].started_ns, calls["read"].started_ns) < min(
+            calls["search"].finished_ns, calls["read"].finished_ns
+        )
     evidence = {
-        "concurrent": max(calls["search"].started_ns, calls["read"].started_ns)
-        <= min(calls["search"].finished_ns, calls["read"].finished_ns),
-        "search_duration_us": (calls["search"].finished_ns - calls["search"].started_ns) / 1000,
-        "read_duration_us": (calls["read"].finished_ns - calls["read"].started_ns) / 1000,
+        "concurrent": concurrent,
+        "search_duration_us": (
+            (calls["search"].finished_ns - calls["search"].started_ns) / 1000
+            if "search" in calls else None
+        ),
+        "read_duration_us": (
+            (calls["read"].finished_ns - calls["read"].started_ns) / 1000
+            if "read" in calls else None
+        ),
         "search": search_evidence, "read": read_evidence,
         "physical_runtime_root": physical_root_identity,
+        "mark_failures": marker_failures,
     }
-    return {"search": search_evidence["ok"], "read": read_evidence["ok"]}, evidence, root_identity
+    return {
+        "search": search_evidence.get("ok") is True and concurrent and not marker_failures,
+        "read": read_evidence.get("ok") is True and concurrent and not marker_failures,
+    }, evidence, root_identity
 
 
 def collect_follow_on_evidence(
@@ -3142,64 +3678,281 @@ def collect_follow_on_evidence(
     logical_root_path = plan["scope"]["root_path"]
     logical_root_type = "primary_workspace"
     structures: list[dict[str, Any]] = []
+    operation_failures: list[dict[str, Any]] = []
+
+    def timed_operation(
+        mark_prefix: str,
+        label: str,
+        tool: str,
+        payload: dict[str, Any],
+        validator: Any,
+    ) -> tuple[dict[str, Any], TimedCall | None]:
+        item: dict[str, Any] = {
+            "operation": mark_prefix,
+            "start_mark_attempted": True,
+            "start_marked": False,
+            "completion_mark_attempted": False,
+            "completion_marked": False,
+        }
+        start_failure = safe_mark(runner, plan, correlation, f"{mark_prefix}_started")
+        item["start_marked"] = start_failure is None
+        if start_failure is not None:
+            item["mark_failures"] = [start_failure]
+            item["error"] = start_failure["error"]
+        timed: TimedCall | None = None
+        try:
+            timed = runner.timed_call(
+                label, tool, payload, check=False, context_id=context_id,
+            )
+            validated = validator(timed.response)
+            validator_ok = validated.get("ok", True)
+            item.update({key: value for key, value in validated.items() if key != "ok"})
+            item["ok"] = validator_ok is True and start_failure is None
+            if item["ok"] is True:
+                item["type"] = "success"
+            elif start_failure is not None:
+                item["type"] = "mark_error"
+            else:
+                item["type"] = operation_failure_type(
+                    str(item.get("error") or "malformed follow-on response")
+                )
+        except BaseException as error:
+            item["ok"] = False
+            item["type"] = "mark_error" if start_failure is not None else operation_failure_type(error)
+            item.setdefault("error", repr(error))
+        finally:
+            item["completion_mark_attempted"] = True
+            completion_failure = safe_mark(
+                runner, plan, correlation, f"{mark_prefix}_completed"
+            )
+            item["completion_marked"] = completion_failure is None
+            if completion_failure is not None:
+                item["ok"] = False
+                item.setdefault("mark_failures", []).append(completion_failure)
+                item["type"] = "mark_error"
+                item.setdefault("error", completion_failure["error"])
+        if timed is not None:
+            item["duration_us"] = (timed.finished_ns - timed.started_ns) / 1000
+        if item.get("ok") is not True:
+            operation_failures.append({
+                "operation": mark_prefix,
+                "type": item.get("type") or "malformed",
+                "error": item.get("error"),
+            })
+        return item, timed
+
     for mark_prefix, label in (("first_codemap", "first-codemap"), ("warm_codemap", "warm-codemap")):
-        mark(runner, plan, correlation, f"{mark_prefix}_started")
-        timed = runner.timed_call(
-            label, "get_code_structure", {"scope": "paths", "paths": [path], "context_id": context_id},
+        item, _ = timed_operation(
+            mark_prefix, label, "get_code_structure",
+            {"scope": "paths", "paths": [path], "context_id": context_id},
+            lambda response: codemap_structure_evidence(
+                response, expected_root_id=logical_root_id,
+                expected_root_path=logical_root_path,
+                expected_root_type=logical_root_type, expected_file_path=path,
+                expected_marker=plan["dataset"]["read_marker"],
+                expected_file_type=plan["dataset"]["code_file_type"],
+                expected_worktree_id=worktree_id,
+                expected_physical_worktree_path=str(worktree_path),
+            ),
+        )
+        structures.append(item)
+
+    def tree_validator(response: Any) -> dict[str, Any]:
+        try:
+            return {
+                **codemap_tree_marker_evidence(
+                    response, expected_context_id=context_id,
+                    expected_root_path=logical_root_path, requested_parent=parent,
+                    expected_file_path=path, expected_worktree_id=worktree_id,
+                    expected_physical_worktree_path=str(worktree_path),
+                ),
+                "ok": True,
+            }
+        except BenchmarkError as error:
+            return {"ok": False, "error": str(error)}
+
+    tree_evidence, _ = timed_operation(
+        "passive_tree", "passive-tree", "get_file_tree",
+        {"type": "files", "mode": "full", "path": parent, "max_depth": 1,
+         "context_id": context_id},
+        tree_validator,
+    )
+
+    selection_started_ns = time.monotonic_ns()
+    selection_record: dict[str, Any] = {
+        "operation": "selection",
+        "start_mark_attempted": True,
+        "start_marked": False,
+        "completion_mark_attempted": False,
+        "completion_marked": False,
+        "set_attempted": True,
+        "get_attempted": False,
+        "get_result_recorded": False,
+    }
+    selection_start_failure = safe_mark(
+        runner, plan, correlation, "selection_started"
+    )
+    selection_record["start_marked"] = selection_start_failure is None
+    selection_errors: list[tuple[str, str]] = []
+    if selection_start_failure is not None:
+        selection_record["mark_failures"] = [selection_start_failure]
+        selection_errors.append(("mark_error", selection_start_failure["error"]))
+    selection_timed: TimedCall | None = None
+    try:
+        selection_timed = runner.timed_call(
+            "selection-set", "manage_selection",
+            {"op": "set", "paths": [path], "mode": "full", "context_id": context_id},
             check=False, context_id=context_id,
         )
-        mark(runner, plan, correlation, f"{mark_prefix}_completed")
-        item = codemap_structure_evidence(
-            timed.response, expected_root_id=logical_root_id, expected_root_path=logical_root_path,
-            expected_root_type=logical_root_type, expected_file_path=path,
-            expected_marker=plan["dataset"]["read_marker"], expected_file_type=plan["dataset"]["code_file_type"],
-            expected_worktree_id=worktree_id,
-            expected_physical_worktree_path=str(worktree_path),
-        )
-        item["duration_us"] = (timed.finished_ns - timed.started_ns) / 1000
-        structures.append(item)
-    mark(runner, plan, correlation, "passive_tree_started")
-    tree = runner.timed_call(
-        "passive-tree", "get_file_tree",
-        {"type": "files", "mode": "full", "path": parent, "max_depth": 1, "context_id": context_id},
-        check=False, context_id=context_id,
-    )
-    mark(runner, plan, correlation, "passive_tree_completed")
+        selection_record["set"] = {"ok": call_succeeded(selection_timed.response)}
+        if not call_succeeded(selection_timed.response):
+            selection_errors.append(("malformed", "selection set failed"))
+    except BaseException as error:
+        selection_record["set"] = {"ok": False, "error": repr(error)}
+        selection_errors.append((operation_failure_type(error), repr(error)))
+    selection_get_timed: TimedCall | None = None
     try:
-        tree_evidence = codemap_tree_marker_evidence(
-        tree.response, expected_context_id=context_id, expected_root_path=logical_root_path,
-            requested_parent=parent, expected_file_path=path,
+        selection_record["get_attempted"] = True
+        selection_get_timed = runner.timed_call(
+            "selection-get", "manage_selection",
+            {"op": "get", "view": "files", "context_id": context_id},
+            check=False, context_id=context_id,
+        )
+        selection_record["get_result_recorded"] = True
+        selection_evidence = structured_success_evidence(
+            selection_get_timed.response, "manage_selection", expected_root_id=logical_root_id,
+            expected_root_path=logical_root_path, expected_root_type=logical_root_type,
+            expected_file_path=path, expected_file_type="file",
             expected_worktree_id=worktree_id,
             expected_physical_worktree_path=str(worktree_path),
         )
-        tree_evidence["ok"] = True
-    except BenchmarkError as error:
-        tree_evidence = {"ok": False, "error": str(error)}
-    tree_evidence["duration_us"] = (tree.finished_ns - tree.started_ns) / 1000
-    mark(runner, plan, correlation, "selection_started")
-    selection = runner.timed_call(
-        "selection-set", "manage_selection",
-        {"op": "set", "paths": [path], "mode": "full", "context_id": context_id},
-        check=False, context_id=context_id,
+        if selection_evidence.get("ok") is not True:
+            selection_evidence["type"] = operation_failure_type(
+                str(selection_evidence.get("error") or "malformed selection response")
+            )
+            selection_errors.append((
+                selection_evidence["type"],
+                str(selection_evidence.get("error") or "malformed selection response"),
+            ))
+    except BaseException as error:
+        selection_evidence = {
+            "ok": False, "type": operation_failure_type(error), "error": repr(error),
+        }
+        selection_errors.append((selection_evidence["type"], repr(error)))
+    finally:
+        selection_record["completion_mark_attempted"] = True
+        selection_record["completion_mark_attempted_ns"] = time.monotonic_ns()
+        completion_failure = safe_mark(
+            runner, plan, correlation, "selection_completed"
+        )
+        selection_record["completion_marked"] = completion_failure is None
+        if completion_failure is not None:
+            selection_record.setdefault("mark_failures", []).append(completion_failure)
+            selection_errors.append(("mark_error", completion_failure["error"]))
+    if selection_get_timed is not None:
+        selection_record["get_finished_ns"] = selection_get_timed.finished_ns
+    selection_ok = (
+        selection_record["start_marked"] is True
+        and selection_record["completion_marked"] is True
+        and selection_record.get("set", {}).get("ok") is True
+        and selection_evidence.get("ok") is True
+        and selection_record["get_result_recorded"] is True
+        and isinstance(selection_record.get("get_finished_ns"), int)
+        and selection_record["get_finished_ns"]
+        <= selection_record["completion_mark_attempted_ns"]
     )
-    mark(runner, plan, correlation, "selection_completed")
-    selected = runner.call(
-        "selection-get", "manage_selection", {"op": "get", "view": "files", "context_id": context_id},
-        check=False, context_id=context_id,
+    selection_type = "success" if selection_ok else (
+        "mark_error" if any(kind == "mark_error" for kind, _ in selection_errors)
+        else selection_errors[0][0] if selection_errors else "malformed"
     )
-    selection_evidence = structured_success_evidence(
-        selected, "manage_selection", expected_root_id=logical_root_id,
-        expected_root_path=logical_root_path, expected_root_type=logical_root_type,
-        expected_file_path=path, expected_file_type="file",
-        expected_worktree_id=worktree_id,
-        expected_physical_worktree_path=str(worktree_path),
+    selection_record.update(selection_evidence)
+    selection_record["ok"] = selection_ok
+    selection_record["type"] = selection_type
+    selection_record["duration_us"] = (
+        (time.monotonic_ns() - selection_started_ns) / 1000
     )
+    if selection_errors:
+        selection_record["error"] = selection_errors[0][1]
+    if not selection_ok:
+        operation_failures.append({
+            "operation": "selection", "type": selection_type,
+            "error": selection_record.get("error"),
+        })
     return {
         "ok": all(item.get("ok") for item in structures) and tree_evidence.get("ok") is True
-        and call_succeeded(selection.response) and selection_evidence.get("ok") is True,
+        and selection_ok and not operation_failures,
         "codemap": structures, "tree": tree_evidence,
-        "selection": {**selection_evidence, "duration_us": (selection.finished_ns - selection.started_ns) / 1000},
+        "selection": selection_record,
+        "failures": operation_failures,
+        "completed": True,
     }
+
+
+def validate_follow_on_collection(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["follow_on_collection_malformed"]
+    failures: list[str] = []
+    if value.get("completed") is not True:
+        failures.append("follow_on_collection_incomplete")
+    codemap = value.get("codemap")
+    tree = value.get("tree")
+    selection = value.get("selection")
+    if not isinstance(codemap, list) or not isinstance(tree, dict) or not isinstance(selection, dict):
+        return failures + ["follow_on_operation_inventory_malformed"]
+    operations = [*codemap, tree, selection]
+    if (
+        len(operations) != len(FOLLOW_ON_OPERATION_ORDER)
+        or any(not isinstance(item, dict) for item in operations)
+        or tuple(item.get("operation") for item in operations) != FOLLOW_ON_OPERATION_ORDER
+    ):
+        failures.append("follow_on_operation_inventory_mismatch")
+        return failures
+
+    expected_failure_inventory: list[dict[str, Any]] = []
+    for item in operations:
+        operation = str(item["operation"])
+        for field in (
+            "start_mark_attempted", "start_marked",
+            "completion_mark_attempted", "completion_marked",
+        ):
+            if item.get(field) is not True:
+                failures.append(f"{operation}_{field}_missing")
+        operation_ok = item.get("ok") is True
+        operation_type = item.get("type")
+        if operation_ok:
+            if operation_type != "success":
+                failures.append(f"{operation}_success_type_mismatch")
+        else:
+            if operation_type not in FOLLOW_ON_FAILURE_TYPES:
+                failures.append(f"{operation}_failure_type_invalid")
+            expected_failure_inventory.append({
+                "operation": operation,
+                "type": operation_type,
+                "error": item.get("error"),
+            })
+
+    if selection.get("set_attempted") is not True:
+        failures.append("selection_set_not_attempted")
+    if selection.get("get_attempted") is not True:
+        failures.append("selection_get_not_attempted")
+    if selection.get("get_result_recorded") is not True:
+        failures.append("selection_get_result_not_recorded")
+    get_finished_ns = selection.get("get_finished_ns")
+    completion_attempted_ns = selection.get("completion_mark_attempted_ns")
+    if (
+        not isinstance(get_finished_ns, int) or isinstance(get_finished_ns, bool)
+        or not isinstance(completion_attempted_ns, int) or isinstance(completion_attempted_ns, bool)
+        or get_finished_ns > completion_attempted_ns
+    ):
+        failures.append("selection_completed_before_get_result")
+
+    recorded_failure_inventory = value.get("failures")
+    if recorded_failure_inventory != expected_failure_inventory:
+        failures.append("follow_on_failure_inventory_mismatch")
+    expected_ok = not expected_failure_inventory and not failures
+    if value.get("ok") is not expected_ok:
+        failures.append("follow_on_collection_ok_mismatch")
+    return failures
 
 
 def nonnegative_integer(value: Any) -> bool:
@@ -3278,10 +4031,18 @@ def validate_filesystem_evidence(value: Any) -> list[str]:
 
 
 def validate_resource_evidence(value: Any) -> list[str]:
-    if not isinstance(value, dict) or not REQUIRED_RESOURCE_FIELDS <= set(value):
+    required = REQUIRED_RESOURCE_FIELDS - {"physical_footprint_available"}
+    if (
+        not isinstance(value, dict)
+        or not required <= set(value)
+        or not ({"physical_footprint_available", "phys_footprint_available"} & set(value))
+    ):
         return ["incomplete_resource_evidence"]
     failures: list[str] = []
-    if value.get("physical_footprint_available") is not True:
+    footprint_available = value.get(
+        "physical_footprint_available", value.get("phys_footprint_available")
+    )
+    if footprint_available is not True:
         failures.append("physical_footprint_unavailable")
     for family in ("resident", "physical_footprint"):
         baseline = value.get(f"baseline_{family}_mb")
@@ -3326,6 +4087,351 @@ def validate_resource_evidence(value: Any) -> list[str]:
     if finite_number(average) and finite_number(peak) and float(peak) < float(average):
         failures.append("invalid_resource_core_utilization")
     return failures
+
+
+def expected_receipt_decision(route: str, correlation: str) -> dict[str, Any]:
+    if route not in ROUTES:
+        raise BenchmarkError(f"unsupported receipt route: {route}")
+    nonprojected_coordinator = {
+        "binding_count": 1,
+        "create_result_receipt_count": 0,
+        "creation_fallback_observed": None,
+        "hint_count": 0,
+        "hint_keyed_by_created_binding": "notEvaluated",
+    }
+    nonprojected_projection = {
+        "all_hint_keys_matched_bindings": True,
+        "matched_hint_count": 0,
+        "supplied_hint_count": 0,
+        "validation_fallback": None,
+    }
+    if route in {"baseline", "forced-full"}:
+        observation = {"state": "disabled"} if route == "baseline" else {
+            "fallback_reason": "noReceipt", "state": "fallback",
+        }
+        return {
+            "ambiguous_or_duplicate": False,
+            "consumption": {
+                "final_observation": observation,
+                "full_crawl_performed": True,
+                "hint_correlation_match": "notEvaluated",
+                "hint_owner_match": "notEvaluated",
+                "hint_session_match": "notEvaluated",
+                "initial_hint_observation": dict(observation),
+                "owner_generation_match": "notEvaluated",
+                "ownership_reused": False,
+                "pending_seeded_preparation_result": None,
+                "selected_route": "fullCrawl",
+            },
+            "coordinator": nonprojected_coordinator,
+            "correlation_id": correlation,
+            "creation": None,
+            "creation_attempt_count": 0,
+            "projection": nonprojected_projection,
+            "terminal_stage": RECEIPT_TERMINAL_STAGE,
+        }
+    return {
+        "ambiguous_or_duplicate": False,
+        "consumption": {
+            "final_observation": {"state": "eligible"},
+            "full_crawl_performed": False,
+            "hint_correlation_match": "match",
+            "hint_owner_match": "match",
+            "hint_session_match": "match",
+            "initial_hint_observation": {"state": "eligible"},
+            "owner_generation_match": "match",
+            "ownership_reused": False,
+            "pending_seeded_preparation_result": {"state": "eligible"},
+            "selected_route": "diffSeedServing",
+        },
+        "coordinator": {
+            "binding_count": 1,
+            "create_result_receipt_count": 1,
+            "creation_fallback_observed": None,
+            "hint_count": 1,
+            "hint_keyed_by_created_binding": "match",
+        },
+        "correlation_id": correlation,
+        "creation": {
+            "initialization_fallback_reason": None,
+            "outcome": "receiptEmitted",
+            "receipt_emitted": True,
+            "receipt_fallback_reason": None,
+        },
+        "creation_attempt_count": 1,
+        "projection": {
+            "all_hint_keys_matched_bindings": True,
+            "matched_hint_count": 1,
+            "supplied_hint_count": 1,
+            "validation_fallback": None,
+        },
+        "terminal_stage": RECEIPT_TERMINAL_STAGE,
+    }
+
+
+def validate_receipt_oracle(
+    checkpoint: dict[str, Any],
+    sample: dict[str, Any],
+    route: str,
+    *,
+    expected_correlation: str,
+    expected_session: str,
+    expected_invocation: int,
+    expected_ordinal: int,
+) -> list[str]:
+    failures: list[str] = []
+    if (
+        sample.get("correlation_id") != expected_correlation
+        or sample.get("agent_session_id") != expected_session
+        or sample.get("invocation") != expected_invocation
+        or sample.get("ordinal") != expected_ordinal
+    ):
+        failures.append("receipt_sample_identity_mismatch")
+    decisions = checkpoint.get("receipt_decisions")
+    if (
+        checkpoint.get("receipt_decision_count") != 1
+        or checkpoint.get("terminal_receipt_decision_count") != 1
+        or checkpoint.get("receipt_decision_buffer_evicted") is not False
+        or checkpoint.get("receipt_decision_ambiguous") is not False
+        or not isinstance(decisions, list)
+        or len(decisions) != 1
+        or not isinstance(decisions[0], dict)
+    ):
+        return failures + ["terminal_receipt_evidence_invalid"]
+    decision = decisions[0]
+    if (
+        decision.get("correlation_id") != expected_correlation
+        or decision.get("ambiguous_or_duplicate") is not False
+        or decision.get("terminal_stage") != RECEIPT_TERMINAL_STAGE
+    ):
+        failures.append("receipt_decision_identity_or_terminal_mismatch")
+    if decision != expected_receipt_decision(route, expected_correlation):
+        failures.append(
+            f"receipt_{route.replace('-', '_')}_decision_contract_mismatch"
+        )
+    return failures
+
+
+def validate_primary_checkpoint(
+    checkpoint: dict[str, Any],
+    route: str,
+    direct_correctness: dict[str, bool],
+    *,
+    expected_correlation: str,
+    expected_session: str,
+    expected_context: str,
+    expected_scope_context: str,
+    expected_invocation: int,
+    expected_ordinal: int,
+) -> list[str]:
+    """Validate only the correlation-bound root/search/read critical path."""
+    failures: list[str] = []
+    if checkpoint.get("schema_version") != DIAGNOSTIC_SCHEMA_VERSION:
+        failures.append("diagnostic_schema_mismatch")
+    scope = checkpoint.get("scope")
+    if (
+        not isinstance(scope, dict)
+        or not isinstance(scope.get("context_id"), str)
+        or scope["context_id"].upper() != expected_scope_context.upper()
+    ):
+        failures.append("sample_context_id_mismatch")
+    sample = checkpoint.get("sample")
+    if not isinstance(sample, dict):
+        return failures + ["missing_sample"]
+    if sample.get("configured_route") != ROUTES[route]["expected"]:
+        failures.append("configured_route_mismatch")
+    for key, expected in {
+        "correlation_id": expected_correlation,
+        "agent_session_id": expected_session,
+    }.items():
+        if not isinstance(sample.get(key), str) or sample[key].upper() != expected.upper():
+            failures.append(f"sample_{key}_mismatch")
+    for key, expected in (("invocation", expected_invocation), ("ordinal", expected_ordinal)):
+        if not positive_integer(sample.get(key)) or sample[key] != expected:
+            failures.append(f"sample_{key}_mismatch")
+    if sample.get("root_ready") is not True:
+        failures.append("root_not_ready")
+    if sample.get("first_search_complete") is not True:
+        failures.append("first_search_incomplete")
+    if sample.get("first_read_complete") is not True:
+        failures.append("first_read_incomplete")
+    route_counts = sample.get("route_counts")
+    fallback_counts = sample.get("fallback_counts")
+    if not validate_named_counts(route_counts):
+        failures.append("invalid_route_counts")
+    elif route_counts != EXPECTED_ACTUAL_ROUTE_COUNTS[route]:
+        failures.append("actual_route_counts_mismatch")
+    if not validate_named_counts(fallback_counts):
+        failures.append("invalid_fallback_counts")
+    elif fallback_counts != {}:
+        failures.append("unexpected_fallback")
+    if direct_correctness != {"search": True, "read": True}:
+        failures.append("direct_content_oracle_mismatch")
+
+    boundaries = sample.get("operation_boundaries_us")
+    durations = sample.get("durations_us")
+    if not isinstance(boundaries, dict):
+        failures.append("invalid_primary_operation_boundaries")
+    elif any(not finite_number(boundaries.get(key)) for key in PRIMARY_BOUNDARY_KEYS):
+        failures.append("invalid_primary_operation_boundaries")
+    else:
+        ordered_pairs = (
+            ("bindingTransitionStarted", "rootReady"),
+            ("rootReady", "firstBenchmarkSearchStarted"),
+            ("rootReady", "firstBenchmarkReadStarted"),
+            ("firstBenchmarkSearchStarted", "firstBenchmarkSearchCompleted"),
+            ("firstBenchmarkReadStarted", "firstBenchmarkReadCompleted"),
+        )
+        if not all(
+            float(boundaries[before]) <= float(boundaries[after])
+            for before, after in ordered_pairs
+        ):
+            failures.append("non_monotonic_primary_operation_boundaries")
+        if not (
+            max(
+                float(boundaries["firstBenchmarkSearchStarted"]),
+                float(boundaries["firstBenchmarkReadStarted"]),
+            )
+            < min(
+                float(boundaries["firstBenchmarkSearchCompleted"]),
+                float(boundaries["firstBenchmarkReadCompleted"]),
+            )
+        ):
+            failures.append("primary_search_read_intervals_do_not_overlap")
+    if not isinstance(durations, dict):
+        failures.append("invalid_primary_durations")
+        durations = {}
+    elif any(not finite_number(durations.get(metric), positive=True) for metric in PRIMARY_DURATION_METRICS):
+        failures.append("invalid_primary_durations")
+    if isinstance(boundaries, dict) and all(
+        finite_number(boundaries.get(key)) for key in PRIMARY_BOUNDARY_KEYS
+    ):
+        for metric in PRIMARY_DURATION_METRICS:
+            start, end = BOUNDARY_DURATION_PAIRS[metric]
+            duration = durations.get(metric)
+            if finite_number(duration, positive=True):
+                expected = float(boundaries[end]) - float(boundaries[start])
+                if expected <= 0 or not math.isclose(float(duration), expected, abs_tol=1.0):
+                    failures.append(f"inconsistent_{metric}_duration")
+        interactive = sample.get("interactive_readiness_us")
+        expected_interactive = max(
+            float(boundaries["firstBenchmarkSearchCompleted"]),
+            float(boundaries["firstBenchmarkReadCompleted"]),
+        ) - float(boundaries["bindingTransitionStarted"])
+        if not finite_number(interactive, positive=True):
+            failures.append("invalid_interactive_readiness_us")
+        elif not math.isclose(float(interactive), expected_interactive, abs_tol=1.0):
+            failures.append("interactive_readiness_boundary_mismatch")
+
+    failures.extend(validate_receipt_oracle(
+        checkpoint, sample, route,
+        expected_correlation=expected_correlation,
+        expected_session=expected_session,
+        expected_invocation=expected_invocation,
+        expected_ordinal=expected_ordinal,
+    ))
+    return failures
+
+
+def validate_primary_performance(
+    primary: dict[str, Any],
+    route: str,
+    *,
+    expected_correlation: str,
+    expected_session: str,
+    expected_context: str,
+    expected_scope_context: str,
+    expected_invocation: int,
+    expected_ordinal: int,
+    expected_build: dict[str, str],
+    expected_fixture: dict[str, str],
+) -> list[str]:
+    failures: list[str] = []
+    identity = primary.get("identity")
+    expected_identity: dict[str, Any] = {
+        "correlation_id": expected_correlation,
+        "session_id": expected_session,
+        "context_id": expected_context,
+        "invocation": expected_invocation,
+        "ordinal": expected_ordinal,
+        "build": expected_build,
+    }
+    if identity != expected_identity:
+        failures.append("primary_identity_mismatch")
+    if primary.get("committed_fixture") != expected_fixture:
+        failures.append("committed_fixture_mismatch")
+    direct = primary.get("direct_tool_evidence")
+    if not isinstance(direct, dict) or direct.get("concurrent") is not True:
+        failures.append("primary_direct_concurrency_unproven")
+    if not isinstance(direct, dict) or direct.get("mark_failures") != []:
+        failures.append("primary_direct_mark_failure")
+    correctness = {
+        "search": isinstance(direct, dict) and isinstance(direct.get("search"), dict)
+        and direct["search"].get("ok") is True,
+        "read": isinstance(direct, dict) and isinstance(direct.get("read"), dict)
+        and direct["read"].get("ok") is True,
+    }
+    checkpoint = primary.get("diagnostic_checkpoint")
+    if not isinstance(checkpoint, dict):
+        failures.append("missing_primary_diagnostic_checkpoint")
+    else:
+        failures.extend(validate_primary_checkpoint(
+            checkpoint, route, correctness,
+            expected_correlation=expected_correlation,
+            expected_session=expected_session,
+            expected_context=expected_context,
+            expected_scope_context=expected_scope_context,
+            expected_invocation=expected_invocation,
+            expected_ordinal=expected_ordinal,
+        ))
+    resource_cleanup = primary.get("resource_cleanup")
+    if not isinstance(resource_cleanup, dict):
+        failures.append("missing_resource_cleanup_proof")
+    else:
+        resource_failures = resource_cleanup.get("resource_failures")
+        if not isinstance(resource_failures, list) or resource_failures:
+            failures.append("resource_evidence_invalid")
+        if resource_cleanup.get("cleanup_complete") is not True:
+            failures.append("cleanup_incomplete")
+        if resource_cleanup.get("build_unchanged") is not True:
+            failures.append("build_changed_during_run")
+    return failures
+
+
+def finalize_primary_performance(
+    primary: dict[str, Any],
+    *,
+    route: str,
+    expected_correlation: str,
+    expected_session: str,
+    expected_context: str,
+    expected_scope_context: str,
+    expected_invocation: int,
+    expected_ordinal: int,
+    expected_build: dict[str, str],
+    expected_fixture: dict[str, str],
+    resource_failures: list[str],
+    cleanup_complete: bool,
+    build_unchanged: bool,
+) -> None:
+    primary["resource_cleanup"] = {
+        "resource_failures": resource_failures,
+        "cleanup_complete": cleanup_complete,
+        "build_unchanged": build_unchanged,
+    }
+    failures = validate_primary_performance(
+        primary, route,
+        expected_correlation=expected_correlation,
+        expected_session=expected_session,
+        expected_context=expected_context,
+        expected_scope_context=expected_scope_context,
+        expected_invocation=expected_invocation,
+        expected_ordinal=expected_ordinal,
+        expected_build=expected_build,
+        expected_fixture=expected_fixture,
+    )
+    primary["invalid_reasons"] = failures
+    primary["valid"] = not failures
 
 
 def validate_boundary_evidence(sample: dict[str, Any]) -> list[str]:
@@ -3605,6 +4711,18 @@ def run_command(args: argparse.Namespace) -> int:
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
     validate_planned_base_commit(plan, root)
+    resolved_cli = cli.resolve(strict=True)
+    build_identity = {
+        "cli_sha256": sha256_bytes(resolved_cli.read_bytes()),
+        "base_commit_oid": str(plan["dataset"]["base_commit_oid"]),
+    }
+    committed_fixture = {
+        "base_commit_oid": str(plan["dataset"]["base_commit_oid"]),
+        "read_blob_sha256": str(plan["dataset"]["read_blob_sha256"]),
+        "read_path": str(plan["dataset"]["read_path"]),
+        "search_marker": str(plan["dataset"]["search_marker"]),
+        "read_marker": str(plan["dataset"]["read_marker"]),
+    }
     artifact = make_artifact(Path(args.output_root), f"{args.process_state}-{args.route}-w{args.width}")
     runner = CLIRunner(
         cli, plan["scope"]["window_id"], plan["scope"]["context_id"], root, artifact
@@ -3614,6 +4732,7 @@ def run_command(args: argparse.Namespace) -> int:
         "schema_version": SCHEMA_VERSION, "plan_sha256": plan["plan_sha256"], "sessions": [],
         "worktrees": [], "control_id": None, "scope_reset": False,
         "benchmark_gate_expected_enabled": True, "memory_session_id": None,
+        "build_identity": build_identity,
     }
     save_json(artifact / "state.json", state)
     verify_scope(runner, plan)
@@ -3689,24 +4808,79 @@ def run_command(args: argparse.Namespace) -> int:
                 correctness, direct_tools, root_identity = first_search_read(
                     runner, plan, correlation, context_id, owned_worktree, worktree_id
                 )
-                follow_on = collect_follow_on_evidence(
-                    runner, plan, correlation, context_id, root_identity,
-                    worktree_id, owned_worktree
+                checkpoint_payload, checkpoint_capture = capture_diagnostic(
+                    runner, plan, correlation, action="snapshot",
+                    label=f"primary-checkpoint-{ordinal}",
                 )
-                correctness["follow_on"] = follow_on["ok"]
-                exported = runner.call(
-                    f"export-{ordinal}", DEBUG_TOOL,
-                    diagnostic_payload(plan, "export", correlation_id=correlation),
-                )
-                export_payload = find_object(exported, "sample")
-                failures = validate_export(
+                primary_performance = {
+                    "identity": {
+                        "correlation_id": correlation,
+                        "session_id": session_id,
+                        "context_id": context_id,
+                        "invocation": invocation,
+                        "ordinal": ordinal,
+                        "build": build_identity,
+                    },
+                    "committed_fixture": committed_fixture,
+                    "direct_tool_evidence": direct_tools,
+                    "diagnostic_checkpoint": checkpoint_payload,
+                    "checkpoint_capture": checkpoint_capture,
+                    "resource_cleanup": None,
+                    "valid": False,
+                    "invalid_reasons": ["resource_cleanup_pending"],
+                }
+                follow_on: dict[str, Any] = {
+                    "ok": False, "completed": False,
+                    "failures": [{"operation": "collection", "type": "not_started"}],
+                }
+                export_payload: dict[str, Any] = {}
+                export_capture: dict[str, Any]
+                try:
+                    follow_on = collect_follow_on_evidence(
+                        runner, plan, correlation, context_id, root_identity,
+                        worktree_id, owned_worktree
+                    )
+                except BaseException as error:
+                    follow_on = {
+                        "ok": False, "completed": True,
+                        "failures": [{
+                            "operation": "collection",
+                            "type": operation_failure_type(error),
+                            "error": repr(error),
+                        }],
+                    }
+                finally:
+                    export_payload, export_capture = capture_diagnostic(
+                        runner, plan, correlation, action="export",
+                        label=f"export-{ordinal}",
+                    )
+                collection_failures = validate_follow_on_collection(follow_on)
+                correctness["follow_on"] = not collection_failures
+                follow_on_failures = validate_export(
                     export_payload, args.route, correctness,
                     expected_correlation=correlation,
                     expected_session=session_id,
                     expected_invocation=invocation,
                     expected_ordinal=ordinal,
                 )
-                status = terminalize(runner, session_id)
+                follow_on_failures.extend(
+                    f"follow_on_collection:{failure}" for failure in collection_failures
+                )
+                if export_capture.get("ok") is not True:
+                    follow_on_failures.append(
+                        f"final_export_{export_capture.get('type') or 'failed'}"
+                    )
+                follow_on_acceptance = {
+                    "accepted": not follow_on_failures,
+                    "invalid_reasons": follow_on_failures,
+                    "collection": follow_on,
+                    "final_export": export_payload,
+                    "export_capture": export_capture,
+                }
+                try:
+                    status = terminalize(runner, session_id, context_id)
+                except BaseException as error:
+                    status = f"terminalize_error:{error!r}"
                 state["sessions"][-1]["terminal"] = status in TERMINAL_STATES
                 state["sessions"][-1]["status"] = status
                 record = {
@@ -3718,10 +4892,12 @@ def run_command(args: argparse.Namespace) -> int:
                     "session_id": session_id,
                     "context_id": context_id, "correctness": correctness,
                     "direct_tool_evidence": direct_tools, "follow_on_evidence": follow_on,
-                    "valid": not failures, "invalid_reasons": failures, "diagnostic": export_payload,
+                    "primary_performance": primary_performance,
+                    "follow_on_acceptance": follow_on_acceptance,
+                    "valid": False, "invalid_reasons": ["resource_cleanup_pending"],
+                    "diagnostic": export_payload,
                 }
                 sample_records.append(record)
-                append_ndjson(artifact / "samples.ndjson", record)
                 save_json(artifact / "state.json", state)
     except BaseException as error:
         operational_error = repr(error)
@@ -3810,22 +4986,72 @@ def run_command(args: argparse.Namespace) -> int:
         cleanup.append({"action": "restore_workspace_roots", "ok": final_target_ok})
         save_json(artifact / "cleanup.json", cleanup, exclusive=True)
         save_json(artifact / "state.json", state)
-    valid = [sample for sample in sample_records if sample["valid"] and not sample["warmup"]]
     cleanup_ok = validate_cleanup_evidence(
         cleanup, run_artifact=True, expected_agent_count=len(state["sessions"]),
         expected_worktree_count=len({item["path"] for item in state["worktrees"]}),
     )
+    resource_metrics = find_value(resources, "metrics")
+    resource_failures = validate_resource_evidence(resource_metrics)
+    try:
+        build_unchanged = (
+            resolved_cli.exists()
+            and sha256_bytes(resolved_cli.read_bytes()) == build_identity["cli_sha256"]
+            and validate_planned_base_commit(plan, root) == build_identity["base_commit_oid"]
+        )
+    except (BenchmarkError, OSError):
+        build_unchanged = False
+    for record in sample_records:
+        primary = record["primary_performance"]
+        finalize_primary_performance(
+            primary, route=args.route,
+            expected_correlation=record["correlation_id"],
+            expected_session=record["session_id"],
+            expected_context=record["context_id"],
+            expected_scope_context=plan["scope"]["context_id"],
+            expected_invocation=record["invocation"],
+            expected_ordinal=record["ordinal"],
+            expected_build=build_identity,
+            expected_fixture=committed_fixture,
+            resource_failures=resource_failures,
+            cleanup_complete=cleanup_ok,
+            build_unchanged=build_unchanged,
+        )
+        follow_on_acceptance = record["follow_on_acceptance"]
+        record["valid"] = (
+            primary["valid"] is True
+            and follow_on_acceptance["accepted"] is True
+        )
+        record["invalid_reasons"] = (
+            [f"primary:{reason}" for reason in primary["invalid_reasons"]]
+            + [
+                f"follow_on:{reason}"
+                for reason in follow_on_acceptance["invalid_reasons"]
+            ]
+        )
+        append_ndjson(artifact / "samples.ndjson", record)
+    valid = [sample for sample in sample_records if sample["valid"] and not sample["warmup"]]
+    primary_valid = [
+        sample for sample in sample_records
+        if sample["primary_performance"]["valid"] and not sample["warmup"]
+    ]
+    follow_on_accepted = [
+        sample for sample in sample_records
+        if sample["follow_on_acceptance"]["accepted"] and not sample["warmup"]
+    ]
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "failed" if operational_error or not cleanup_ok else "completed",
         "artifact_id": artifact.name,
         "plan_sha256": plan["plan_sha256"], "artifact_directory": str(artifact),
+        "build_identity": build_identity,
         "process_state": args.process_state, "checkout_kind": args.checkout_kind,
         "route": args.route, "width": args.width, "invocation": args.invocation,
         "warmup_groups": args.warmups, "retained_groups": args.samples,
         "expected_sample_count": (args.warmups + args.samples) * args.width,
         "operational_error": operational_error,
         "sample_count": len(sample_records), "valid_retained_count": len(valid),
+        "primary_valid_retained_count": len(primary_valid),
+        "follow_on_accepted_retained_count": len(follow_on_accepted),
         "invalid_count": len([sample for sample in sample_records if not sample["valid"]]),
         "cleanup_complete": cleanup_ok,
     }
@@ -7089,7 +8315,11 @@ def diagnostic_number(
 
 
 def sample_metric_number(item: dict[str, Any], metric: str) -> float | None:
-    sample = find_value(item.get("diagnostic"), "sample")
+    diagnostic = (
+        (item.get("primary_performance") or {}).get("diagnostic_checkpoint")
+        if metric in METRICS else item.get("diagnostic")
+    )
+    sample = find_value(diagnostic, "sample")
     if not isinstance(sample, dict):
         return None
     if metric == "interactive_readiness_us":
@@ -7429,8 +8659,8 @@ def render_scoreboard(summary: dict[str, Any]) -> str:
             )
     lines.extend([
         "", "### Route and work attribution", "",
-        "| cohort | routes | fallbacks | Git commands p50 | Git µs p50 | FS ops p50 | FS µs p50 | CPU ms | peak physical Δ MB | retained physical Δ MB |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| cohort | primary retained | follow-on accepted | routes | fallbacks | Git commands p50 | Git µs p50 | FS ops p50 | FS µs p50 | CPU ms | peak physical Δ MB | retained physical Δ MB |",
+        "|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for key, cohort in sorted(summary["cohorts"].items()):
         resources = cohort.get("resources") or []
@@ -7438,7 +8668,9 @@ def render_scoreboard(summary: dict[str, Any]) -> str:
         peak = [item.get("peak_physical_footprint_delta_mb") for item in resources if isinstance(item.get("peak_physical_footprint_delta_mb"), (int, float))]
         retained = [item.get("retained_physical_footprint_delta_mb") for item in resources if isinstance(item.get("retained_physical_footprint_delta_mb"), (int, float))]
         lines.append(
-            f"| `{key}` | `{cohort.get('route_counts', {})}` | `{cohort.get('fallback_counts', {})}` | "
+            f"| `{key}` | {cohort.get('primary_valid_retained', 0)} | "
+            f"{cohort.get('follow_on_accepted_retained', 0)} | "
+            f"`{cohort.get('route_counts', {})}` | `{cohort.get('fallback_counts', {})}` | "
             f"{cohort['git_command_count']['p50']} | {cohort['git_duration_us']['p50']} | "
             f"{cohort['filesystem_operation_count']['p50']} | {cohort['filesystem_duration_us']['p50']} | "
             f"{statistics.median(cpu) if cpu else None} | {statistics.median(peak) if peak else None} | "
@@ -7451,6 +8683,8 @@ def render_scoreboard(summary: dict[str, Any]) -> str:
     lines.append(f"- Correctness results: `{summary['correctness']}`")
     lines.append(f"- Invalid attempted samples: `{summary['invalid_attempted_samples']}`")
     lines.append(f"- Invalid retained samples: `{summary['invalid_retained_samples']}`")
+    lines.append(f"- Primary-invalid attempted samples: `{summary['primary_invalid_attempted_samples']}`")
+    lines.append(f"- Follow-on-failed attempted samples: `{summary['follow_on_failed_attempted_samples']}`")
     lines.append(f"- Artifact directories: `{', '.join(summary['artifacts'])}`")
     return "\n".join(lines) + "\n"
 
@@ -7483,8 +8717,322 @@ def configured_required_matrix_keys(plan: dict[str, Any]) -> set[str]:
     }
 
 
+def validate_primary_revalidation_provenance(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["provenance_malformed"]
+    failures: list[str] = []
+    if value.get("schema_version") != SCHEMA_VERSION:
+        failures.append("provenance_schema_mismatch")
+    if value.get("kind") != "primary-performance-offline-revalidation":
+        failures.append("provenance_kind_mismatch")
+    validator = value.get("validator")
+    if (
+        not isinstance(validator, dict)
+        or validator.get("version") != PRIMARY_REVALIDATION_VERSION
+        or not isinstance(validator.get("source_path"), str)
+        or not isinstance(validator.get("source_sha256"), str)
+        or len(validator.get("source_sha256", "")) != 64
+    ):
+        failures.append("validator_provenance_invalid")
+    command = value.get("command")
+    if (
+        not isinstance(command, dict)
+        or not isinstance(command.get("cwd"), str)
+        or not isinstance(command.get("exact"), str)
+        or not command.get("exact")
+    ):
+        failures.append("revalidation_command_missing")
+    artifact = value.get("artifact")
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("route") != "forced-full"
+        or artifact.get("width") != 1
+        or not positive_integer(artifact.get("invocation"))
+        or not isinstance(artifact.get("artifact_id"), str)
+        or not isinstance(artifact.get("plan_sha256"), str)
+        or len(artifact.get("plan_sha256", "")) != 64
+        or not isinstance(artifact.get("build_identity"), dict)
+    ):
+        failures.append("revalidation_artifact_identity_invalid")
+    inputs = value.get("inputs")
+    required_inputs = {
+        "plan_argument", "artifact_plan", "summary", "samples_ndjson",
+        "resources", "cleanup",
+    }
+    if not isinstance(inputs, dict) or set(inputs) != required_inputs:
+        failures.append("revalidation_input_inventory_mismatch")
+    elif any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("path"), str)
+        or not isinstance(item.get("sha256"), str)
+        or len(item["sha256"]) != 64
+        for item in inputs.values()
+    ):
+        failures.append("revalidation_input_hash_invalid")
+
+    samples = value.get("samples")
+    if not isinstance(samples, list) or len(samples) != 6:
+        failures.append("revalidation_sample_count_mismatch")
+        samples = []
+    else:
+        if [item.get("ordinal") for item in samples if isinstance(item, dict)] != list(range(1, 7)):
+            failures.append("revalidation_sample_ordinals_mismatch")
+        identities = {
+            (item.get("correlation_id"), item.get("session_id"))
+            for item in samples if isinstance(item, dict)
+        }
+        if len(identities) != 6:
+            failures.append("revalidation_sample_identity_reused")
+        for item in samples:
+            if (
+                not isinstance(item, dict)
+                or item.get("primary_valid") is not True
+                or item.get("invalid_reasons") != []
+                or not isinstance(item.get("source_record_sha256"), str)
+                or len(item.get("source_record_sha256", "")) != 64
+                or not isinstance(item.get("checkpoint_sha256"), str)
+                or len(item.get("checkpoint_sha256", "")) != 64
+                or not isinstance(item.get("revalidated_checkpoint_sha256"), str)
+                or item.get("revalidated_checkpoint_sha256") != item.get("checkpoint_sha256")
+                or not finite_number(item.get("raw_primary_ms"), positive=True)
+                or item.get("revalidated_primary_ms") != item.get("raw_primary_ms")
+            ):
+                failures.append("revalidation_sample_proof_invalid")
+                break
+    raw_values = value.get("raw_values_ms")
+    source_retained = [
+        item.get("raw_primary_ms") for item in samples
+        if isinstance(item, dict) and item.get("warmup") is False
+    ]
+    source_warmup = [
+        item.get("raw_primary_ms") for item in samples
+        if isinstance(item, dict) and item.get("warmup") is True
+    ]
+    revalidated_retained = [
+        item.get("revalidated_primary_ms") for item in samples
+        if isinstance(item, dict) and item.get("warmup") is False
+    ]
+    if (
+        not isinstance(raw_values, dict)
+        or raw_values.get("source_retained") != source_retained
+        or raw_values.get("revalidated_retained") != revalidated_retained
+        or revalidated_retained != source_retained
+        or raw_values.get("source_warmup") != source_warmup
+        or len(source_retained) != 5
+        or len(source_warmup) != 1
+    ):
+        failures.append("revalidation_raw_values_changed_or_mixed")
+    proof = value.get("proof")
+    required_proof = {
+        "plan_content_matches_artifact",
+        "artifact_identity_exact",
+        "exact_sample_accounting",
+        "checkpoint_hashes_recorded",
+        "source_raw_values_equal_revalidated",
+        "no_mixed_samples",
+        "cleanup_complete",
+        "resource_evidence_valid",
+    }
+    if (
+        not isinstance(proof, dict)
+        or set(proof) != required_proof
+        or any(proof.get(key) is not True for key in required_proof)
+    ):
+        failures.append("revalidation_proof_incomplete")
+    return failures
+
+
+def revalidate_primary_command(args: argparse.Namespace) -> int:
+    plan_path = Path(args.plan).expanduser().resolve(strict=True)
+    artifact = Path(args.artifact).expanduser().resolve(strict=True)
+    output = Path(args.output).expanduser().resolve()
+    plan = load_plan(plan_path)
+    artifact_files = {
+        "artifact_plan": artifact / "plan.json",
+        "summary": artifact / "summary.json",
+        "samples_ndjson": artifact / "samples.ndjson",
+        "resources": artifact / "resources.json",
+        "cleanup": artifact / "cleanup.json",
+    }
+    if any(not path.is_file() for path in artifact_files.values()):
+        raise BenchmarkError("revalidation artifact omitted a required input file")
+    artifact_plan = load_plan(artifact_files["artifact_plan"])
+    summary = json.loads(artifact_files["summary"].read_text(encoding="utf-8"))
+    if artifact_plan != plan:
+        raise BenchmarkError("revalidation plan argument differs from artifact plan")
+    if (
+        summary.get("artifact_id") != artifact.name
+        or summary.get("plan_sha256") != plan["plan_sha256"]
+        or summary.get("route") != "forced-full"
+        or summary.get("width") != 1
+        or summary.get("warmup_groups") != 1
+        or summary.get("retained_groups") != 5
+        or summary.get("expected_sample_count") != 6
+    ):
+        raise BenchmarkError("revalidation artifact is not the exact forced-full 1+5 cohort")
+    build_identity = summary.get("build_identity")
+    if (
+        not isinstance(build_identity, dict)
+        or build_identity.get("base_commit_oid") != plan["dataset"]["base_commit_oid"]
+        or not isinstance(build_identity.get("cli_sha256"), str)
+        or len(build_identity["cli_sha256"]) != 64
+    ):
+        raise BenchmarkError("revalidation artifact build identity is invalid")
+
+    resources = json.loads(artifact_files["resources"].read_text(encoding="utf-8"))
+    resource_failures = validate_resource_evidence(find_value(resources, "metrics"))
+    cleanup = json.loads(artifact_files["cleanup"].read_text(encoding="utf-8"))
+    cleanup_entries = [item for item in cleanup if isinstance(item, dict)] if isinstance(cleanup, list) else []
+    cleanup_complete = validate_cleanup_evidence(
+        cleanup_entries, run_artifact=True, expected_agent_count=6,
+        expected_worktree_count=6,
+    )
+    expected_fixture = {
+        "base_commit_oid": str(plan["dataset"]["base_commit_oid"]),
+        "read_blob_sha256": str(plan["dataset"]["read_blob_sha256"]),
+        "read_path": str(plan["dataset"]["read_path"]),
+        "search_marker": str(plan["dataset"]["search_marker"]),
+        "read_marker": str(plan["dataset"]["read_marker"]),
+    }
+    raw_lines = artifact_files["samples_ndjson"].read_text(encoding="utf-8").splitlines()
+    samples: list[dict[str, Any]] = []
+    mixed_samples = 0
+    for line in raw_lines:
+        sample = json.loads(line)
+        expected_identity = (
+            sample.get("artifact_id") == artifact.name
+            and sample.get("plan_sha256") == plan["plan_sha256"]
+            and sample.get("route") == "forced-full"
+            and sample.get("width") == 1
+            and sample.get("invocation") == summary.get("invocation")
+        )
+        if not expected_identity:
+            mixed_samples += 1
+        source_primary = sample.get("primary_performance")
+        if not isinstance(source_primary, dict):
+            raise BenchmarkError("revalidation sample omitted primary_performance")
+        source_checkpoint = source_primary.get("diagnostic_checkpoint")
+        source_checkpoint_sample = find_value(source_checkpoint, "sample")
+        if not isinstance(source_checkpoint, dict) or not isinstance(source_checkpoint_sample, dict):
+            raise BenchmarkError("revalidation source sample omitted its primary checkpoint")
+        source_raw_primary_us = source_checkpoint_sample.get("interactive_readiness_us")
+        if not finite_number(source_raw_primary_us, positive=True):
+            raise BenchmarkError("revalidation source sample primary value is invalid")
+        primary = json.loads(json.dumps(source_primary))
+        primary["resource_cleanup"] = {
+            "resource_failures": resource_failures,
+            "cleanup_complete": cleanup_complete,
+            "build_unchanged": primary.get("identity", {}).get("build") == build_identity,
+        }
+        failures = validate_primary_performance(
+            primary, "forced-full",
+            expected_correlation=sample["correlation_id"],
+            expected_session=sample["session_id"],
+            expected_context=sample["context_id"],
+            expected_scope_context=plan["scope"]["context_id"],
+            expected_invocation=sample["invocation"],
+            expected_ordinal=sample["ordinal"],
+            expected_build=build_identity,
+            expected_fixture=expected_fixture,
+        )
+        checkpoint = primary.get("diagnostic_checkpoint")
+        checkpoint_sample = find_value(checkpoint, "sample")
+        if not isinstance(checkpoint, dict) or not isinstance(checkpoint_sample, dict):
+            raise BenchmarkError("revalidation sample omitted its primary checkpoint")
+        revalidated_raw_primary_us = checkpoint_sample.get("interactive_readiness_us")
+        if not finite_number(revalidated_raw_primary_us, positive=True):
+            raise BenchmarkError("revalidation sample primary value is invalid")
+        samples.append({
+            "ordinal": sample["ordinal"],
+            "warmup": sample["warmup"],
+            "correlation_id": sample["correlation_id"],
+            "session_id": sample["session_id"],
+            "source_record_sha256": sha256_bytes((line + "\n").encode()),
+            "checkpoint_sha256": sha256_bytes(canonical_json(source_checkpoint)),
+            "revalidated_checkpoint_sha256": sha256_bytes(canonical_json(checkpoint)),
+            "raw_primary_ms": float(source_raw_primary_us) / 1000,
+            "revalidated_primary_ms": float(revalidated_raw_primary_us) / 1000,
+            "primary_valid": not failures,
+            "invalid_reasons": failures,
+        })
+    validate_sample_ordinals(samples, 6)
+    if any(item["primary_valid"] is not True for item in samples):
+        raise BenchmarkError("one or more forced-full primary samples failed revalidation")
+
+    retained = [item["raw_primary_ms"] for item in samples if item["warmup"] is False]
+    revalidated_retained = [
+        item["revalidated_primary_ms"] for item in samples if item["warmup"] is False
+    ]
+    warmup = [item["raw_primary_ms"] for item in samples if item["warmup"] is True]
+    source_path = Path(__file__).resolve()
+    cwd = Path.cwd().resolve()
+    try:
+        source_display = str(source_path.relative_to(cwd))
+    except ValueError:
+        source_display = str(source_path)
+    command = " ".join(shlex.quote(item) for item in (
+        "python3", source_display, "revalidate-primary",
+        "--plan", str(plan_path), "--artifact", str(artifact), "--output", str(output),
+    ))
+    inputs = {
+        "plan_argument": {"path": str(plan_path), "sha256": sha256_bytes(plan_path.read_bytes())},
+        **{
+            name: {"path": str(path), "sha256": sha256_bytes(path.read_bytes())}
+            for name, path in artifact_files.items()
+        },
+    }
+    provenance = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "primary-performance-offline-revalidation",
+        "validator": {
+            "version": PRIMARY_REVALIDATION_VERSION,
+            "source_path": source_display,
+            "source_sha256": sha256_bytes(source_path.read_bytes()),
+        },
+        "command": {"cwd": str(cwd), "exact": command},
+        "inputs": inputs,
+        "artifact": {
+            "artifact_id": artifact.name,
+            "plan_sha256": plan["plan_sha256"],
+            "route": "forced-full",
+            "width": 1,
+            "invocation": summary["invocation"],
+            "build_identity": build_identity,
+        },
+        "samples": samples,
+        "raw_values_ms": {
+            "source_warmup": warmup,
+            "source_retained": retained,
+            "revalidated_retained": revalidated_retained,
+        },
+        "proof": {
+            "plan_content_matches_artifact": artifact_plan == plan,
+            "artifact_identity_exact": summary.get("artifact_id") == artifact.name,
+            "exact_sample_accounting": len(samples) == 6 and len(warmup) == 1 and len(retained) == 5,
+            "checkpoint_hashes_recorded": all(len(item["checkpoint_sha256"]) == 64 for item in samples),
+            "source_raw_values_equal_revalidated": retained == revalidated_retained,
+            "no_mixed_samples": mixed_samples == 0,
+            "cleanup_complete": cleanup_complete,
+            "resource_evidence_valid": not resource_failures,
+        },
+    }
+    failures = validate_primary_revalidation_provenance(provenance)
+    if failures:
+        raise BenchmarkError(f"revalidation provenance failed closed: {failures}")
+    save_json(output, provenance, exclusive=True)
+    print(output)
+    return 0
+
+
 def aggregate_command(args: argparse.Namespace) -> int:
     plan = load_plan(Path(args.plan).expanduser().resolve(strict=True))
+    expected_fixture = {
+        "base_commit_oid": str(plan["dataset"]["base_commit_oid"]),
+        "read_blob_sha256": str(plan["dataset"]["read_blob_sha256"]),
+        "read_path": str(plan["dataset"]["read_path"]),
+        "search_marker": str(plan["dataset"]["search_marker"]),
+        "read_marker": str(plan["dataset"]["read_marker"]),
+    }
     samples: list[dict[str, Any]] = []
     correctness: list[dict[str, Any]] = []
     resource_records: dict[str, list[dict[str, Any]]] = {}
@@ -7515,6 +9063,15 @@ def aggregate_command(args: argparse.Namespace) -> int:
         is_run = all(item.get(field) is not None for field in run_fields)
         expected_sample_count = 0
         if is_run:
+            build_identity = item.get("build_identity")
+            if (
+                not isinstance(build_identity, dict)
+                or set(build_identity) != {"cli_sha256", "base_commit_oid"}
+                or build_identity.get("base_commit_oid") != plan["dataset"]["base_commit_oid"]
+                or not isinstance(build_identity.get("cli_sha256"), str)
+                or len(build_identity["cli_sha256"]) != 64
+            ):
+                raise BenchmarkError(f"run artifact omitted exact build identity: {artifact}")
             cohort_invocation = (
                 str(item["process_state"]), str(item["checkout_kind"]), str(item["route"]),
                 int(item["width"]), int(item["invocation"]),
@@ -7559,25 +9116,68 @@ def aggregate_command(args: argparse.Namespace) -> int:
                 )
                 if identity[:6] != expected_prefix:
                     raise BenchmarkError(f"mixed sample identity: {identity}")
-                diagnostic_sample = find_value(sample.get("diagnostic"), "sample")
+                primary = sample.get("primary_performance")
+                follow_on_acceptance = sample.get("follow_on_acceptance")
+                if not isinstance(primary, dict) or not isinstance(follow_on_acceptance, dict):
+                    raise BenchmarkError(f"sample omitted split primary/follow-on evidence in {artifact}")
+                diagnostic_sample = find_value(primary.get("diagnostic_checkpoint"), "sample")
                 if not isinstance(diagnostic_sample, dict):
-                    raise BenchmarkError(f"sample omitted diagnostic payload in {artifact}")
+                    raise BenchmarkError(f"sample omitted primary diagnostic checkpoint in {artifact}")
                 correlation_id = validate_uuid(
                     str(diagnostic_sample.get("correlation_id") or ""), "sample correlation_id"
                 )
                 session_id = record_session
                 if correlation_id != record_correlation:
                     raise BenchmarkError(f"sample correlation IDs disagree in {artifact}")
-                recomputed_failures = validate_export(
+                primary_failures = validate_primary_performance(
+                    primary, str(sample["route"]),
+                    expected_correlation=correlation_id,
+                    expected_session=session_id,
+                    expected_context=sample["context_id"],
+                    expected_scope_context=plan["scope"]["context_id"],
+                    expected_invocation=sample["invocation"],
+                    expected_ordinal=sample["ordinal"],
+                    expected_build=build_identity,
+                    expected_fixture=expected_fixture,
+                )
+                if sorted(primary_failures) != sorted(primary.get("invalid_reasons") or []):
+                    raise BenchmarkError(f"primary validity evidence mismatch in {artifact}")
+                if primary.get("valid") is not (not primary_failures):
+                    raise BenchmarkError(f"primary valid flag disagrees with evidence in {artifact}")
+                follow_on_failures = validate_export(
                     sample["diagnostic"], str(sample["route"]), sample.get("correctness") or {},
                     expected_correlation=correlation_id,
                     expected_session=session_id,
                     expected_invocation=sample["invocation"],
                     expected_ordinal=sample["ordinal"],
                 )
+                collection = follow_on_acceptance.get("collection")
+                if collection != sample.get("follow_on_evidence"):
+                    raise BenchmarkError(
+                        f"follow-on collection copies disagree in {artifact}"
+                    )
+                follow_on_failures.extend(
+                    f"follow_on_collection:{failure}"
+                    for failure in validate_follow_on_collection(collection)
+                )
+                export_capture = follow_on_acceptance.get("export_capture")
+                if isinstance(export_capture, dict) and export_capture.get("ok") is not True:
+                    follow_on_failures.append(
+                        f"final_export_{export_capture.get('type') or 'failed'}"
+                    )
+                if sorted(follow_on_failures) != sorted(
+                    follow_on_acceptance.get("invalid_reasons") or []
+                ):
+                    raise BenchmarkError(f"follow-on acceptance evidence mismatch in {artifact}")
+                if follow_on_acceptance.get("accepted") is not (not follow_on_failures):
+                    raise BenchmarkError(f"follow-on accepted flag disagrees with evidence in {artifact}")
+                recomputed_failures = (
+                    [f"primary:{reason}" for reason in primary_failures]
+                    + [f"follow_on:{reason}" for reason in follow_on_failures]
+                )
                 if sorted(recomputed_failures) != sorted(sample.get("invalid_reasons") or []):
                     raise BenchmarkError(f"sample validity evidence mismatch in {artifact}")
-                if sample["valid"] != (not recomputed_failures):
+                if sample["valid"] is not (not recomputed_failures):
                     raise BenchmarkError(f"sample valid flag disagrees with evidence in {artifact}")
                 register_unique(identity, sample_identities, "sample identity")
                 register_unique(correlation_id, correlation_ids, "sample correlation identity")
@@ -7599,11 +9199,15 @@ def aggregate_command(args: argparse.Namespace) -> int:
             resource_value = json.loads(resource_file.read_text(encoding="utf-8"))
             metrics_value = find_value(resource_value, "metrics")
             resource_failures = validate_resource_evidence(metrics_value)
-            if resource_failures:
-                raise BenchmarkError(
-                    f"invalid CPU/RSS resource evidence in {artifact}: {resource_failures}"
-                )
-            resource_records.setdefault(key, []).append(metrics_value)
+            if any(
+                (sample.get("primary_performance") or {}).get("resource_cleanup", {}).get(
+                    "resource_failures"
+                ) != resource_failures
+                for sample in artifact_samples
+            ):
+                raise BenchmarkError(f"sample resource proof disagrees with {artifact}")
+            if not resource_failures:
+                resource_records.setdefault(key, []).append(metrics_value)
         elif isinstance(item.get("results"), dict):
             correctness.append(item["results"])
         else:
@@ -7613,13 +9217,25 @@ def aggregate_command(args: argparse.Namespace) -> int:
             raise BenchmarkError(f"artifact omitted cleanup.json: {artifact}")
         cleanup_value = json.loads(cleanup_file.read_text(encoding="utf-8"))
         entries = [entry for entry in cleanup_value if isinstance(entry, dict)] if isinstance(cleanup_value, list) else []
-        teardown_results.append(validate_cleanup_evidence(
+        expected_cleanup_ok = validate_cleanup_evidence(
             entries, run_artifact=is_run, expected_agent_count=expected_sample_count,
             expected_worktree_count=expected_sample_count if is_run else 2,
-        ))
+        )
+        teardown_results.append(expected_cleanup_ok)
         if item.get("cleanup_complete") is not True:
             teardown_results.append(False)
         if is_run:
+            actual_cleanup_ok = validate_cleanup_evidence(
+                entries, run_artifact=True, expected_agent_count=len(artifact_samples),
+                expected_worktree_count=len(artifact_samples),
+            )
+            if any(
+                (sample.get("primary_performance") or {}).get("resource_cleanup", {}).get(
+                    "cleanup_complete"
+                ) is not actual_cleanup_ok
+                for sample in artifact_samples
+            ):
+                raise BenchmarkError(f"sample cleanup proof disagrees with {artifact}")
             state_file = artifact / "state.json"
             if not state_file.exists():
                 raise BenchmarkError(f"run artifact omitted state.json: {artifact}")
@@ -7652,6 +9268,11 @@ def aggregate_command(args: argparse.Namespace) -> int:
         grouped.setdefault(key, []).append(sample)
     for key, members in grouped.items():
         retained = [item for item in members if not item.get("warmup") and item.get("valid")]
+        primary_retained = [
+            item for item in members
+            if not item.get("warmup")
+            and (item.get("primary_performance") or {}).get("valid") is True
+        ]
         invocation_count = sum(
             1
             for process_state, checkout_kind, route, width, _ in cohort_invocations
@@ -7659,8 +9280,11 @@ def aggregate_command(args: argparse.Namespace) -> int:
         )
         route_counts: dict[str, int] = {}
         fallback_counts: dict[str, int] = {}
-        for item in retained:
-            sample_payload = find_value(item.get("diagnostic"), "sample")
+        for item in primary_retained:
+            sample_payload = find_value(
+                (item.get("primary_performance") or {}).get("diagnostic_checkpoint"),
+                "sample",
+            )
             if not isinstance(sample_payload, dict):
                 continue
             for name, count in (sample_payload.get("route_counts") or {}).items():
@@ -7671,13 +9295,27 @@ def aggregate_command(args: argparse.Namespace) -> int:
             "attempted": len(members),
             "invocation_count": invocation_count,
             "valid_retained": len(retained),
+            "primary_valid_retained": len(primary_retained),
+            "follow_on_accepted_retained": len([
+                item for item in members
+                if not item.get("warmup")
+                and (item.get("follow_on_acceptance") or {}).get("accepted") is True
+            ]),
             "invalid_retained": len([item for item in members if not item.get("warmup") and not item.get("valid")]),
             "invalid_attempted": len([item for item in members if not item.get("valid")]),
+            "primary_invalid_attempted": len([
+                item for item in members
+                if (item.get("primary_performance") or {}).get("valid") is not True
+            ]),
+            "follow_on_failed_attempted": len([
+                item for item in members
+                if (item.get("follow_on_acceptance") or {}).get("accepted") is not True
+            ]),
             "route_counts": route_counts,
             "fallback_counts": fallback_counts,
             "exact_actual_routes": (
                 route_counts == {
-                    name: count * len(retained)
+                    name: count * len(primary_retained)
                     for name, count in EXPECTED_ACTUAL_ROUTE_COUNTS[key.split("/")[2]].items()
                 }
                 and fallback_counts == {}
@@ -7686,7 +9324,7 @@ def aggregate_command(args: argparse.Namespace) -> int:
                 metric: stats(
                     (
                         value
-                        for item in retained
+                        for item in (primary_retained if metric in METRICS else retained)
                         if (value := sample_metric_number(item, metric)) is not None
                     ),
                     positive=True,
@@ -7779,7 +9417,10 @@ def aggregate_command(args: argparse.Namespace) -> int:
     )
     sample_correctness_mismatches = sum(
         1 for sample in samples
-        if "content_oracle_mismatch" in sample.get("invalid_reasons", [])
+        if any(
+            str(reason).endswith("content_oracle_mismatch")
+            for reason in sample.get("invalid_reasons", [])
+        )
     )
     mismatches = sample_correctness_mismatches + sum(
         1 for group in correctness for item in group.values() if not item.get("ok")
@@ -7799,7 +9440,10 @@ def aggregate_command(args: argparse.Namespace) -> int:
     projected_fallbacks = sum(
         1 for sample in samples
         if sample.get("route") == "projected"
-        and "unexpected_fallback" in sample.get("invalid_reasons", [])
+        and any(
+            str(reason).endswith("unexpected_fallback")
+            for reason in sample.get("invalid_reasons", [])
+        )
     )
     gates["zero eligible warm fallbacks"] = "pass" if samples and projected_fallbacks == 0 else "fail" if samples else "incomplete"
     expected_secondary_comparisons = len(states) * len(checkouts) * len(widths) * len(TOOL_METRICS)
@@ -7874,6 +9518,14 @@ def aggregate_command(args: argparse.Namespace) -> int:
         "invalid_attempted_samples": invalid,
         "invalid_retained_samples": sum(
             1 for sample in samples if not sample.get("warmup") and not sample.get("valid")
+        ),
+        "primary_invalid_attempted_samples": sum(
+            1 for sample in samples
+            if (sample.get("primary_performance") or {}).get("valid") is not True
+        ),
+        "follow_on_failed_attempted_samples": sum(
+            1 for sample in samples
+            if (sample.get("follow_on_acceptance") or {}).get("accepted") is not True
         ),
         "identity": {
             "sample_count": len(samples), "unique_correlation_ids": len(correlation_ids),
@@ -8308,6 +9960,15 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--details", help="optional JSON object with sanitized evidence details")
     evidence.add_argument("--output", required=True)
     evidence.set_defaults(func=record_evidence_command)
+
+    revalidate_primary = sub.add_parser(
+        "revalidate-primary",
+        help="revalidate one forced-full primary cohort and persist hashed offline provenance",
+    )
+    revalidate_primary.add_argument("--plan", required=True)
+    revalidate_primary.add_argument("--artifact", required=True)
+    revalidate_primary.add_argument("--output", required=True)
+    revalidate_primary.set_defaults(func=revalidate_primary_command)
 
     run = sub.add_parser("run", help="run one route/process/width cohort")
     add_live_common(run)

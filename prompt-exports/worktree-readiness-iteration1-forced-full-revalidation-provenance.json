@@ -1,0 +1,159 @@
+{
+  "artifact": {
+    "artifact_id": "20260626T182344Z-warm-forced-full-w1-c7e4f414",
+    "build_identity": {
+      "base_commit_oid": "be61584899ed2ef5623817b2ad80815c13e4cbeb",
+      "cli_sha256": "4fdd50df7891d354d9ea3cfcd4f447e8d028e458a8f451f2965c2fa1500873d8"
+    },
+    "invocation": 1,
+    "plan_sha256": "dea1b3b16557a6d13dfba7b46c16184485355ab0884ca4deeab704e1e198d367",
+    "route": "forced-full",
+    "width": 1
+  },
+  "command": {
+    "cwd": "/Users/pvncher/Documents/Git/repoprompt-ce-release",
+    "exact": "python3 Scripts/worktree_startup_live_benchmark.py revalidate-primary --plan /private/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/primary-plan.json --artifact /private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414 --output /Users/pvncher/Documents/Git/repoprompt-ce-release/prompt-exports/worktree-readiness-iteration1-forced-full-revalidation-provenance.json"
+  },
+  "inputs": {
+    "artifact_plan": {
+      "path": "/private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414/plan.json",
+      "sha256": "1ba4577525ea61994ee72dbe05add40810fbaf4ae2582d36e6b57d382fc9e8a2"
+    },
+    "cleanup": {
+      "path": "/private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414/cleanup.json",
+      "sha256": "22f35d73239404d251ba4361be1547d2ee7521012e7e2cae633d767959310448"
+    },
+    "plan_argument": {
+      "path": "/private/tmp/rpce-worktree-startup/iteration1-measurement-split-20260626T182119Z/primary-plan.json",
+      "sha256": "1ba4577525ea61994ee72dbe05add40810fbaf4ae2582d36e6b57d382fc9e8a2"
+    },
+    "resources": {
+      "path": "/private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414/resources.json",
+      "sha256": "2d01f578609d53537037470f137da798766350bffae1210fe593b5a0946ddadd"
+    },
+    "samples_ndjson": {
+      "path": "/private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414/samples.ndjson",
+      "sha256": "e4a87c430c69deebb7e6c55355327546ab8191225b31d6ad2df776d7a2ebf062"
+    },
+    "summary": {
+      "path": "/private/tmp/rpce-worktree-startup/v1/20260626T182344Z-warm-forced-full-w1-c7e4f414/summary.json",
+      "sha256": "b1c7240775d982f4cfb1d23ab9ae8be7660cd608b8d0f32836aee98f006bc6c1"
+    }
+  },
+  "kind": "primary-performance-offline-revalidation",
+  "proof": {
+    "artifact_identity_exact": true,
+    "checkpoint_hashes_recorded": true,
+    "cleanup_complete": true,
+    "exact_sample_accounting": true,
+    "no_mixed_samples": true,
+    "plan_content_matches_artifact": true,
+    "resource_evidence_valid": true,
+    "source_raw_values_equal_revalidated": true
+  },
+  "raw_values_ms": {
+    "revalidated_retained": [
+      898.364,
+      1021.922,
+      972.808,
+      946.328,
+      866.379
+    ],
+    "source_retained": [
+      898.364,
+      1021.922,
+      972.808,
+      946.328,
+      866.379
+    ],
+    "source_warmup": [
+      726.572
+    ]
+  },
+  "samples": [
+    {
+      "checkpoint_sha256": "1a078754ddef15a920186cfd58fabbe2dead4210fb0e6f693c3877b4dfbeffa6",
+      "correlation_id": "9197CB69-FA67-4A70-9651-96922E57205A",
+      "invalid_reasons": [],
+      "ordinal": 1,
+      "primary_valid": true,
+      "raw_primary_ms": 726.572,
+      "revalidated_checkpoint_sha256": "1a078754ddef15a920186cfd58fabbe2dead4210fb0e6f693c3877b4dfbeffa6",
+      "revalidated_primary_ms": 726.572,
+      "session_id": "48D37C2E-E24B-4E5C-8C8B-CF1CFA4F3AD5",
+      "source_record_sha256": "be964cc09f58f5c1ba9bb5a5ac26bc06e288361ce9bd2fe62da36c6bcdba12b0",
+      "warmup": true
+    },
+    {
+      "checkpoint_sha256": "4ed78f38104027cf589d27c1bc9da734f9d336bf756bb9b4b233ee94a981a5d3",
+      "correlation_id": "260B6AE7-2856-4393-B220-4FC92444013E",
+      "invalid_reasons": [],
+      "ordinal": 2,
+      "primary_valid": true,
+      "raw_primary_ms": 898.364,
+      "revalidated_checkpoint_sha256": "4ed78f38104027cf589d27c1bc9da734f9d336bf756bb9b4b233ee94a981a5d3",
+      "revalidated_primary_ms": 898.364,
+      "session_id": "2FA854EF-D474-4EB4-AC5C-362A9D488327",
+      "source_record_sha256": "aee314e8f345fea0cd0caea617f73b76c58e81d8edbe91a1f917b45de01ab706",
+      "warmup": false
+    },
+    {
+      "checkpoint_sha256": "42f8a4d9ed167db91c34ddd352627b3c1a908879dd23ecf1939f875eac8a5448",
+      "correlation_id": "8FFD1C6E-D8F2-4FBE-88B2-8336C3D75FF3",
+      "invalid_reasons": [],
+      "ordinal": 3,
+      "primary_valid": true,
+      "raw_primary_ms": 1021.922,
+      "revalidated_checkpoint_sha256": "42f8a4d9ed167db91c34ddd352627b3c1a908879dd23ecf1939f875eac8a5448",
+      "revalidated_primary_ms": 1021.922,
+      "session_id": "26FA0F6D-B35D-4848-98A2-125F16CE8FC8",
+      "source_record_sha256": "38654444cf6b0b517eee8d0224594d8fb384e6b425aa49d6c0f12a5855cd79b4",
+      "warmup": false
+    },
+    {
+      "checkpoint_sha256": "d047fe9906a578b73a9a9b3a9d0d340a810b346951ecc2664283ad710312f799",
+      "correlation_id": "ADA5A145-145F-43D4-9EA7-C36466C5380E",
+      "invalid_reasons": [],
+      "ordinal": 4,
+      "primary_valid": true,
+      "raw_primary_ms": 972.808,
+      "revalidated_checkpoint_sha256": "d047fe9906a578b73a9a9b3a9d0d340a810b346951ecc2664283ad710312f799",
+      "revalidated_primary_ms": 972.808,
+      "session_id": "6923261F-6155-4886-91B8-E38D99D325F0",
+      "source_record_sha256": "02a68be83cac5dc9acc8877fd40eb3e7d10b4b21023a94e0bce0a418207cbc16",
+      "warmup": false
+    },
+    {
+      "checkpoint_sha256": "cdf8f4d4204e21284b9623cc4fcc87265a4d481739e00eae1402594fb5fac249",
+      "correlation_id": "3D570E17-D0A8-4068-9F8E-B5E8EBD209F0",
+      "invalid_reasons": [],
+      "ordinal": 5,
+      "primary_valid": true,
+      "raw_primary_ms": 946.328,
+      "revalidated_checkpoint_sha256": "cdf8f4d4204e21284b9623cc4fcc87265a4d481739e00eae1402594fb5fac249",
+      "revalidated_primary_ms": 946.328,
+      "session_id": "7F71E035-8AD0-44C5-8DAF-8EAF91CB0E09",
+      "source_record_sha256": "98f41c2fa8eaa2cf966d4f1f7ce723fb6ee0771a9edca556e000c7858664d0dc",
+      "warmup": false
+    },
+    {
+      "checkpoint_sha256": "adc0c06f942bfda48c29a081f000fcf3909e506d0ad26713216dbd072dc0462c",
+      "correlation_id": "D242D4FC-7F3B-472B-9914-0613E841A25D",
+      "invalid_reasons": [],
+      "ordinal": 6,
+      "primary_valid": true,
+      "raw_primary_ms": 866.379,
+      "revalidated_checkpoint_sha256": "adc0c06f942bfda48c29a081f000fcf3909e506d0ad26713216dbd072dc0462c",
+      "revalidated_primary_ms": 866.379,
+      "session_id": "AA84271B-1FC1-445B-9F11-C77923354676",
+      "source_record_sha256": "79854f9f291fdd4d31ee991eb5a47e913bf80f61c8996a74234fc0d676f1fa74",
+      "warmup": false
+    }
+  ],
+  "schema_version": 1,
+  "validator": {
+    "source_path": "Scripts/worktree_startup_live_benchmark.py",
+    "source_sha256": "1ce57f9421137aacc5f0140eae183ea27edf7540b372b9c4c9e7ae73579eef85",
+    "version": 1
+  }
+}
