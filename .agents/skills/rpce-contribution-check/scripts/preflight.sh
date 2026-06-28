@@ -104,41 +104,42 @@ range_contains() {
   return 1
 }
 
+run_pr_ready_validation_if_range_contains() {
+  local files="$1"
+  local pattern="$2"
+  local label="$3"
+  shift 3
+  if range_contains "$files" "$pattern"; then
+    log "$label"
+    "$@"
+  fi
+}
+
 run_pr_ready_path_validations() {
   local files
   ensure_tmp_root
   files="$tmp_root/range-files.z"
   write_range_files "$files"
 
-  if range_contains "$files" '^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'; then
-    log "Run conductor self-tests"
+  local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'
+  local swift_paths_pattern='\.swift$'
+  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'
+  local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
+  local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
+  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
+
+  run_pr_ready_validation_if_range_contains "$files" "$control_plane_paths_pattern" "Run conductor self-tests" \
     make conductor-selftest
-  fi
-
-  if range_contains "$files" '\.swift$'; then
-    log "Run coordinated Swift lint"
+  run_pr_ready_validation_if_range_contains "$files" "$swift_paths_pattern" "Run coordinated Swift lint" \
     make dev-lint
-  fi
-
-  if range_contains "$files" '^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'; then
-    log "Run coordinated root tests"
+  run_pr_ready_validation_if_range_contains "$files" "$root_test_paths_pattern" "Run coordinated root tests" \
     make dev-test
-  fi
-
-  if range_contains "$files" '^Packages/RepoPromptAgentProviders/'; then
-    log "Run coordinated provider tests"
+  run_pr_ready_validation_if_range_contains "$files" "$provider_package_paths_pattern" "Run coordinated provider tests" \
     make dev-provider-test
-  fi
-
-  if range_contains "$files" '^Sources/RepoPrompt/'; then
-    log "Build RepoPrompt product"
+  run_pr_ready_validation_if_range_contains "$files" "$repoprompt_product_paths_pattern" "Build RepoPrompt product" \
     make dev-swift-build PRODUCT=RepoPrompt
-  fi
-
-  if range_contains "$files" '^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'; then
-    log "Build repoprompt-mcp product"
+  run_pr_ready_validation_if_range_contains "$files" "$mcp_product_paths_pattern" "Build repoprompt-mcp product" \
     make dev-swift-build PRODUCT=repoprompt-mcp
-  fi
 }
 
 push_success() {
