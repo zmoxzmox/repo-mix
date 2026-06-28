@@ -3842,8 +3842,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0)
             XCTAssertEqual(sample.distinctContentKeyCount, fileCount)
             XCTAssertEqual(sample.decodedCacheInvalidationRequestCount, 1)
-            // Legacy codemap serving invalidations are no longer issued from content publications.
-            XCTAssertEqual(sample.codemapInvalidationRequestCount, 0)
+            // Decoded search cache invalidation is batched once per publication, while content-addressed
+            // codemap path invalidation still records each modified file path.
+            XCTAssertEqual(sample.codemapInvalidationRequestCount, fileCount)
             XCTAssertEqual(sample.appliedIndexEventYieldCount, 1)
 
             for (index, file) in files.enumerated() {

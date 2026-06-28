@@ -2057,6 +2057,7 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             repositoryFixture.cleanup()
         }
         let cancelledTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
+        let operationReceiptTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         let store = fixture.makeStore(cancellationCleanupHook: { ticket in
             cancelledTickets.append(ticket)
         })
@@ -2070,6 +2071,10 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
                 rootScope: .allLoaded
             ) { presentation in
                 XCTAssertEqual(presentation.orderedEntries.count, 1)
+                let receipt = try XCTUnwrap(presentation.publicationReceipt)
+                XCTAssertEqual(receipt.demandTickets.count, 1)
+                let receiptTicket = try XCTUnwrap(receipt.demandTickets.first)
+                operationReceiptTickets.append(receiptTicket)
                 await operationGate.enterAndWait()
                 try Task.checkCancellation()
                 return presentation
@@ -2087,11 +2092,16 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             // Expected.
         }
 
-        let ticket = try XCTUnwrap(cancelledTickets.values.first)
-        XCTAssertEqual(cancelledTickets.values.count, 1)
-        let demandRetainCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
+        let receiptTicket = try XCTUnwrap(operationReceiptTickets.values.first)
+        XCTAssertEqual(operationReceiptTickets.values.count, 1)
+        let cleanupTickets = cancelledTickets.values
+        XCTAssertLessThanOrEqual(cleanupTickets.count, 1)
+        if let cleanupTicket = cleanupTickets.first {
+            XCTAssertEqual(cleanupTicket, receiptTicket)
+        }
+        let demandRetainCount = await store.codemapArtifactDemandRetainCountForTesting(receiptTicket)
         let presentationRetainCount = await store.codemapPresentationRetainCountForTesting(
-            rootEpoch: ticket.rootEpoch
+            rootEpoch: receiptTicket.rootEpoch
         )
         XCTAssertEqual(demandRetainCount, 0)
         XCTAssertEqual(presentationRetainCount, 0)

@@ -112,36 +112,36 @@ extension PromptViewModel {
             sourceTabID: snapshot.tabID,
             finalReviewAuthorization: snapshot.finalReviewAuthorization
         ) { preAssembly in
-                let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
-                    preAssembly.entries
-                )
-                let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
-                    { entry in preAssembly.displayPath(for: entry) }
-                } else {
-                    nil
-                }
-                let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-                    codeEntries,
-                    filePathDisplay: self.filePathDisplayOption,
-                    codemapPresentation: preAssembly.codemapPresentation,
-                    displayPathResolver: displayPathResolver
-                )
-                let fileTree = PromptPackagingService.combinedFileMapContent(
-                    fileTreeContent: preAssembly.fileTreeContent,
-                    codemapBlocks: partitionedBlocks.codemapBlocks
-                ) ?? ""
-                return PromptPackagingService.buildAIMessage(
-                    systemPrompt: systemPrompt,
-                    metaInstructions: [],
-                    fileTree: fileTree,
-                    fileContents: partitionedBlocks.contentBlocks,
-                    gitDiff: preAssembly.gitDiff,
-                    conversation: conversation,
-                    temperature: self.setModelTemperature ? self.modelTemperature : nil,
-                    promptSectionsOrder: self.promptSectionsOrder,
-                    disabledPromptSections: self.disabledPromptSections,
-                    duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
-                )
+            let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
+                preAssembly.entries
+            )
+            let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
+                { entry in preAssembly.displayPath(for: entry) }
+            } else {
+                nil
             }
+            let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
+                codeEntries,
+                filePathDisplay: self.filePathDisplayOption,
+                codemapPresentation: preAssembly.codemapPresentation,
+                displayPathResolver: displayPathResolver
+            )
+            let fileTree = PromptPackagingService.combinedFileMapContent(
+                fileTreeContent: preAssembly.fileTreeContent,
+                codemapBlocks: partitionedBlocks.codemapBlocks
+            ) ?? ""
+            return PromptPackagingService.buildAIMessage(
+                systemPrompt: systemPrompt,
+                metaInstructions: [],
+                fileTree: fileTree,
+                fileContents: partitionedBlocks.contentBlocks,
+                gitDiff: preAssembly.gitDiff,
+                conversation: conversation,
+                temperature: self.setModelTemperature ? self.modelTemperature : nil,
+                promptSectionsOrder: self.promptSectionsOrder,
+                disabledPromptSections: self.disabledPromptSections,
+                duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+            )
+        }
     }
 }

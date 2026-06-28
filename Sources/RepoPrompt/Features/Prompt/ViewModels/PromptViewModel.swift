@@ -5455,8 +5455,8 @@ extension PromptViewModel {
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool = false,
         reviewGitContext: FrozenPromptGitReviewContext? = nil,
-		sourceTabID: UUID? = nil,
-		finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
+        sourceTabID: UUID? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         operation: (PromptContextPreAssemblyResult) async throws -> Value
     ) async throws -> Value {
         let request = await makePromptContextPreAssemblyRequest(
@@ -5464,16 +5464,16 @@ extension PromptViewModel {
             selection: selection,
             lookupContext: lookupContext,
             includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
-			reviewGitContext: reviewGitContext,
-			sourceTabID: sourceTabID,
-			finalReviewAuthorization: finalReviewAuthorization
+            reviewGitContext: reviewGitContext,
+            sourceTabID: sourceTabID,
+            finalReviewAuthorization: finalReviewAuthorization
         )
-		if finalReviewAuthorization != nil {
-			return try await PromptContextPreAssemblyService.withResolvedStrict(
-				request,
-				operation: operation
-			)
-		}
+        if finalReviewAuthorization != nil {
+            return try await PromptContextPreAssemblyService.withResolvedStrict(
+                request,
+                operation: operation
+            )
+        }
         return try await PromptContextPreAssemblyService.withResolved(
             request,
             operation: operation
@@ -5485,9 +5485,9 @@ extension PromptViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool,
-		reviewGitContext: FrozenPromptGitReviewContext?,
-		sourceTabID: UUID? = nil,
-		finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
+        reviewGitContext: FrozenPromptGitReviewContext?,
+        sourceTabID: UUID? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) async -> PromptContextPreAssemblyRequest {
         let frozenReviewContext = if let reviewGitContext {
             reviewGitContext
@@ -5517,8 +5517,8 @@ extension PromptViewModel {
             selectedGitDiffLookupProfile: .uiAssisted,
             includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
             reviewGitContext: frozenReviewContext,
-			sourceTabID: sourceTabID,
-			finalReviewAuthorization: finalReviewAuthorization,
+            sourceTabID: sourceTabID,
+            finalReviewAuthorization: finalReviewAuthorization,
             selectedGitDiffProvider: { request in
                 #if DEBUG
                     if let automaticReviewGitDiffProviderOverrideForTesting {

@@ -6,7 +6,9 @@ import RepoPromptShared
 import XCTest
 
 private extension ToolResultDTOs.CodeStructureReplyDTO {
-    var fileCount: Int { summary.returnedFiles }
+    var fileCount: Int {
+        summary.returnedFiles
+    }
 
     var content: String {
         files.map(\.content).joined(separator: "\n")
@@ -441,7 +443,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let primed = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
-            request: request(maximumCodemapTokens: 6_000),
+            request: request(maximumCodemapTokens: 6000),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
@@ -699,7 +701,6 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(admission.logicalPathComputations, 0)
         XCTAssertEqual(admission.coordinatorInvocations, 0)
     }
-
 
     func testSeedOrderingAndOutputAreDeterministic() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
@@ -1168,7 +1169,6 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
     }
 
-
     private func readyTicket(
         store: WorkspaceFileContextStore,
         fileID: UUID,
@@ -1190,7 +1190,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(25))
                 result = await store.codemapArtifactDemandStatus(ticket)
             case let .unavailable(.busy(retryAfterMilliseconds)):
-                let delayMilliseconds = min(max(retryAfterMilliseconds ?? 100, 25), 1_000)
+                let delayMilliseconds = min(max(retryAfterMilliseconds ?? 100, 25), 1000)
                 try await Task.sleep(for: .milliseconds(delayMilliseconds))
                 if let activeTicket {
                     result = await store.retryBusyCodemapArtifactDemand(activeTicket, priority: .demand)
@@ -1351,38 +1351,38 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 }
 
 #if DEBUG
-private actor AsyncGate {
-    private var started = false
-    private var released = false
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private actor AsyncGate {
+        private var started = false
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func markStartedAndWaitForRelease() async {
-        started = true
-        let waiters = startWaiters
-        startWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        func markStartedAndWaitForRelease() async {
+            started = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
 
-        guard !released else { return }
-        await withCheckedContinuation { continuation in
-            releaseWaiters.append(continuation)
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { continuation in
+                startWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            waiters.forEach { $0.resume() }
         }
     }
-
-    func waitUntilStarted() async {
-        guard !started else { return }
-        await withCheckedContinuation { continuation in
-            startWaiters.append(continuation)
-        }
-    }
-
-    func release() {
-        released = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        waiters.forEach { $0.resume() }
-    }
-}
 #endif
 
 private extension Sequence {

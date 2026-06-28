@@ -636,7 +636,7 @@ enum PromptContextPreAssemblyService {
                     allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
                     excluding: []
                 )
-                let automaticRequest: AutomaticReviewGitDiffRequest = if let finalReviewAuthorization = request.finalReviewAuthorization {
+                let automaticRequest = if let finalReviewAuthorization = request.finalReviewAuthorization {
                     AutomaticReviewGitDiffRequest(
                         finalReviewAuthorization: finalReviewAuthorization,
                         compareIntent: request.reviewGitContext.compareIntent,
