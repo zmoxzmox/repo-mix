@@ -13,7 +13,13 @@ Before every commit or push, read and run the repository-local `$rpce-contributi
 .agents/skills/rpce-contribution-check/scripts/preflight.sh push
 ```
 
-Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. The skill enforces redacted staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, and the applicable coordinated validation lanes. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
+Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. These default modes are mandatory safety gates: they enforce redacted staged-index and outgoing-range secret scanning, repository guardrails, and clean push boundaries. Default `push` does not run heavyweight lint/test/build lanes; use the explicit `pr-ready` lane when you need the computed-outgoing-range path-selected local PR-ready pass:
+
+```bash
+.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready
+```
+
+Focused validation and release validation remain explicit; use the validation matrix plus commands such as `make dev-release-preflight` / `make dev-release-artifact` when the changed boundary requires them. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
 
 Local `docs/investigations/*.md` reports are intentionally left unignored so RepoPrompt tooling can read them. Do not stage or merge these local investigation artifacts unless intentionally requested.
 

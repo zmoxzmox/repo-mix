@@ -112,6 +112,7 @@ guardrails:
 
 conductor-selftest:
 	python3 Scripts/test_debug_app_process.py
+	python3 Scripts/test_contribution_preflight.py
 	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_agent_mode_file_tools_benchmark.py
 	python3 Scripts/test_conductor_lifecycle.py

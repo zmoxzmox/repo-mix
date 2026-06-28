@@ -135,6 +135,8 @@ At minimum, provide:
 3. the `verify-ledger` command and result;
 4. required style/guardrail validation from `AGENTS.md` when applicable.
 
+Default `.agents/skills/rpce-contribution-check/scripts/preflight.sh push` is a safety-only gate; test changes still need the smallest focused daemon tests, authoritative list commands, and ledger verification above. Use `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` for computed-outgoing-range path-selected local evidence, not routine iteration.
+
 Ordinary additions, fixes, renames, and removals do not need timing artifacts merely because the harness exists.
 
 ### Optimization or performance campaigns

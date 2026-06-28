@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() { echo "usage: $0 [commit|push|pr-ready]" >&2; }
+
+if (( $# > 1 )); then
+  usage
+  exit 2
+fi
+
 mode="${1:-commit}"
 case "$mode" in
-  commit|push) ;;
+  commit|push|pr-ready) ;;
   *)
-    echo "usage: $0 [commit|push]" >&2
+    usage
     exit 2
     ;;
 esac
@@ -97,12 +104,59 @@ range_contains() {
   return 1
 }
 
+run_pr_ready_path_validations() {
+  local files
+  ensure_tmp_root
+  files="$tmp_root/range-files.z"
+  write_range_files "$files"
+
+  if range_contains "$files" '^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight\.sh|Makefile)$'; then
+    log "Run conductor self-tests"
+    make conductor-selftest
+  fi
+
+  if range_contains "$files" '\.swift$'; then
+    log "Run coordinated Swift lint"
+    make dev-lint
+  fi
+
+  if range_contains "$files" '^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'; then
+    log "Run coordinated root tests"
+    make dev-test
+  fi
+
+  if range_contains "$files" '^Packages/RepoPromptAgentProviders/'; then
+    log "Run coordinated provider tests"
+    make dev-provider-test
+  fi
+
+  if range_contains "$files" '^Sources/RepoPrompt/'; then
+    log "Build RepoPrompt product"
+    make dev-swift-build PRODUCT=RepoPrompt
+  fi
+
+  if range_contains "$files" '^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'; then
+    log "Build repoprompt-mcp product"
+    make dev-swift-build PRODUCT=repoprompt-mcp
+  fi
+}
+
 push_success() {
   cat <<'EOF'
 
-Scripted push checks passed.
-Any validation-matrix evidence is still required before push; read `.agents/skills/rpce-contribution-check/references/validation-matrix.md`.
+Default push safety preflight passed.
+Heavyweight lint/test/build lanes were not run. Run `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` for the full/PR-ready path-selected local lane.
+Release candidate validation remains `make dev-release-preflight` / `make dev-release-artifact`.
 Push mode validated only the current branch against the computed range above. It does not validate tags, `--all`, `--mirror`, or arbitrary refspecs.
+EOF
+}
+
+pr_ready_success() {
+  cat <<'EOF'
+
+PR-ready preflight passed.
+This included ordinary push safety checks and ran any matching path-selected heavyweight lanes for the computed outgoing range.
+Release validation, live smoke, destructive-operation approval, and any specialized matrix evidence may still require explicit commands for the changed boundary.
 EOF
 }
 
@@ -141,45 +195,21 @@ git log --oneline "$range_spec"
 outgoing_count="$(git rev-list --count "$range_spec")"
 if [[ "$outgoing_count" == "0" ]]; then
   echo "No outgoing commits in $range_spec."
-  push_success
+  if [[ "$mode" == "pr-ready" ]]; then
+    pr_ready_success
+  else
+    push_success
+  fi
   exit 0
 fi
 
 log "Scan outgoing commit range for secrets"
 gitleaks git --no-banner --redact --log-opts="$range_spec" .
 
-ensure_tmp_root
-files="$tmp_root/range-files.z"
-write_range_files "$files"
-
-if range_contains "$files" '^(Scripts/conductor\.py|Scripts/test_conductor_(lifecycle|output)\.py|Makefile)$'; then
-  log "Run conductor self-tests"
-  make conductor-selftest
+if [[ "$mode" == "push" ]]; then
+  push_success
+  exit 0
 fi
 
-if range_contains "$files" '\.swift$'; then
-  log "Run coordinated Swift lint"
-  make dev-lint
-fi
-
-if range_contains "$files" '^(Sources/RepoPrompt/|Tests/RepoPromptTests/)'; then
-  log "Run coordinated root tests"
-  make dev-test
-fi
-
-if range_contains "$files" '^Packages/RepoPromptAgentProviders/'; then
-  log "Run coordinated provider tests"
-  make dev-provider-test
-fi
-
-if range_contains "$files" '^Sources/RepoPrompt/'; then
-  log "Build RepoPrompt product"
-  make dev-swift-build PRODUCT=RepoPrompt
-fi
-
-if range_contains "$files" '^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'; then
-  log "Build repoprompt-mcp product"
-  make dev-swift-build PRODUCT=repoprompt-mcp
-fi
-
-push_success
+run_pr_ready_path_validations
+pr_ready_success
