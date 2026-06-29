@@ -565,22 +565,6 @@ struct WorkspaceCodemapPresentationCoordinator {
                 await ownership.record(ticket)
             }
         }
-        let sourceGraphDrainRootEpochs = Set(sourceTicketsByRoot.keys)
-        guard try await drainAutomaticSelectionGraphPublications(
-            rootEpochs: sourceGraphDrainRootEpochs,
-            clock: clock,
-            deadline: deadline
-        ) else {
-            let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage
-                .pending(
-                    sourceGraphDrainRootEpochs
-                        .sorted(by: workspaceCodemapRootEpochPrecedes)
-                        .map { .graphRebuild(rootEpoch: $0) }
-                )
-            issues.append(.automatic(automaticCoverage))
-            return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
-        }
-
         var planDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = .pending([])
         var provisionallyDemandedFileIDs = Set<UUID>()
         for round in 0 ..< policy.maximumReadinessRounds {

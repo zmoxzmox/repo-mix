@@ -2748,7 +2748,36 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         XCTAssertTrue(readyTree.content.contains("Feature.swift +"), readyTree.content)
         let countsAfterReadyTree = await store.codemapPresentationOperationCountsForTesting()
         let retainCountAfterReadyTree = await store.codemapArtifactDemandRetainCountForTesting(ticket)
-        XCTAssertEqual(countsAfterReadyTree, countsBeforeReadyTree)
+        // Ready demand publication owns graph publication asynchronously. While the passive
+        // file-tree render awaits snapshot/logical-root work, already-scheduled graph
+        // publication may advance. This path must still avoid demand, presentation, and
+        // retain work.
+        XCTAssertEqual(
+            countsAfterReadyTree.structureSeedAdmissionRequests,
+            countsBeforeReadyTree.structureSeedAdmissionRequests
+        )
+        XCTAssertEqual(
+            countsAfterReadyTree.selectedMetadataResolutionRequests,
+            countsBeforeReadyTree.selectedMetadataResolutionRequests
+        )
+        XCTAssertEqual(
+            countsAfterReadyTree.presentationCandidateRequests,
+            countsBeforeReadyTree.presentationCandidateRequests
+        )
+        XCTAssertEqual(
+            countsAfterReadyTree.artifactDemandRequests,
+            countsBeforeReadyTree.artifactDemandRequests
+        )
+        XCTAssertEqual(
+            countsAfterReadyTree.presentationFreezeRequests,
+            countsBeforeReadyTree.presentationFreezeRequests
+        )
+        XCTAssertEqual(countsAfterReadyTree.setupTasksCreated, countsBeforeReadyTree.setupTasksCreated)
+        XCTAssertEqual(countsAfterReadyTree.demandTasksCreated, countsBeforeReadyTree.demandTasksCreated)
+        XCTAssertEqual(
+            countsAfterReadyTree.targetedReadyFreezes,
+            countsBeforeReadyTree.targetedReadyFreezes
+        )
         XCTAssertEqual(retainCountAfterReadyTree, retainCountBeforePendingTree)
 
         _ = await store.cancelCodemapArtifactDemand(ticket)
@@ -8259,16 +8288,23 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             sourceFileIDs: [source.id],
             rootScope: .visibleWorkspace
         )
+        let coldResultDiagnostics = """
+        aggregateCoverage: \(result.aggregateCoverage)
+        roots: \(result.roots)
+        sourceIssues: \(result.roots.flatMap(\.sourceIssues))
+        targetIssues: \(result.roots.flatMap(\.targetIssues))
+        """
 
         XCTAssertEqual(
             result.targets.map(\.logicalPath.standardizedRelativePath),
-            ["Sources/Target.swift"]
+            ["Sources/Target.swift"],
+            coldResultDiagnostics
         )
         XCTAssertEqual(fixture.buildCount.value, warmBuildCount)
         XCTAssertFalse(result.targets.contains {
             $0.logicalPath.standardizedRelativePath == "Sources/Unrelated.swift"
         })
-        let receipt = try XCTUnwrap(result.publicationReceipt)
+        let receipt = try XCTUnwrap(result.publicationReceipt, coldResultDiagnostics)
         let actualTarget = try XCTUnwrap(receipt.targets.first)
         let unrelated = try XCTUnwrap(coldFiles.first {
             $0.standardizedRelativePath == "Sources/Unrelated.swift"

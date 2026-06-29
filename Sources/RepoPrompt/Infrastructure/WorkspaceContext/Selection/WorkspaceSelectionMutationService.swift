@@ -1263,22 +1263,6 @@ struct WorkspaceSelectionMutationService {
                 await ownership.record(ticket)
             }
         }
-        let sourceGraphDrainRootEpochs = Set(sourceTicketsByRoot.keys)
-        guard try await drainAutomaticSelectionGraphPublications(
-            rootEpochs: sourceGraphDrainRootEpochs,
-            clock: clock,
-            deadline: deadline
-        ) else {
-            return WorkspaceCodemapAutomaticSelectionResult(
-                roots: [],
-                aggregateCoverage: .pending(
-                    sourceGraphDrainRootEpochs
-                        .sorted(by: workspaceCodemapRootEpochPrecedes)
-                        .map { .graphRebuild(rootEpoch: $0) }
-                )
-            )
-        }
-
         var candidatePlanDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition =
             .pending([])
         var provisionallyDemandedFileIDs = Set<UUID>()
@@ -1609,7 +1593,7 @@ struct WorkspaceSelectionMutationService {
         clock: ContinuousClock,
         deadline: ContinuousClock.Instant
     ) async throws -> WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition {
-        guard automaticSelectionCandidatePlanDispositionShouldRetryForReadiness(disposition),
+        guard automaticSelectionCandidatePlanDispositionIsTransientGraphReadiness(disposition),
               automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
         else { return disposition }
 
