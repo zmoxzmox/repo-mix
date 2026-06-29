@@ -1300,11 +1300,7 @@ struct WorkspaceSelectionMutationService {
                     }
                 }
             }
-            let shouldRetry = switch candidatePlanDisposition {
-            case .provisional, .incomplete, .pending, .busy: true
-            case .ready, .unavailable, .stale, .budget: false
-            }
-            guard shouldRetry,
+            guard automaticSelectionCandidatePlanDispositionShouldRetryForReadiness(candidatePlanDisposition),
                   round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
                   clock.now < deadline
             else { break }
@@ -1549,17 +1545,23 @@ struct WorkspaceSelectionMutationService {
             rootScope: rootScope
         )
         for round in 1 ..< automaticSelectionPolicy.maximumReadinessRounds {
-            let shouldRetry = switch result.aggregateCoverage {
-            case .incomplete, .busy, .pending: true
-            case .complete, .partial, .provisional, .unavailable, .stale, .budget: false
-            }
-            guard shouldRetry, clock.now < deadline else { break }
+            guard automaticSelectionAggregateCoverageShouldRetryForReadiness(result.aggregateCoverage),
+                  clock.now < deadline
+            else { break }
             guard try await waitForAutomaticSelectionRound(
                 round: round,
                 retryAfterMilliseconds: [],
                 clock: clock,
                 deadline: deadline
             ) else { break }
+            if automaticSelectionAggregateCoverageIsTransientGraphReadiness(result.aggregateCoverage) {
+                let rootEpochs = Set(readySources.map(\.rootEpoch)).union(candidateRootEpochs)
+                guard try await drainAutomaticSelectionGraphPublications(
+                    rootEpochs: rootEpochs,
+                    clock: clock,
+                    deadline: deadline
+                ) else { break }
+            }
             result = try await store.resolveAutomaticCodemapSelection(
                 sources: readySources,
                 rootScope: rootScope
@@ -1589,22 +1591,33 @@ struct WorkspaceSelectionMutationService {
         clock: ContinuousClock,
         deadline: ContinuousClock.Instant
     ) async throws -> WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition {
-        let shouldDrain = switch disposition {
-        case .provisional, .incomplete, .pending, .busy: true
-        case .ready, .unavailable, .stale, .budget: false
-        }
-        guard shouldDrain,
+        guard automaticSelectionCandidatePlanDispositionShouldRetryForReadiness(disposition),
               automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
         else { return disposition }
 
-        let rootEpochs = Array(Set(readySources.map(\.rootEpoch))).sorted(
-            by: workspaceCodemapRootEpochPrecedes
+        let rootEpochs = Set(readySources.map(\.rootEpoch))
+        guard try await drainAutomaticSelectionGraphPublications(
+            rootEpochs: rootEpochs,
+            clock: clock,
+            deadline: deadline
+        ) else { return disposition }
+        return await store.planAutomaticCodemapSelectionCandidates(
+            sources: readySources,
+            rootScope: rootScope,
+            maximumCandidateDemandCount: automaticSelectionPolicy.maximumCandidateDemandCount
         )
-        guard !rootEpochs.isEmpty else { return disposition }
-        for rootEpoch in rootEpochs {
+    }
+
+    private func drainAutomaticSelectionGraphPublications(
+        rootEpochs: Set<WorkspaceCodemapRootEpoch>,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async throws -> Bool {
+        guard !rootEpochs.isEmpty else { return true }
+        for rootEpoch in rootEpochs.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
             guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
-                return disposition
+                return false
             }
             let publicationCurrent = await store.waitForCodemapGraphPublication(
                 rootEpoch: rootEpoch,
@@ -1612,17 +1625,10 @@ struct WorkspaceSelectionMutationService {
             )
             guard publicationCurrent,
                   automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
-            else { return disposition }
+            else { return false }
         }
         try Task.checkCancellation()
-        guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
-            return disposition
-        }
-        return await store.planAutomaticCodemapSelectionCandidates(
-            sources: readySources,
-            rootScope: rootScope,
-            maximumCandidateDemandCount: automaticSelectionPolicy.maximumCandidateDemandCount
-        )
+        return automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
     }
 
     private func settleProvisionalAutomaticCandidates(

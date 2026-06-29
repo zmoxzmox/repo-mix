@@ -283,6 +283,47 @@ extension MCPServerViewModel {
         case explicitHint
     }
 
+    enum MCPTabContextSelectionMirrorPolicy {
+        struct Result: Equatable {
+            let selection: StoredSelection
+            let preservedManualMode: Bool
+        }
+
+        static func isExplicitAutoReset(_ selection: StoredSelection) -> Bool {
+            selection.codemapAutoEnabled
+                && selection.selectedPaths.isEmpty
+                && selection.manualCodemapPaths.isEmpty
+                && selection.slices.isEmpty
+        }
+
+        static func reconcileIncomingSnapshotSelection(
+            boundSelection: StoredSelection,
+            incomingSnapshotSelection: StoredSelection,
+            isRunScopedWorktreeContext: Bool
+        ) -> Result {
+            if isRunScopedWorktreeContext {
+                return Result(selection: boundSelection, preservedManualMode: false)
+            }
+
+            if boundSelection.codemapAutoEnabled == false,
+               incomingSnapshotSelection.codemapAutoEnabled,
+               !isExplicitAutoReset(incomingSnapshotSelection)
+            {
+                return Result(
+                    selection: StoredSelection(
+                        selectedPaths: incomingSnapshotSelection.selectedPaths,
+                        manualCodemapPaths: boundSelection.manualCodemapPaths,
+                        slices: incomingSnapshotSelection.slices,
+                        codemapAutoEnabled: false
+                    ),
+                    preservedManualMode: true
+                )
+            }
+
+            return Result(selection: incomingSnapshotSelection, preservedManualMode: false)
+        }
+    }
+
     struct TabContextHint: Equatable {
         let tabID: UUID
         let workspaceID: UUID?
@@ -721,20 +762,13 @@ extension MCPServerViewModel {
                     // intentionally empty for hidden worktree runs; importing it would erase
                     // the source selection used by run-scoped tools.
                     guard var bound = self.tabContextByConnectionID[connectionID] else { return }
-                    var incomingSelection = snapshot.selection
-                    if bound.runID != nil, !bound.worktreeBindings.isEmpty {
-                        incomingSelection = bound.selection
-                    }
-
-                    // Preserve manual=false stickiness
-                    let wasManual = (bound.selection.codemapAutoEnabled == false)
-                    if wasManual && incomingSelection.codemapAutoEnabled == true {
-                        incomingSelection = StoredSelection(
-                            selectedPaths: incomingSelection.selectedPaths,
-                            manualCodemapPaths: bound.selection.manualCodemapPaths,
-                            slices: incomingSelection.slices,
-                            codemapAutoEnabled: false
-                        )
+                    let mirrorResult = MCPTabContextSelectionMirrorPolicy.reconcileIncomingSnapshotSelection(
+                        boundSelection: bound.selection,
+                        incomingSnapshotSelection: snapshot.selection,
+                        isRunScopedWorktreeContext: bound.runID != nil && !bound.worktreeBindings.isEmpty
+                    )
+                    let incomingSelection = mirrorResult.selection
+                    if mirrorResult.preservedManualMode {
                         // DON'T call commitTabContext here - it creates an infinite loop!
                         // The bound context correction is enough; next operation will sync to UI.
                         tabContextLog("preserved manual mode on snapshot connectionID=\(connectionID) tab=\(context.tabID)")
@@ -1848,13 +1882,24 @@ extension MCPServerViewModel {
         if !resolved.usesActiveTabCompatibility,
            let canonicalSelection = verification.canonicalSelection,
            canonicalSelection == verification.expectedSelection,
-           let connectionID = metadata.connectionID,
-           let latest = tabContextByConnectionID[connectionID],
-           latest.tabID == context.tabID,
-           latest.windowID == context.windowID,
-           latest.workspaceID == context.workspaceID,
-           latest.runID == context.runID,
-           latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
+           MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection)
+        {
+            synchronizeBoundTabContextAfterVerifiedAutoReset(
+                resolvedContext: resolved,
+                persistedContext: context,
+                canonicalSelection: canonicalSelection,
+                metadata: metadata
+            )
+        } else if !resolved.usesActiveTabCompatibility,
+                  let canonicalSelection = verification.canonicalSelection,
+                  canonicalSelection == verification.expectedSelection,
+                  let connectionID = metadata.connectionID,
+                  let latest = tabContextByConnectionID[connectionID],
+                  latest.tabID == context.tabID,
+                  latest.windowID == context.windowID,
+                  latest.workspaceID == context.workspaceID,
+                  latest.runID == context.runID,
+                  latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
         {
             var refreshed = selectionOnlyCommitContext(from: context)
             refreshed.selection = canonicalSelection
@@ -1868,6 +1913,40 @@ extension MCPServerViewModel {
             tabContextByConnectionID[connectionID] = refreshed
         }
         return verification
+    }
+
+    @MainActor
+    private func synchronizeBoundTabContextAfterVerifiedAutoReset(
+        resolvedContext: ResolvedTabContextSnapshot,
+        persistedContext: TabContextSnapshot,
+        canonicalSelection: StoredSelection,
+        metadata: RequestMetadata
+    ) {
+        guard MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection),
+              !resolvedContext.usesActiveTabCompatibility,
+              resolvedContext.source != nil,
+              let connectionID = metadata.connectionID,
+              var latest = tabContextByConnectionID[connectionID],
+              latest.tabID == persistedContext.tabID,
+              latest.windowID == persistedContext.windowID,
+              latest.runID == persistedContext.runID,
+              latest.readFileAutoSelectionGeneration == persistedContext.readFileAutoSelectionGeneration
+        else { return }
+        if let latestWorkspaceID = latest.workspaceID,
+           let persistedWorkspaceID = persistedContext.workspaceID,
+           latestWorkspaceID != persistedWorkspaceID
+        {
+            return
+        }
+
+        latest.selection = canonicalSelection
+        if let workspaceID = persistedContext.workspaceID {
+            latest.selectionRevision = workspaceManager?.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: persistedContext.tabID
+            ) ?? latest.selectionRevision
+        }
+        tabContextByConnectionID[connectionID] = latest
     }
 
     struct ReadFileAutoSelectionAuthoritativeResult: Equatable {

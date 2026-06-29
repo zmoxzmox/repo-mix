@@ -595,15 +595,25 @@ struct WorkspaceCodemapPresentationCoordinator {
                     }
                 }
             }
-            let shouldRetry = switch planDisposition {
-            case .provisional, .incomplete, .pending, .busy: true
-            case .ready, .unavailable, .stale, .budget: false
-            }
-            guard shouldRetry,
+            guard automaticSelectionCandidatePlanDispositionShouldRetryForReadiness(planDisposition),
                   round + 1 < policy.maximumReadinessRounds,
                   clock.now < deadline
             else { break }
             try await wait(round: round, suggestedMilliseconds: [], clock: clock, deadline: deadline)
+        }
+        if automaticSelectionCandidatePlanDispositionIsTransientGraphReadiness(planDisposition) {
+            let rootEpochs = Set(readySources.map(\.rootEpoch))
+            if try await drainAutomaticSelectionGraphPublications(
+                rootEpochs: rootEpochs,
+                clock: clock,
+                deadline: deadline
+            ) {
+                planDisposition = await store.planAutomaticCodemapSelectionCandidates(
+                    sources: readySources,
+                    rootScope: rootScope,
+                    maximumCandidateDemandCount: policy.maximumCandidateDemandCount
+                )
+            }
         }
         let plan: WorkspaceCodemapAutomaticSelectionCandidatePlan
         switch planDisposition {
@@ -754,12 +764,18 @@ struct WorkspaceCodemapPresentationCoordinator {
             rootScope: rootScope
         )
         for round in 1 ..< policy.maximumReadinessRounds {
-            let shouldRetry = switch selection.aggregateCoverage {
-            case .incomplete, .busy, .pending: true
-            case .complete, .partial, .provisional, .unavailable, .stale, .budget: false
-            }
-            guard shouldRetry, clock.now < deadline else { break }
+            guard automaticSelectionAggregateCoverageShouldRetryForReadiness(selection.aggregateCoverage),
+                  clock.now < deadline
+            else { break }
             try await wait(round: round, suggestedMilliseconds: [], clock: clock, deadline: deadline)
+            if automaticSelectionAggregateCoverageIsTransientGraphReadiness(selection.aggregateCoverage) {
+                let rootEpochs = Set(readySources.map(\.rootEpoch)).union(plan.candidates.map(\.rootEpoch))
+                guard try await drainAutomaticSelectionGraphPublications(
+                    rootEpochs: rootEpochs,
+                    clock: clock,
+                    deadline: deadline
+                ) else { break }
+            }
             selection = try await store.resolveAutomaticCodemapSelection(
                 sources: readySources,
                 rootScope: rootScope
@@ -1385,6 +1401,25 @@ struct WorkspaceCodemapPresentationCoordinator {
         guard remaining > .zero else { return }
         try await waiter.sleep(min(.milliseconds(milliseconds), remaining))
         try Task.checkCancellation()
+    }
+
+    private func drainAutomaticSelectionGraphPublications(
+        rootEpochs: Set<WorkspaceCodemapRootEpoch>,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async throws -> Bool {
+        guard !rootEpochs.isEmpty else { return true }
+        for rootEpoch in rootEpochs.sorted(by: workspaceCodemapRootEpochPrecedes) {
+            try Task.checkCancellation()
+            guard clock.now < deadline else { return false }
+            let publicationCurrent = await store.waitForCodemapGraphPublication(
+                rootEpoch: rootEpoch,
+                deadline: deadline
+            )
+            guard publicationCurrent, clock.now < deadline else { return false }
+        }
+        try Task.checkCancellation()
+        return clock.now < deadline
     }
 
     private func release(_ ownership: WorkspaceCodemapOperationPresentationOwnership) async {

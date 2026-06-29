@@ -625,6 +625,112 @@ enum WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition: Equatable {
     case budget(WorkspaceCodemapAutomaticSelectionBudgetReason)
 }
 
+func automaticSelectionCandidatePlanDispositionShouldRetryForReadiness(
+    _ disposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition
+) -> Bool {
+    switch disposition {
+    case .provisional, .incomplete, .pending, .busy:
+        true
+    case let .unavailable(reason):
+        automaticSelectionUnavailableReasonIsTransientGraphReadiness(reason)
+    case let .stale(reason):
+        automaticSelectionStaleReasonIsTransientGraphReadiness(reason)
+    case .ready, .budget:
+        false
+    }
+}
+
+func automaticSelectionCandidatePlanDispositionIsTransientGraphReadiness(
+    _ disposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition
+) -> Bool {
+    switch disposition {
+    case let .unavailable(reason):
+        automaticSelectionUnavailableReasonIsTransientGraphReadiness(reason)
+    case let .stale(reason):
+        automaticSelectionStaleReasonIsTransientGraphReadiness(reason)
+    case .ready, .provisional, .incomplete, .pending, .busy, .budget:
+        false
+    }
+}
+
+func automaticSelectionAggregateCoverageShouldRetryForReadiness(
+    _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
+) -> Bool {
+    switch coverage {
+    case .incomplete, .pending, .busy:
+        true
+    case let .unavailable(reason):
+        automaticSelectionUnavailableReasonIsTransientGraphReadiness(reason)
+    case let .stale(reason):
+        automaticSelectionStaleReasonIsTransientGraphReadiness(reason)
+    case .complete, .partial, .provisional, .budget:
+        false
+    }
+}
+
+func automaticSelectionAggregateCoverageIsTransientGraphReadiness(
+    _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
+) -> Bool {
+    switch coverage {
+    case let .unavailable(reason):
+        automaticSelectionUnavailableReasonIsTransientGraphReadiness(reason)
+    case let .stale(reason):
+        automaticSelectionStaleReasonIsTransientGraphReadiness(reason)
+    case .complete, .partial, .provisional, .incomplete, .pending, .busy, .budget:
+        false
+    }
+}
+
+private func automaticSelectionUnavailableReasonIsTransientGraphReadiness(
+    _ reason: WorkspaceCodemapAutomaticSelectionUnavailableReason
+) -> Bool {
+    switch reason {
+    case let .graph(graphReason):
+        automaticSelectionGraphUnavailableReasonIsTransientReadiness(graphReason)
+    case .noReadySources, .candidate:
+        false
+    }
+}
+
+private func automaticSelectionStaleReasonIsTransientGraphReadiness(
+    _ reason: WorkspaceCodemapAutomaticSelectionStaleReason
+) -> Bool {
+    switch reason {
+    case let .graph(graphReason):
+        automaticSelectionGraphStaleReasonIsTransientReadiness(graphReason)
+    case .rootEpochNotCurrent, .rootScopeChanged, .sourceStateChanged, .sourceCatalogGeneration,
+         .targetStateChanged, .coverageProof, .publicationReceipt:
+        false
+    }
+}
+
+private func automaticSelectionGraphUnavailableReasonIsTransientReadiness(
+    _ reason: WorkspaceCodemapStoreSelectionGraphQueryUnavailableReason
+) -> Bool {
+    switch reason {
+    case .notActivated, .sourceNotReady:
+        true
+    case .runtime(_, .notBuilt):
+        true
+    case .emptySources, .foreignRootEpoch, .duplicateSourceConflict, .invalidGraphResult,
+         .definitionUniverse, .runtime:
+        false
+    }
+}
+
+private func automaticSelectionGraphStaleReasonIsTransientReadiness(
+    _ reason: WorkspaceCodemapStoreSelectionGraphQueryStaleReason
+) -> Bool {
+    switch reason {
+    case .currentness:
+        true
+    case .runtime(_, .staleCurrentness):
+        true
+    case .runtime:
+        false
+    }
+}
+
 struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
     let roots: [WorkspaceCodemapAutomaticSelectionRootResult]
     let aggregateCoverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
@@ -721,9 +827,13 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
                   !receipt.targets.isEmpty,
                   candidates.count == receipt.targets.count
             else { return nil }
-            let candidateSlots = Set(candidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) })
-            let targetSlots = Set(receipt.targets.map { WorkspaceCodemapRootScopedFileSlot(target: $0) })
-            return candidateSlots == targetSlots ? receipt : nil
+            let candidateSlots = candidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) }
+            let targetSlots = receipt.targets.map { WorkspaceCodemapRootScopedFileSlot(target: $0) }
+            guard Set(candidateSlots).count == candidates.count,
+                  Set(targetSlots).count == receipt.targets.count,
+                  Set(candidateSlots) == Set(targetSlots)
+            else { return nil }
+            return receipt
         case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             return nil
         }

@@ -649,6 +649,40 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(changes.last, .init(tabID: inactiveTabID, selection: next, source: .mcpTabContext))
     }
 
+    func testMCPSelectionClearRestoresAutoModeAndNextFullAddPreservesAutoFlag() async {
+        let initial = StoredSelection(
+            manualCodemapPaths: ["/tmp/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let cleared = await coordinator.persistActiveSelection(
+            StoredSelection(),
+            source: .mcpTabContext
+        )
+
+        XCTAssertEqual(cleared, StoredSelection())
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, StoredSelection())
+        XCTAssertEqual(harness.manager.mirrorStartedSelections, [StoredSelection()])
+        XCTAssertEqual(harness.manager.mirrorCompletedSelections, [StoredSelection()])
+        XCTAssertEqual(harness.manager.mirroredSelection, StoredSelection())
+
+        let current = harness.manager.composeTab(with: harness.tabID)?.selection
+        let nextFullAdd = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift"],
+            codemapAutoEnabled: current?.codemapAutoEnabled ?? false
+        )
+        let persistedFullAdd = await coordinator.persistActiveSelection(
+            nextFullAdd,
+            source: .mcpTabContext
+        )
+
+        XCTAssertEqual(persistedFullAdd.selectedPaths, ["/tmp/Full.swift"])
+        XCTAssertTrue(persistedFullAdd.codemapAutoEnabled)
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, persistedFullAdd)
+    }
+
     func testAtomicArtifactTransformMergesIntoLatestCanonicalSelection() async throws {
         let sourcePath = "/tmp/source.swift"
         let concurrentPath = "/tmp/concurrent.swift"

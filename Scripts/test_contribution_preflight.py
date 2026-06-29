@@ -225,6 +225,19 @@ class ContributionPreflightTests(unittest.TestCase):
             self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET])
             self.assertNotIn(XCODE_VALIDATE_TARGET, self.make_lines(env))
 
+    def test_pr_ready_keeps_xcode_architecture_docs_guardrails_only_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(
+                Path(tmp), outgoing_path="docs/architecture/xcode-workspace.md"
+            )
+
+            result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assert_make_lines_equal(env, [GUARDRAILS_TARGET])
+            self.assertNotIn(XCODE_GENERATOR_TEST_TARGET, self.make_lines(env))
+            self.assertNotIn(XCODE_VALIDATE_TARGET, self.make_lines(env))
+
     def test_pr_ready_selects_expected_heavyweight_targets_by_changed_path(self) -> None:
         cases = [
             (

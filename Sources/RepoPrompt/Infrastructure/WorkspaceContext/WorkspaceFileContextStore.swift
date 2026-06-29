@@ -10585,7 +10585,7 @@ actor WorkspaceFileContextStore {
         switch disposition {
         case let .readyPartial(queryResult):
             guard queryResult.roots.count == orderedRootEpochs.count else {
-                return provisionalFallbackDisposition ?? .unavailable(.graph(.invalidGraphResult(orderedRootEpochs[0])))
+                return .unavailable(.graph(.invalidGraphResult(orderedRootEpochs[0])))
             }
             let selectedFileIDs = Set(sources.map(\.fileID))
             var plannedCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
@@ -10601,7 +10601,7 @@ actor WorkspaceFileContextStore {
                       candidateCount == supportedCandidateCount,
                       proof.catalogCompletion.supportedCandidateCount == candidateCount,
                       automaticSelectionCoverageProofIsCurrent(proof)
-                else { return provisionalFallbackDisposition ?? .stale(.coverageProof(rootEpoch)) }
+                else { return .stale(.coverageProof(rootEpoch)) }
                 for endpoint in rootResult.result.targets where !selectedFileIDs.contains(endpoint.fileID) {
                     guard let candidate = automaticSelectionCatalogCandidate(
                         endpoint: endpoint,
@@ -10624,9 +10624,9 @@ actor WorkspaceFileContextStore {
         case let .busy(reason):
             return provisionalFallbackDisposition ?? .busy(reason)
         case let .unavailable(reason):
-            return provisionalFallbackDisposition ?? .unavailable(.graph(reason))
+            return .unavailable(.graph(reason))
         case let .stale(reason):
-            return provisionalFallbackDisposition ?? .stale(.graph(reason))
+            return .stale(.graph(reason))
         case let .budget(reason):
             let budgetDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = if case let .targetLimit(attempted, _) = reason {
                 .budget(.candidateDemandLimit(
@@ -10639,7 +10639,7 @@ actor WorkspaceFileContextStore {
                     rootEpoch: orderedRootEpochs.first
                 ))
             }
-            return provisionalFallbackDisposition ?? budgetDisposition
+            return budgetDisposition
         }
     }
 
@@ -10925,7 +10925,9 @@ actor WorkspaceFileContextStore {
             )
         }
         guard Set(targets).count == targets.count,
-              targetCandidates.count == targets.count
+              targetSlots.count == targets.count,
+              targetCandidates.count == targets.count,
+              Set(targetCandidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) }).count == targetCandidates.count
         else {
             return WorkspaceCodemapAutomaticSelectionResult(
                 roots: [],
@@ -12303,7 +12305,9 @@ actor WorkspaceFileContextStore {
               receipt.coverageProofs.isEmpty,
               !receipt.targets.isEmpty,
               candidates.count == receipt.targets.count,
-              Set(receipt.targets).count == receipt.targets.count
+              Set(receipt.targets).count == receipt.targets.count,
+              Set(receipt.targets.map { WorkspaceCodemapRootScopedFileSlot(target: $0) }).count == receipt.targets.count,
+              Set(candidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) }).count == candidates.count
         else { return false }
 
         let sourceTickets = replacementSourceTickets ?? receipt.sourceTickets

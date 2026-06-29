@@ -129,6 +129,53 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
         XCTAssertNotEqual(filesReply.totalTokens, staleResult.displayTokens)
     }
 
+    func testBorrowedSelectionReplyTokenAccountingUsesFrozenPresentationNotActiveSnapshot() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Nested/Borrowed.swift": "import Foundation\nfunc borrowedFrozenTokenSentinel() {}\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let codemapURL = root.appendingPathComponent("Nested/Borrowed.swift")
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        let codemapLookup = await window.workspaceFileContextStore.lookupPath(codemapURL.path)
+        let codemapRecord = try XCTUnwrap(codemapLookup?.file)
+        let frozenText = "File: Nested/Borrowed.swift\nimport Foundation\nfunc borrowedFrozenTokenSentinel() {}"
+        let frozenPresentation = try makePresentation(
+            file: codemapRecord,
+            text: frozenText
+        )
+        let frozenEntry = try XCTUnwrap(frozenPresentation.renderedEntriesByFileID[codemapRecord.id])
+        let selection = StoredSelection(
+            manualCodemapPaths: [codemapURL.path],
+            codemapAutoEnabled: false
+        )
+
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: frozenPresentation,
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertNotEqual(reply.tokenAccounting?.source, "active_tab_published")
+        XCTAssertEqual(reply.summary?.codemapTokens, frozenEntry.tokenCount)
+        XCTAssertEqual(reply.totalTokens, frozenEntry.tokenCount)
+        XCTAssertEqual(reply.tokenStats?.codemaps, frozenEntry.tokenCount)
+        XCTAssertTrue(reply.blocks?.contains { $0.contains("borrowedFrozenTokenSentinel") } ?? false)
+    }
+
     private func makePresentation(
         file: WorkspaceFileRecord,
         text: String

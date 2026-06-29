@@ -482,13 +482,14 @@ extension MCPServerViewModel {
             runID: nil,
             explicitlyBound: false
         )
+        let useActivePublishedSnapshot = virtualContext == nil && codemapPresentationOverride == nil
         let preparedAccounting = await prepareMCPTokenAccounting(
             context: accountingContext,
             effectiveSelection: effectiveSelection,
             collections: collections,
             resolvedContext: resolvedPromptContext,
             lookupContext: lookupContext,
-            activeTabCompatibility: virtualContext == nil,
+            activeTabCompatibility: useActivePublishedSnapshot,
             allowActivePublishedSnapshotRefresh: codemapPresentationOverride == nil
         )
         let artifactRootMetadata: [String: PathFormatter.RootMetadata] = Dictionary(
