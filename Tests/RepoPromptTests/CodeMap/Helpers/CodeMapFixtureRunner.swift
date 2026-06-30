@@ -76,10 +76,6 @@ enum CodeMapFixtureRunner {
         return try normalize(String(contentsOf: url, encoding: .utf8))
     }
 
-    static func renderCodeMap(for fixture: CodeMapFixture, tempRoot: URL) throws -> String {
-        try renderArtifactCodeMap(for: fixture, tempRoot: tempRoot)
-    }
-
     static func renderArtifactCodeMap(for fixture: CodeMapFixture, tempRoot: URL) throws -> String {
         let virtualURL = tempRoot.appendingPathComponent(fixture.relativePath)
         guard let language = SyntaxManager.shared.language(forFileExtension: fixture.fileExtension) else {
