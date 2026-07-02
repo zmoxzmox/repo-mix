@@ -827,6 +827,34 @@ class WorkspaceManagerViewModel: ObservableObject {
         case skipPreviouslyCompleted
     }
 
+    @MainActor
+    private final class WorkspaceSwitchOverlayVisibilityGate {
+        private var restoreStateReady = false
+        private var primaryRootsVisible = false
+        private var didHide = false
+        private let hide: () -> Void
+
+        init(hide: @escaping () -> Void) {
+            self.hide = hide
+        }
+
+        func markRestoreStateReady() {
+            restoreStateReady = true
+            hideIfReady()
+        }
+
+        func markPrimaryRootsVisible() {
+            primaryRootsVisible = true
+            hideIfReady()
+        }
+
+        private func hideIfReady() {
+            guard restoreStateReady, primaryRootsVisible, !didHide else { return }
+            didHide = true
+            hide()
+        }
+    }
+
     private(set) var isSwitchingWorkspace = false
     private nonisolated let workspaceSearchReadinessFence = WorkspaceSearchReadinessFence()
     @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle {
@@ -3010,8 +3038,53 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         runGitDataMaintenanceOnWorkspaceOpen(activeWS)
 
-        // Restore path-based state before catalog/search hydration. This activation phase
-        // must not require root descendant UI projection.
+        let overlayVisibilityGate = WorkspaceSwitchOverlayVisibilityGate { [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: activeWS.id) else { return }
+            hideWorkspaceSwitchOverlay(reason: "primary roots visible workspace=\"\(activeWS.name)\"")
+        }
+        func loadTargetWorkspaceFolders() async {
+            await loadWorkspaceFolders(
+                for: activeWS,
+                hydrationGeneration: hydrationGeneration,
+                gitDataRootLoadMode: .deferredAfterSwitch,
+                initialUnloadMode: rootsUnloadedBeforeFolderLoad ? .skipPreviouslyCompleted : .perform,
+                onInitialRootUnloadCompleted: { [weak self] in
+                    self?.markWorkspaceSwitchRootsUnloaded(operationID)
+                },
+                onAllPrimaryRootsVisible: {
+                    overlayVisibilityGate.markPrimaryRootsVisible()
+                }
+            )
+        }
+
+        // Same-ID replacement reloads use loadWorkspaceFolders as the destructive unload
+        // boundary. Keep that path serial so cancellation/recovery observes the existing
+        // roots-unloaded marker in the same task that owns the switch operation.
+        let shouldOverlapRootHydration = activeWS.id != previousActiveWorkspace?.id
+        var folderLoadStart: Date?
+        let folderLoadTask: Task<Void, Never>?
+        if shouldOverlapRootHydration {
+            folderLoadStart = Date()
+            logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
+            folderLoadTask = Task { @MainActor in
+                await loadTargetWorkspaceFolders()
+            }
+        } else {
+            folderLoadTask = nil
+        }
+        var folderLoadCompleted = !shouldOverlapRootHydration
+        defer {
+            if !folderLoadCompleted {
+                folderLoadTask?.cancel()
+            }
+        }
+
+        // Restore path-based state while catalog/search hydration is already in flight when
+        // the switch target differs from the outgoing workspace. This activation phase must
+        // not require root descendant UI projection; final checkbox reconciliation still
+        // happens after target hydration and selection replay below.
         advanceWorkspaceSwitchOperation(operationID, to: .restoringState)
         await Task.yield()
         if let cancellation = cancellationResult(
@@ -3064,27 +3137,19 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         #endif
 
-        // Hydrate primary root catalogs and build search/path lookup indexes. Root shells
-        // attach as catalogs complete; watchers, slices and codemap scans are post-catalog work.
+        // Finish primary root catalog/search hydration. Root shells attach as catalogs complete;
+        // watchers, slices and codemap scans are post-catalog work.
+        overlayVisibilityGate.markRestoreStateReady()
         advanceWorkspaceSwitchOperation(operationID, to: .hydratingRoots)
-        let folderLoadStart = Date()
-        logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
-        await loadWorkspaceFolders(
-            for: activeWS,
-            hydrationGeneration: hydrationGeneration,
-            gitDataRootLoadMode: .deferredAfterSwitch,
-            initialUnloadMode: rootsUnloadedBeforeFolderLoad ? .skipPreviouslyCompleted : .perform,
-            onInitialRootUnloadCompleted: { [weak self] in
-                self?.markWorkspaceSwitchRootsUnloaded(operationID)
-            },
-            onAllPrimaryRootsVisible: { [weak self] in
-                guard let self else { return }
-                guard !Task.isCancelled else { return }
-                guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: activeWS.id) else { return }
-                hideWorkspaceSwitchOverlay(reason: "primary roots visible workspace=\"\(activeWS.name)\"")
-            }
-        )
-        let folderLoadDuration = Date().timeIntervalSince(folderLoadStart)
+        if let folderLoadTask {
+            await folderLoadTask.value
+            folderLoadCompleted = true
+        } else {
+            folderLoadStart = Date()
+            logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
+            await loadTargetWorkspaceFolders()
+        }
+        let folderLoadDuration = folderLoadStart.map { Date().timeIntervalSince($0) } ?? 0
         logWorkspaceSwitch("catalog hydration END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", folderLoadDuration))s")
         #if DEBUG
             let folderCounts = fileManager.restorePerfLoadedTreeCounts()
@@ -6001,6 +6066,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ], uniquingKeysWith: { _, new in new })
             )
         #endif
+        guard !Task.isCancelled,
+              isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id)
+        else { return }
         switch initialUnloadMode {
         case .perform:
             #if DEBUG
