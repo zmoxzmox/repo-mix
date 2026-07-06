@@ -495,6 +495,54 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertTrue(loaded.turns.isEmpty)
     }
 
+    func testLoadTranscriptForSearch_cachesTranscriptAcrossCalls() async throws {
+        // F5: a transcript decoded once is reused on the next load when the session
+        // file is unchanged — the decode counter must not increment on the cache hit.
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let sessionID = UUID()
+        let session = AgentSession(
+            id: sessionID,
+            name: "S",
+            transcript: AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))]),
+            itemCount: 1
+        )
+        try writeSessionFile(session, in: wsDir)
+
+        let first = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+        XCTAssertEqual(first.turns.count, 1)
+        let decodedAfterFirst = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedAfterFirst, 1)
+
+        // Second load, file unchanged → served from the signature cache; no re-decode.
+        let cached = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+        XCTAssertEqual(cached.turns.count, 1)
+        let decodedAfterSecond = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedAfterSecond, 1, "Unchanged file must hit the cache (no re-decode)")
+    }
+
+    func testLoadTranscriptForSearch_invalidatesCacheWhenSessionFileChanges() async throws {
+        // F5: modifying the session file (size+mtime change) must invalidate the cache
+        // and re-decode on the next load.
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let sessionID = UUID()
+        func writeTranscript(_ turnCount: Int) throws {
+            let turns = (0 ..< turnCount).map { AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000).addingTimeInterval(TimeInterval($0))) }
+            try writeSessionFile(AgentSession(id: sessionID, name: "S", transcript: AgentTranscript(turns: turns), itemCount: turnCount), in: wsDir)
+        }
+        try writeTranscript(1)
+        let first = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+        XCTAssertEqual(first.turns.count, 1)
+        let decodedAfterFirst = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedAfterFirst, 1)
+
+        // Rewrite with more turns → different size+mtime → signature changes → re-decode.
+        try writeTranscript(3)
+        let refreshed = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+        XCTAssertEqual(refreshed.turns.count, 3, "Changed file must re-decode (cache invalidated)")
+        let decodedAfterRefresh = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedAfterRefresh, 2)
+    }
+
     // MARK: - Cross-Workspace Unification
 
     func testScanAllWorkspaces_recordsIncludeWorkspaceContext() async throws {

@@ -108,6 +108,14 @@ actor HistorySessionScanner: HistorySessionScanning {
         var entries: [String: Entry]
     }
 
+    /// Cached decode of a single session's transcript, invalidated when the session
+    /// file's size or modification time changes. Bounds repeated decoding across
+    /// iterative list/search/time queries that re-hydrate the same stub records.
+    private struct TranscriptCacheEntry {
+        let signature: FileSignature
+        let transcript: AgentTranscript
+    }
+
     private let fileManager: FileManager
     private let decoder: JSONDecoder
 
@@ -118,6 +126,11 @@ actor HistorySessionScanner: HistorySessionScanning {
     private var cachedScanResults: [HistoryWorkspaceScanResult]?
     private var cachedScanResultsAt: Date?
     private var indexScanCache: IndexScanCache?
+    private var transcriptCache: [String: TranscriptCacheEntry] = [:]
+    private static let transcriptCacheLimit = 512
+    /// Observability counter: number of session files actually decoded (cache misses).
+    /// Lets tests prove a second load hits the cache without re-reading.
+    private(set) var transcriptDecodeCountForTesting: Int = 0
 
     init(
         fileManager: FileManager = .default,
@@ -254,25 +267,41 @@ actor HistorySessionScanner: HistorySessionScanning {
         let agentSessionsDir = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
         let filename = "AgentSession-\(sessionID.uuidString).json"
         let sessionFile = agentSessionsDir.appendingPathComponent(filename)
+        let cacheKey = sessionFile.standardizedFileURL.path
 
         guard fileManager.fileExists(atPath: sessionFile.path) else {
+            transcriptCache.removeValue(forKey: cacheKey)
             throw HistorySessionScannerError.sessionFileNotFound(
                 sessionID: sessionID,
                 workspaceDir: workspaceDir
             )
         }
 
+        // Reuse a cached decode when the session file's size+mtime are unchanged
+        // (same signature-invalidation approach as the per-index scan cache), so
+        // iterative list/search/time queries don't re-decode the same transcripts.
+        let signature = fileSignature(for: sessionFile)
+        if let signature, let cached = transcriptCache[cacheKey], cached.signature == signature {
+            return cached.transcript
+        }
+
         do {
+            transcriptDecodeCountForTesting += 1
             let data = try Data(contentsOf: sessionFile, options: .mappedIfSafe)
 
             // Decode the session and extract the transcript.
             // We decode as a full AgentSession to get the transcript field.
             let session = try decoder.decode(AgentSession.self, from: data)
-            guard let transcript = session.transcript else {
-                return .empty
+            let transcript = session.transcript ?? .empty
+            if let signature {
+                transcriptCache[cacheKey] = TranscriptCacheEntry(signature: signature, transcript: transcript)
+                if transcriptCache.count > Self.transcriptCacheLimit {
+                    transcriptCache.removeAll()
+                }
             }
             return transcript
         } catch {
+            transcriptCache.removeValue(forKey: cacheKey)
             throw HistorySessionScannerError.transcriptDecodingFailed(
                 sessionID: sessionID,
                 underlying: String(describing: error)
