@@ -1982,7 +1982,6 @@ extension ToolOutputFormatter {
             }
             if dto.status.lowercased() == "failed" || dto.errorMessage != nil || dto.errorCode != nil {
                 var errorLines: [String] = []
-                errorLines.reserveCapacity(6)
                 errorLines.append("### Error")
                 if let message = dto.errorMessage, !message.isEmpty {
                     errorLines.append("- \(message)")

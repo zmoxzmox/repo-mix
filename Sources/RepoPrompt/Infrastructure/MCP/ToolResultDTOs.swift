@@ -837,10 +837,10 @@ enum ToolResultDTOs {
             case reviewStatus = "review_status"
             case rejectionReason = "rejection_reason"
             case requiresUserApproval = "requires_user_approval"
-            case errorMessage = "error_message"
+            case errorMessage = "error"
             case errorCode = "error_code"
             case retryable
-            case retryAfterMilliseconds = "retry_after_milliseconds"
+            case retryAfterMilliseconds = "retry_after_ms"
             case suggestion
         }
     }
@@ -1127,10 +1127,10 @@ enum ToolResultDTOs {
             case path
             case newPath = "new_path"
             case warning
-            case errorMessage = "error_message"
+            case errorMessage = "error"
             case errorCode = "error_code"
             case retryable
-            case retryAfterMilliseconds = "retry_after_milliseconds"
+            case retryAfterMilliseconds = "retry_after_ms"
             case suggestion
         }
     }

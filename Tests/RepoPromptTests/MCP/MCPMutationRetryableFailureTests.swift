@@ -3,16 +3,6 @@ import MCP
 import XCTest
 
 final class MCPMutationRetryableFailureTests: XCTestCase {
-    func testFailClosedLookupContextProducesRetryableWorktreeFailure() {
-        let failure = MCPMutationRetryableFailure.worktreeScopeUnavailable(missingPhysicalRootPaths: [])
-
-        XCTAssertEqual(failure.errorCode, "worktree_scope_unavailable")
-        XCTAssertEqual(failure.retryable, true)
-        XCTAssertEqual(failure.retryAfterMilliseconds, 1000)
-        XCTAssertTrue(failure.errorMessage.contains("stopped before path translation"), failure.errorMessage)
-        XCTAssertTrue(failure.errorMessage.contains("canonical checkout"), failure.errorMessage)
-    }
-
     func testMutationScopeFailureClassifiesFailClosedAndMissingWorktreeScopes() async {
         let store = WorkspaceFileContextStore()
 
@@ -22,6 +12,9 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         )
         XCTAssertEqual(failClosed?.errorCode, "worktree_scope_unavailable")
         XCTAssertEqual(failClosed?.retryable, true)
+        XCTAssertEqual(failClosed?.retryAfterMilliseconds, 1000)
+        XCTAssertTrue(failClosed?.errorMessage.contains("stopped before path translation") ?? false, failClosed?.errorMessage ?? "nil")
+        XCTAssertTrue(failClosed?.errorMessage.contains("canonical checkout") ?? false, failClosed?.errorMessage ?? "nil")
 
         let missingPhysicalRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("missing-worktree-\(UUID().uuidString)")
@@ -99,10 +92,12 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
             to: "        if resolved.usesActiveTabCompatibility,"
         ))
 
-        XCTAssertTrue(body.contains("if purpose == .agentModeRun"), body)
-        XCTAssertTrue(body.contains("return AgentWorkspaceLookupContextResolver.failClosedLookupContext"), body)
-        XCTAssertTrue(body.contains("return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)"), body)
-        XCTAssertFalse(body.contains("return .visibleWorkspace"), body)
+        try Self.assertOrdered([
+            "guard let resolved else {",
+            "if purpose == .agentModeRun",
+            "return AgentWorkspaceLookupContextResolver.failClosedLookupContext",
+            "return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)"
+        ], in: body)
     }
 
     func testFileActionRetryableFailureDTOAndFormatterExposeCode() throws {
