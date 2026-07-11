@@ -939,7 +939,8 @@ class WindowState: ObservableObject {
 
     private func collapseRedundantSingleWindowTabBarIfNeeded(for window: NSWindow) {
         guard let tabbedWindows = window.tabbedWindows,
-              tabbedWindows.count == 1
+              tabbedWindows.count == 1,
+              window.tabGroup?.isTabBarVisible == true
         else {
             return
         }
