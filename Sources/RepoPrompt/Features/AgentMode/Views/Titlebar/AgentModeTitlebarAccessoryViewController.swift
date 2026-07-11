@@ -2,123 +2,73 @@
 //  AgentModeTitlebarAccessoryViewController.swift
 //  RepoPrompt
 //
-//  Xcode-style titlebar accessory that places Agent Mode controls
+//  Xcode-style titlebar accessory that places a "New Session" button
 //  near the traffic lights using NSTitlebarAccessoryViewController.
 //
 
 import Cocoa
+import SwiftUI
 
-struct AgentModeTitlebarChatMenuSnapshot: Equatable {
-    let isPinned: Bool
-}
+// MARK: - SwiftUI View for Titlebar Button
 
-struct AgentModeTitlebarChatMenuActions {
-    let togglePin: () -> Void
-    let rename: () -> Void
-    let stash: () -> Void
-    let delete: () -> Void
-}
+/// Compact "New Session" button designed for the titlebar area
+private struct AgentModeTitlebarNewSessionView: View {
+    let onNewSession: () -> Void
+    @State private var isHovering = false
 
-// MARK: - Titlebar Button
-
-private final class TitlebarAccessoryIconButton: NSButton {
-    private let symbolName: String
-    private let accessibilityLabelText: String
-    private let normalAlpha: CGFloat
-    private var trackingArea: NSTrackingArea?
-    private var isHovering = false {
-        didSet { updateAppearance() }
-    }
-
-    init(symbolName: String, accessibilityLabel: String, toolTip: String, normalAlpha: CGFloat = 0.7) {
-        self.symbolName = symbolName
-        accessibilityLabelText = accessibilityLabel
-        self.normalAlpha = normalAlpha
-        super.init(frame: .zero)
-
-        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityLabel)
-        imagePosition = .imageOnly
-        isBordered = false
-        bezelStyle = .regularSquare
-        setButtonType(.momentaryChange)
-        focusRingType = .none
-        translatesAutoresizingMaskIntoConstraints = false
-        self.toolTip = toolTip
-        setAccessibilityLabel(accessibilityLabel)
-        setAccessibilityRole(.button)
-
-        wantsLayer = true
-        layer?.cornerRadius = 6
-        layer?.cornerCurve = .continuous
-
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 36),
-            heightAnchor.constraint(equalToConstant: 28)
-        ])
-        updateAppearance()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override var isHighlighted: Bool {
-        didSet { updateAppearance() }
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
+    var body: some View {
+        Button(action: onNewSession) {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundColor(.primary.opacity(isHovering ? 1.0 : 0.7))
+                // SEARCH-HELPER: Titlebar, Alignment, Compose icon offset
+                // The `square.and.pencil` glyph's pencil shaft extends up-and-right
+                // beyond the square, so the geometric center of its bounding box sits
+                // higher than the visible mass (the square). Centering the bounding
+                // box therefore renders the square visibly *low* relative to the
+                // traffic lights — nudge the icon up slightly to correct the optical
+                // center.
+                .offset(y: -1.5)
         }
-        let options: NSTrackingArea.Options = [.activeAlways, .inVisibleRect, .mouseEnteredAndExited]
-        let area = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
+        .buttonStyle(TitlebarAccessoryButtonStyle(isHovering: isHovering))
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovering = hovering
+            }
+        }
+        .hoverTooltip("New Session", .bottom)
+        .accessibilityLabel("New Session")
+    }
+}
+
+/// Button style optimized for titlebar accessory placement
+struct TitlebarAccessoryButtonStyle: ButtonStyle {
+    let isHovering: Bool
+
+    init(isHovering: Bool = false) {
+        self.isHovering = isHovering
     }
 
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        isHovering = true
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(width: 36, height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(backgroundColor(isPressed: configuration.isPressed))
+            )
+            .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
+            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
     }
 
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        isHovering = false
-    }
-
-    private func updateAppearance() {
-        if isHighlighted {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.15).cgColor
+    private func backgroundColor(isPressed: Bool) -> Color {
+        if isPressed {
+            Color.primary.opacity(0.15)
         } else if isHovering {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.08).cgColor
+            Color.primary.opacity(0.08)
         } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
+            Color.clear
         }
-        contentTintColor = NSColor.labelColor.withAlphaComponent(isHovering ? 1.0 : normalAlpha)
-        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityLabelText)
-    }
-}
-
-private final class AgentModeTitlebarMenuItem: NSMenuItem {
-    private let handler: () -> Void
-
-    init(title: String, symbolName: String, handler: @escaping () -> Void) {
-        self.handler = handler
-        super.init(title: title, action: #selector(performHandler(_:)), keyEquivalent: "")
-        target = self
-        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-    }
-
-    @available(*, unavailable)
-    required init(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    @objc private func performHandler(_ sender: NSMenuItem) {
-        _ = sender
-        handler()
     }
 }
 
@@ -126,24 +76,11 @@ private final class AgentModeTitlebarMenuItem: NSMenuItem {
 
 @MainActor
 final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewController {
+    private var hostingView: NSHostingView<AgentModeTitlebarNewSessionView>?
     private var onNewSession: () -> Void
-    private var hasChatOptions: () -> Bool
-    private var chatMenuSnapshot: () -> AgentModeTitlebarChatMenuSnapshot?
-    private var chatMenuActions: AgentModeTitlebarChatMenuActions
 
-    private weak var newSessionButton: TitlebarAccessoryIconButton?
-    private weak var chatOptionsButton: TitlebarAccessoryIconButton?
-
-    init(
-        onNewSession: @escaping () -> Void,
-        hasChatOptions: @escaping () -> Bool,
-        chatMenuSnapshot: @escaping () -> AgentModeTitlebarChatMenuSnapshot?,
-        chatMenuActions: AgentModeTitlebarChatMenuActions
-    ) {
+    init(onNewSession: @escaping () -> Void) {
         self.onNewSession = onNewSession
-        self.hasChatOptions = hasChatOptions
-        self.chatMenuSnapshot = chatMenuSnapshot
-        self.chatMenuActions = chatMenuActions
         super.init(nibName: nil, bundle: nil)
         layoutAttribute = .leading
     }
@@ -154,98 +91,16 @@ final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewCon
     }
 
     override func loadView() {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-
-        let newButton = TitlebarAccessoryIconButton(
-            symbolName: "square.and.pencil",
-            accessibilityLabel: "New Session",
-            toolTip: "New Session"
-        )
-        newButton.target = self
-        newButton.action = #selector(performNewSession(_:))
-        stack.addArrangedSubview(newButton)
-        newSessionButton = newButton
-
-        let optionsButton = TitlebarAccessoryIconButton(
-            symbolName: "ellipsis",
-            accessibilityLabel: "Chat Options",
-            toolTip: "Chat Options"
-        )
-        optionsButton.target = self
-        optionsButton.action = #selector(showChatOptionsMenu(_:))
-        stack.addArrangedSubview(optionsButton)
-        chatOptionsButton = optionsButton
-
-        view = stack
-        refreshChatOptionsVisibility()
+        let swiftUIView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
+        let hosting = NSHostingView(rootView: swiftUIView)
+        hosting.frame.size = hosting.fittingSize
+        hostingView = hosting
+        view = hosting
     }
 
-    /// Updates action closures without recreating the controller.
-    func update(
-        onNewSession: @escaping () -> Void,
-        hasChatOptions: @escaping () -> Bool,
-        chatMenuSnapshot: @escaping () -> AgentModeTitlebarChatMenuSnapshot?,
-        chatMenuActions: AgentModeTitlebarChatMenuActions
-    ) {
+    /// Updates the action closure without recreating the controller
+    func update(onNewSession: @escaping () -> Void) {
         self.onNewSession = onNewSession
-        self.hasChatOptions = hasChatOptions
-        self.chatMenuSnapshot = chatMenuSnapshot
-        self.chatMenuActions = chatMenuActions
-        refreshChatOptionsVisibility()
-    }
-
-    func refreshChatOptionsVisibility() {
-        guard let chatOptionsButton else { return }
-        let shouldHide = !hasChatOptions()
-        guard chatOptionsButton.isHidden != shouldHide else { return }
-
-        chatOptionsButton.isHidden = shouldHide
-        view.invalidateIntrinsicContentSize()
-        view.needsLayout = true
-        view.superview?.needsLayout = true
-    }
-
-    @objc private func performNewSession(_ sender: NSButton) {
-        _ = sender
-        onNewSession()
-        refreshChatOptionsVisibility()
-    }
-
-    @objc private func showChatOptionsMenu(_ sender: NSButton) {
-        guard let snapshot = chatMenuSnapshot() else {
-            refreshChatOptionsVisibility()
-            return
-        }
-
-        let menu = NSMenu(title: "Chat Options")
-        menu.autoenablesItems = false
-        menu.addItem(AgentModeTitlebarMenuItem(
-            title: snapshot.isPinned ? "Unpin Chat" : "Pin Chat",
-            symbolName: snapshot.isPinned ? "pin.slash" : "pin",
-            handler: { [weak self] in self?.chatMenuActions.togglePin() }
-        ))
-        menu.addItem(AgentModeTitlebarMenuItem(
-            title: "Rename Chat…",
-            symbolName: "pencil",
-            handler: { [weak self] in self?.chatMenuActions.rename() }
-        ))
-        menu.addItem(AgentModeTitlebarMenuItem(
-            title: "Stash Chat",
-            symbolName: "tray.and.arrow.down",
-            handler: { [weak self] in self?.chatMenuActions.stash() }
-        ))
-        menu.addItem(.separator())
-        menu.addItem(AgentModeTitlebarMenuItem(
-            title: "Delete Chat…",
-            symbolName: "trash",
-            handler: { [weak self] in self?.chatMenuActions.delete() }
-        ))
-
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 4), in: sender)
-        refreshChatOptionsVisibility()
+        hostingView?.rootView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
     }
 }

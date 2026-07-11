@@ -167,12 +167,14 @@ class WindowState: ObservableObject {
 
     // MARK: - Agent Mode Titlebar Accessory
 
-    /// Titlebar accessory controller for Agent mode ("New Session" button near traffic lights)
+    /// Native titlebar edge accessory controller for the Agent mode New Session button
     private weak var agentTitlebarAccessory: AgentModeTitlebarAccessoryViewController?
     /// Whether Agent mode has requested the titlebar accessory be visible
     private var wantsAgentTitlebarAccessory: Bool = false
     /// Action to call when the "New Session" button is tapped
     private var agentNewSessionAction: (() -> Void)?
+    /// Narrow titlebar state observed only by the principal toolbar title cluster.
+    let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
     /// The sticky instance number assigned for this window's current workspace (monotonically increasing per workspace).
     /// Nil when no workspace is active yet.
@@ -433,7 +435,6 @@ class WindowState: ObservableObject {
                       notifiedWindowID == windowID
                 else { return }
                 requestWindowTitleUpdate(reason: .activeComposeTabChanged)
-                refreshAgentTitlebarChatOptionsVisibility()
             }
             .store(in: &cancellables)
 
@@ -447,7 +448,6 @@ class WindowState: ObservableObject {
                       tabID == promptManager.activeComposeTabID
                 else { return }
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
-                refreshAgentTitlebarChatOptionsVisibility()
             }
             .store(in: &cancellables)
 
@@ -460,7 +460,7 @@ class WindowState: ObservableObject {
                       let tabID = notification.userInfo?["tabID"] as? UUID,
                       tabID == promptManager.activeComposeTabID
                 else { return }
-                refreshAgentTitlebarChatOptionsVisibility()
+                refreshAgentChatTitleCluster()
             }
             .store(in: &cancellables)
     }
@@ -528,9 +528,15 @@ class WindowState: ObservableObject {
     private func configureWindowChrome(for window: NSWindow) {
         // Keep titlebar visually continuous with content (no horizontal separator).
         window.toolbar?.showsBaselineSeparator = false
+        if #unavailable(macOS 15.0) {
+            window.titleVisibility = .hidden
+        }
         // SwiftUI can recreate toolbar chrome during toolbar updates; re-apply on next runloop.
         DispatchQueue.main.async { [weak window] in
             window?.toolbar?.showsBaselineSeparator = false
+            if #unavailable(macOS 15.0) {
+                window?.titleVisibility = .hidden
+            }
         }
     }
 
@@ -643,6 +649,7 @@ class WindowState: ObservableObject {
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
+        refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
             return
@@ -751,7 +758,8 @@ class WindowState: ObservableObject {
     }
 
     private func currentAgentTitlebarChatOptionsTabID() -> UUID? {
-        guard let tabID = agentModeViewModel.currentTabID,
+        guard wantsAgentTitlebarAccessory,
+              let tabID = agentModeViewModel.currentTabID,
               agentModeViewModel.hasLinkedAgentSession(for: tabID)
         else {
             return nil
@@ -759,31 +767,24 @@ class WindowState: ObservableObject {
         return tabID
     }
 
-    private func hasAgentTitlebarChatOptions() -> Bool {
-        currentAgentTitlebarChatOptionsTabID() != nil
-    }
-
     private func agentTitlebarChatOptionsTabExists(_ tabID: UUID) -> Bool {
         promptManager.currentComposeTabs.contains(where: { $0.id == tabID })
             && agentModeViewModel.hasLinkedAgentSession(for: tabID)
     }
 
-    private func agentTitlebarChatTitle(for tabID: UUID) -> String {
-        promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.name
-            ?? workspaceManager.composeTabName(with: tabID)
-            ?? "Chat"
-    }
-
-    private func agentTitlebarChatMenuSnapshot() -> AgentModeTitlebarChatMenuSnapshot? {
-        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return nil }
+    func agentChatTitleClusterMenuSnapshot() -> AgentChatOptionsMenuSnapshot? {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else {
+            refreshAgentChatTitleCluster()
+            return nil
+        }
         let tab = promptManager.currentComposeTabs.first(where: { $0.id == tabID })
-        return AgentModeTitlebarChatMenuSnapshot(
+        return AgentChatOptionsMenuSnapshot(
             isPinned: tab?.isPinned ?? false
         )
     }
 
-    private func makeAgentTitlebarChatMenuActions() -> AgentModeTitlebarChatMenuActions {
-        AgentModeTitlebarChatMenuActions(
+    func agentChatTitleClusterMenuActions() -> AgentChatOptionsMenuActions {
+        AgentChatOptionsMenuActions(
             togglePin: { [weak self] in
                 self?.toggleCurrentAgentChatPinFromTitlebar()
             },
@@ -799,14 +800,16 @@ class WindowState: ObservableObject {
         )
     }
 
-    private func refreshAgentTitlebarChatOptionsVisibility() {
-        agentTitlebarAccessory?.refreshChatOptionsVisibility()
+    private func refreshAgentChatTitleCluster() {
+        agentChatTitleCluster.update(
+            title: displayedWindowTitle,
+            showsChatOptions: currentAgentTitlebarChatOptionsTabID() != nil
+        )
     }
 
     private func toggleCurrentAgentChatPinFromTitlebar() {
         guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
         promptManager.toggleComposeTabPinned(tabID)
-        refreshAgentTitlebarChatOptionsVisibility()
     }
 
     private func stashCurrentAgentChatFromTitlebar() {
@@ -816,13 +819,14 @@ class WindowState: ObservableObject {
                   agentTitlebarChatOptionsTabExists(tabID)
             else { return }
             await promptManager.stashTab(tabID)
-            refreshAgentTitlebarChatOptionsVisibility()
         }
     }
 
     private func renameCurrentAgentChatFromTitlebar() {
         guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
-        let currentName = agentTitlebarChatTitle(for: tabID)
+        let currentName = promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.name
+            ?? workspaceManager.composeTabName(with: tabID)
+            ?? "Chat"
         let alert = NSAlert()
         alert.messageText = "Rename chat"
         alert.informativeText = "Choose a new name for this chat."
@@ -844,7 +848,6 @@ class WindowState: ObservableObject {
             let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !newName.isEmpty, newName != currentName else { return }
             agentModeViewModel.renameSession(tabID: tabID, to: newName)
-            refreshAgentTitlebarChatOptionsVisibility()
         }
 
         if let window = nsWindow {
@@ -877,7 +880,6 @@ class WindowState: ObservableObject {
                       agentTitlebarChatOptionsTabExists(tabID)
                 else { return }
                 await promptManager.closeComposeTab(tabID)
-                refreshAgentTitlebarChatOptionsVisibility()
             }
         }
 
@@ -888,7 +890,7 @@ class WindowState: ObservableObject {
         }
     }
 
-    /// Shows or hides the Agent mode titlebar accessory ("New Session" button near traffic lights).
+    /// Shows or hides the Agent mode New Session titlebar edge accessory.
     /// - Parameters:
     ///   - visible: Whether to show the accessory
     ///   - onNewSession: Action to call when button is tapped (required when visible is true)
@@ -897,11 +899,13 @@ class WindowState: ObservableObject {
             guard !shouldSuppressObservationSideEffects else { return }
             wantsAgentTitlebarAccessory = true
             agentNewSessionAction = onNewSession
+            refreshAgentChatTitleCluster()
             applyAgentTitlebarAccessoryIfPossible()
         } else {
             wantsAgentTitlebarAccessory = false
             agentNewSessionAction = nil
             removeAgentTitlebarAccessory()
+            refreshAgentChatTitleCluster()
         }
     }
 
@@ -915,28 +919,31 @@ class WindowState: ObservableObject {
             return
         }
 
-        let menuActions = makeAgentTitlebarChatMenuActions()
         if let existing = agentTitlebarAccessory {
-            existing.update(
-                onNewSession: action,
-                hasChatOptions: { [weak self] in self?.hasAgentTitlebarChatOptions() ?? false },
-                chatMenuSnapshot: { [weak self] in self?.agentTitlebarChatMenuSnapshot() },
-                chatMenuActions: menuActions
-            )
+            existing.update(onNewSession: action)
             if !window.titlebarAccessoryViewControllers.contains(where: { $0 === existing }) {
                 window.addTitlebarAccessoryViewController(existing)
             }
         } else {
-            let accessory = AgentModeTitlebarAccessoryViewController(
-                onNewSession: action,
-                hasChatOptions: { [weak self] in self?.hasAgentTitlebarChatOptions() ?? false },
-                chatMenuSnapshot: { [weak self] in self?.agentTitlebarChatMenuSnapshot() },
-                chatMenuActions: menuActions
-            )
+            let accessory = AgentModeTitlebarAccessoryViewController(onNewSession: action)
             window.addTitlebarAccessoryViewController(accessory)
             agentTitlebarAccessory = accessory
         }
         configureWindowChrome(for: window)
+        collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window else { return }
+            collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        }
+    }
+
+    private func collapseRedundantSingleWindowTabBarIfNeeded(for window: NSWindow) {
+        guard let tabbedWindows = window.tabbedWindows,
+              tabbedWindows.count == 1
+        else {
+            return
+        }
+        window.toggleTabBar(nil)
     }
 
     /// Removes the titlebar accessory from the window
