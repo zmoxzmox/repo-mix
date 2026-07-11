@@ -1354,6 +1354,21 @@ final class EngineHookEvents: @unchecked Sendable {
         }
         return true
     }
+
+    func wait(
+        kind: WorkspaceCodemapBindingEngineHookKind,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        minimumCount: Int,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while events.count(where: { $0.kind == kind && $0.rootEpoch == rootEpoch }) < minimumCount {
+            guard condition.wait(until: deadline) else { return false }
+        }
+        return true
+    }
 }
 
 actor EngineProjectionRecorder {

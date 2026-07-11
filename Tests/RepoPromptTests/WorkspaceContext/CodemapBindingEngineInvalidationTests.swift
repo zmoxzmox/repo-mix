@@ -268,6 +268,15 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         let bundleValue = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
         XCTAssertEqual(try XCTUnwrap(bundleValue).entries.count, 1)
 
+        XCTAssertTrue(hookEvents.wait(
+            kind: .manifestWrite,
+            rootEpoch: fixture.rootEpoch,
+            minimumCount: 1
+        ))
+        let retriedAccounting = await fixture.engine.accounting()
+        XCTAssertEqual(retriedAccounting.dirtyManifestCount, 0)
+        XCTAssertEqual(retriedAccounting.counters.manifestWrites, 1)
+
         let recoveryResult = await fixture.engine.demand(fixture.demand(path: "Sources/Recovery.swift"))
         guard case .ready = recoveryResult else {
             let accounting = await fixture.engine.accounting()
@@ -286,11 +295,11 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
         XCTAssertTrue(hookEvents.wait(
             kind: .manifestWrite,
             rootEpoch: fixture.rootEpoch,
-            numericValue: 0
+            minimumCount: 2
         ))
         let recoveredAccounting = await fixture.engine.accounting()
         XCTAssertEqual(recoveredAccounting.dirtyManifestCount, 0)
-        XCTAssertEqual(recoveredAccounting.counters.manifestWrites, 1)
+        XCTAssertEqual(recoveredAccounting.counters.manifestWrites, 2)
 
         let state = await fixture.capabilityService.state(for: fixture.rootEpoch)
         let capability = try eligible(state)
