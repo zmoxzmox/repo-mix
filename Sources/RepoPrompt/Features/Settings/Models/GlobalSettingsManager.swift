@@ -310,7 +310,12 @@ class GlobalSettingsStore: ObservableObject {
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
-    @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason?
+    @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
+        didSet { reconcilePersistenceBlockDismissal() }
+    }
+
+    @Published private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
+
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
 
@@ -334,10 +339,30 @@ class GlobalSettingsStore: ObservableObject {
         self.fileStore = fileStore
         load()
         ensureFileSystemGlobalIgnoreDefaultsSeeded()
+        reconcilePersistenceBlockDismissal()
     }
 
     func recentSettingsWriteDiagnostics() -> [GlobalSettingsWriteDiagnostic] {
         settingsWriteDiagnostics
+    }
+
+    func dismissCurrentPersistenceBlockForSession() {
+        sessionDismissedPersistenceBlockReason = persistenceBlockReason
+    }
+
+    var isCurrentPersistenceBlockDismissedForSession: Bool {
+        guard let persistenceBlockReason else { return false }
+        return sessionDismissedPersistenceBlockReason == persistenceBlockReason
+    }
+
+    private func reconcilePersistenceBlockDismissal() {
+        guard let persistenceBlockReason else {
+            sessionDismissedPersistenceBlockReason = nil
+            return
+        }
+        if sessionDismissedPersistenceBlockReason != persistenceBlockReason {
+            sessionDismissedPersistenceBlockReason = nil
+        }
     }
 
     private func recordSettingsWriteDiagnostic(

@@ -9,6 +9,11 @@ import Foundation
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
+    /// Fixed feature-version constants are permanent compatibility boundaries. Add a new
+    /// constant for each schema-requiring feature; never infer an existing feature's minimum
+    /// version from `currentSchemaVersion`.
+    static let baselineSchemaVersion = 2
+    static let workspaceAgentModelsSchemaVersion = 4
     static let currentSchemaVersion = 4
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
@@ -61,6 +66,19 @@ struct GlobalSettingsDocument: Codable {
 
     var agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] {
         Self.decodeUUIDKeyedDictionary(agentModelsSettingsByWorkspaceID ?? [:])
+    }
+
+    /// Lowest CE schema version that can faithfully represent this document's content.
+    ///
+    /// Each feature contributes its own fixed introduction version. Future schema bumps must
+    /// add another feature constant and participate in this maximum; they must not change the
+    /// minimum version of content that existing features already know how to represent.
+    var requiredSchemaVersion: Int {
+        var requiredVersion = Self.baselineSchemaVersion
+        if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
+            requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        return requiredVersion
     }
 
     func replacing(
