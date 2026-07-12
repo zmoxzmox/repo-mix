@@ -881,6 +881,63 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private final class AppliedIngressTimeoutRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>?
+        private var pendingResult: Result<[WorkspaceIngressBarrierSample], Error>?
+        private var operationTask: Task<Void, Never>?
+        private var timeoutTask: Task<Void, Never>?
+        private var isResolved = false
+
+        func install(continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>) {
+            lock.lock()
+            if let pendingResult {
+                self.pendingResult = nil
+                lock.unlock()
+                continuation.resume(with: pendingResult)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func install(operationTask: Task<Void, Never>, timeoutTask: Task<Void, Never>) {
+            lock.lock()
+            if isResolved {
+                lock.unlock()
+                operationTask.cancel()
+                timeoutTask.cancel()
+                return
+            }
+            self.operationTask = operationTask
+            self.timeoutTask = timeoutTask
+            lock.unlock()
+        }
+
+        func resolve(_ result: Result<[WorkspaceIngressBarrierSample], Error>) {
+            lock.lock()
+            guard !isResolved else {
+                lock.unlock()
+                return
+            }
+            isResolved = true
+            let continuation = continuation
+            self.continuation = nil
+            if continuation == nil {
+                pendingResult = result
+            }
+            let operationTask = operationTask
+            let timeoutTask = timeoutTask
+            self.operationTask = nil
+            self.timeoutTask = nil
+            lock.unlock()
+
+            operationTask?.cancel()
+            timeoutTask?.cancel()
+            continuation?.resume(with: result)
+        }
+    }
+
     private final class ScopedIngressBarrierFlight {
         let token: UInt64
         let target: ScopedIngressBarrierTarget
@@ -8115,17 +8172,26 @@ actor WorkspaceFileContextStore {
         _ timeout: Duration,
         operation: @escaping @Sendable () async -> [WorkspaceIngressBarrierSample]
     ) async throws -> [WorkspaceIngressBarrierSample] {
-        try await withThrowingTaskGroup(of: [WorkspaceIngressBarrierSample].self) { group in
-            defer { group.cancelAll() }
-            group.addTask {
-                await operation()
+        let race = AppliedIngressTimeoutRace()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                race.install(continuation: continuation)
+                let operationTask = Task {
+                    let samples = await operation()
+                    race.resolve(.success(samples))
+                }
+                let timeoutTask = Task {
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    race.resolve(.failure(WorkspaceAppliedIngressWaitError.timedOut))
+                }
+                race.install(operationTask: operationTask, timeoutTask: timeoutTask)
             }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw WorkspaceAppliedIngressWaitError.timedOut
-            }
-            guard let result = try await group.next() else { return [] }
-            return result
+        } onCancel: {
+            race.resolve(.failure(CancellationError()))
         }
     }
 
@@ -18508,7 +18574,10 @@ actor WorkspaceFileContextStore {
             // already-held root fence, so installing the root fence first would make each side
             // wait for the other. Recheck the root-fence lane after every suspension so competing
             // root mutations remain serialized.
-            await Task.yield()
+            // Do not hot-spin on this actor while retained path-derived work settles. A tight
+            // yield loop can repeatedly reacquire the store executor and starve the explicit
+            // mutation that owns the path fence from reaching its release boundary.
+            try? await Task.sleep(for: .milliseconds(1))
         }
         var didTransferFenceOwnership = false
         defer {
@@ -18654,15 +18723,13 @@ actor WorkspaceFileContextStore {
         }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        guard let codemapFence = await beginCodemapRootMutationFence(
+        let codemapFence = beginCodemapPathFence(
             rootID: rootID,
-            command: .catalogAdvanced
-        ) else {
-            throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
-        }
+            commands: [.modified([standardizedRelativePath])]
+        )
         var didCommitCatalogMutation = false
         defer {
-            finishCodemapRootMutationFence(
+            releaseCodemapPathFence(
                 codemapFence,
                 didCommitMutation: didCommitCatalogMutation
             )
@@ -18670,9 +18737,9 @@ actor WorkspaceFileContextStore {
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
         let result = try await materializeCatalogFileAfterDiskWrite(
             rootID: rootID,
-            relativePath: standardizedRelativePath
+            relativePath: standardizedRelativePath,
+            codemapPathLocalMutation: true
         )
-        await awaitCodemapCleanupFlights(rootIDs: [rootID])
         if case .materialized = result {
             didCommitCatalogMutation = true
         }

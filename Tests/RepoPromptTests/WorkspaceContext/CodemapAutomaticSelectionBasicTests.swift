@@ -56,6 +56,34 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             return XCTFail("Expected the retained codemap invalidation flight to fence demand admission")
         }
 
+        let rootFenceTask = Task {
+            await store.fenceCodemapAuthorityForCheckoutMutation(rootIDs: [loaded.id])
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        let explicitlyCreatedRelativePath = "Sources/Explicit.swift"
+        let explicitlyCreatedURL = root.appendingPathComponent(explicitlyCreatedRelativePath)
+        let createTask = Task {
+            try await store.createFile(
+                rootID: loaded.id,
+                relativePath: explicitlyCreatedRelativePath,
+                content: SwiftFixtureSource.emptyStruct("Explicit")
+            )
+        }
+        var createdBeforeDerivedInvalidationReleased = false
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: explicitlyCreatedURL.path) {
+                createdBeforeDerivedInvalidationReleased = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(
+            createdBeforeDerivedInvalidationReleased,
+            "Explicit create must not wait for publisher-derived codemap convergence"
+        )
+        _ = try await createTask.value
+
         let deleteTask = Task {
             try await store.deleteFile(rootID: loaded.id, relativePath: createdRelativePath)
         }
@@ -74,6 +102,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
 
         await codemapGate.release()
         try await deleteTask.value
+        await rootFenceTask.value
         await store.setCodemapPathInvalidationStageHandlerForTesting(nil)
 
         let refreshed = try await readyArtifactDemand(store: store, forFileID: seed.id)

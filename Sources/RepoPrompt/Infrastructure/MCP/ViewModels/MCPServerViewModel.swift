@@ -5848,13 +5848,13 @@ final class MCPServerViewModel: ObservableObject {
             _ = try await store.awaitAppliedIngressForExplicitRequest(
                 userPath: effectivePath,
                 fallbackScope: lookupContext.rootScope,
-                timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+                timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
             )
             if let effectiveNewPath {
                 _ = try await store.awaitAppliedIngressForExplicitRequest(
                     userPath: effectiveNewPath,
                     fallbackScope: lookupContext.rootScope,
-                    timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+                    timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
                 )
             }
         } catch is WorkspaceAppliedIngressWaitError {

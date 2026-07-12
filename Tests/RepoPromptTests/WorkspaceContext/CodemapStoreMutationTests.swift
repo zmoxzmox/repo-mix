@@ -67,7 +67,7 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
         await store.unloadRoot(id: loaded.id)
     }
 
-    func testCheckoutAndCatalogAdvanceFenceOldAuthorityBeforeSuccessorDemand() async throws {
+    func testCheckoutFencesOldAuthorityAndCreatePreservesUnrelatedSuccessorDemand() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -130,7 +130,9 @@ final class CodemapStoreMutationTests: WorkspaceFileContextStoreCodemapSeamTestS
             relativePath: "Sources/CatalogReplacement.swift",
             content: SwiftFixtureSource.emptyStruct("CatalogReplacement")
         )
-        await assertStale(store.codemapArtifactDemandStatus(successorTicket))
+        guard case .ready = await store.codemapArtifactDemandStatus(successorTicket) else {
+            return XCTFail("A path-local create must preserve unrelated ready codemap authority.")
+        }
         try await assertEngineRootCount(1, fixture: fixture)
         await store.unloadRoot(id: loaded.id)
     }

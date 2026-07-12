@@ -1,8 +1,16 @@
 import MCP
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 final class MCPMutationRetryableFailureTests: XCTestCase {
+    func testMutationFreshnessTimeoutHasHeadroomBeforeBoundedToolWatchdog() {
+        XCTAssertLessThan(
+            MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeoutSeconds,
+            MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds
+        )
+    }
+
     func testMutationScopeFailureClassifiesFailClosedAndMissingWorktreeScopes() async {
         let store = WorkspaceFileContextStore()
 

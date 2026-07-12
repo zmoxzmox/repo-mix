@@ -774,13 +774,10 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        _ = try reconcileLocked(
-            layout: layout,
-            maximumEntries: nil,
-            protectingDigest: name,
-            incomingByteCount: 0,
-            replacedByteCount: 0
-        )
+        // The pre-publication reconciliation above already projected this exact encoded byte
+        // count while holding the same maintenance lock. No competing writer can change quota
+        // authority before this point, so rescanning and decoding the entire manifest store
+        // after the atomic replacement is redundant and can monopolize a cooperative executor.
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
@@ -979,7 +976,13 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
         var scan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: true)
-        let projectionScan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+        let scanMutatedStore = scan.removedTemporaryCount > 0 ||
+            scan.quarantinedCorruptCount > 0 ||
+            scan.removedQuarantineCount > 0 ||
+            scan.prunedShardCount > 0
+        let projectionScan = scanMutatedStore
+            ? try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+            : scan
         if incomingByteCount > 0 {
             hooks.beforeTerminalAuthorityCheck(.publicationQuota)
             guard scanAuthorityIsCurrent(layout: layout, scan: projectionScan) else {
@@ -1041,7 +1044,9 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
 
-        let finalScan = try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
+        let finalScan = evicted == 0
+            ? projectionScan
+            : try scanLocked(layout: layout, maximumEntries: maximumEntries, mutate: false)
         guard scanAuthorityIsCurrent(layout: layout, scan: finalScan) else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
