@@ -2447,6 +2447,37 @@ extension MCPServerViewModel {
         return adjustedLookupContext
     }
 
+    /// Resolves mutation routing and lookup authority together so an inactive,
+    /// persisted Agent tab can hydrate its worktree binding before the mutation
+    /// gate evaluates it. Re-resolving the snapshot after hydration keeps stale or
+    /// superseded routes fail-closed instead of falling back to the visible checkout.
+    @MainActor
+    func resolveMutationFileToolContext(
+        from metadata: RequestMetadata,
+        toolName: String
+    ) async throws -> (
+        resolvedContext: ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        var resolvedContext = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: toolName,
+            policy: .allowLegacyImplicitRouting
+        )
+        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           resolvedContext.snapshot.activeAgentSessionID != nil,
+           case .unhydrated = resolvedContext.snapshot.worktreeBindingState
+        {
+            resolvedContext = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName,
+                policy: .allowLegacyImplicitRouting
+            )
+        }
+        return (resolvedContext, lookupContext)
+    }
+
     @MainActor
     private func fileToolVisibleRootFingerprint() async -> String {
         await promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)

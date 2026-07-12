@@ -8168,6 +8168,44 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// Awaits one shared freshness barrier for every path participating in a single mutation.
+    /// Root IDs are deduplicated before waiting, so a move never spends the preflight timeout
+    /// once for its source and again for its destination.
+    func awaitAppliedIngressForExplicitRequests(
+        userPaths: [String],
+        fallbackScope: WorkspaceLookupRootScope,
+        timeout: Duration
+    ) async throws -> [WorkspaceIngressBarrierSample] {
+        let fallbackRootRefs = rootRefs(scope: fallbackScope)
+        let rootIDs = userPaths.flatMap { userPath in
+            explicitRequestIngressRootIDs(
+                userPath: userPath,
+                fallbackRootRefs: fallbackRootRefs
+            )
+        }
+        return try await awaitAppliedIngressWithTimeout(timeout) { [self] in
+            await awaitAppliedIngress(rootIDs: rootIDs)
+        }
+    }
+
+    private func explicitRequestIngressRootIDs(
+        userPath: String,
+        fallbackRootRefs: [WorkspaceRootRef]
+    ) -> [UUID] {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let standardized = (expanded as NSString).standardizingPath
+        guard standardized.hasPrefix("/") else {
+            return fallbackRootRefs.map(\.id)
+        }
+        let containingRootID = fallbackRootRefs
+            .filter { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) }
+            .max { $0.standardizedFullPath.count < $1.standardizedFullPath.count }?
+            .id
+        return containingRootID.map { [$0] } ?? []
+    }
+
     private func awaitAppliedIngressWithTimeout(
         _ timeout: Duration,
         operation: @escaping @Sendable () async -> [WorkspaceIngressBarrierSample]

@@ -87,10 +87,9 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
             let metadata = await dependencies.captureRequestMetadata()
-            let resolvedContext = try dependencies.resolveTabContextSnapshot(
+            let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(
                 metadata,
-                MCPWindowToolName.applyEdits,
-                MCPServerViewModel.TabContextResolutionPolicy.allowLegacyImplicitRouting
+                MCPWindowToolName.applyEdits
             )
             if !resolvedContext.usesActiveTabCompatibility,
                let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
@@ -99,7 +98,6 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
             if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
                 for: lookupContext,
                 store: dependencies.promptVM.workspaceFileContextStore

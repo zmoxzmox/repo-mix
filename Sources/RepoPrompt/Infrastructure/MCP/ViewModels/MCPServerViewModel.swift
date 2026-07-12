@@ -1321,6 +1321,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return .visibleWorkspace }
             return await resolveFileToolLookupContext(from: metadata)
         },
+        resolveMutationFileToolContext: { [weak self] metadata, toolName in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
+            }
+            return try await resolveMutationFileToolContext(from: metadata, toolName: toolName)
+        },
         stabilizedVirtualSelection: { [weak self] context in
             guard let self else { return context.selection }
             return await stabilizedVirtualSelection(for: context)
@@ -5817,10 +5823,9 @@ final class MCPServerViewModel: ObservableObject {
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
-        var resolvedContext = try resolveTabContextSnapshot(
+        var (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
             from: metadata,
-            toolName: MCPWindowToolName.fileActions,
-            policy: .allowLegacyImplicitRouting
+            toolName: MCPWindowToolName.fileActions
         )
         if !resolvedContext.usesActiveTabCompatibility,
            let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
@@ -5829,7 +5834,6 @@ final class MCPServerViewModel: ObservableObject {
         {
             throw failure
         }
-        let lookupContext = await resolveFileToolLookupContext(from: metadata)
         if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
             for: lookupContext,
             store: promptVM.workspaceFileContextStore
@@ -5845,18 +5849,12 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
         do {
-            _ = try await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectivePath,
+            let mutationPaths = [effectivePath] + (effectiveNewPath.map { [$0] } ?? [])
+            _ = try await store.awaitAppliedIngressForExplicitRequests(
+                userPaths: mutationPaths,
                 fallbackScope: lookupContext.rootScope,
                 timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
             )
-            if let effectiveNewPath {
-                _ = try await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: effectiveNewPath,
-                    fallbackScope: lookupContext.rootScope,
-                    timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
-                )
-            }
         } catch is WorkspaceAppliedIngressWaitError {
             throw MCPMutationRetryableFailure.workspaceFreshnessUnavailable()
         }

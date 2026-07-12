@@ -159,6 +159,13 @@ struct MCPWindowToolDependencies {
     ) async -> FrozenPromptGitReviewContext
     typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
     typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async -> WorkspaceLookupContext
+    typealias ResolveMutationFileToolContext = @MainActor @Sendable (
+        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ toolName: String
+    ) async throws -> (
+        resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    )
     typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPServerViewModel.TabScopedContext) async -> StoredSelection
     typealias BuildCurrentSelectionReply = @MainActor @Sendable (
         _ includeBlocks: Bool,
@@ -350,6 +357,7 @@ struct MCPWindowToolDependencies {
     let workspaceSearch: WorkspaceSearch
     let parseManageSelectionInputs: ParseManageSelectionInputs
     let resolveFileToolLookupContext: ResolveFileToolLookupContext
+    let resolveMutationFileToolContext: ResolveMutationFileToolContext
     let stabilizedVirtualSelection: StabilizedVirtualSelection
     let freezePromptGitReviewContext: FreezePromptGitReviewContext
     let buildCurrentSelectionReply: BuildCurrentSelectionReply
