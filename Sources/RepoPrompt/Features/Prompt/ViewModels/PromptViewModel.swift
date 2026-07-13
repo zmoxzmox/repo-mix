@@ -2803,8 +2803,14 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func closeComposeTab(_ id: UUID) async {
-        await closeComposeTabs(withIDs: [id])
+    func closeComposeTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        await closeComposeTabs(
+            withIDs: [id],
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @MainActor
@@ -3131,11 +3137,15 @@ class PromptViewModel: ObservableObject {
     @Published private(set) var currentStashedTabs: [StashedTab] = []
 
     @MainActor
-    func stashTab(_ id: UUID) async {
+    func stashTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+            isMutationContextCurrent?() ?? true
         else { return }
 
         // Don't allow stashing if it's the last tab
@@ -3146,7 +3156,11 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        await closeComposeTabs(withIDs: [id], reason: .stash)
+        await closeComposeTabs(
+            withIDs: [id],
+            reason: .stash,
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @discardableResult
