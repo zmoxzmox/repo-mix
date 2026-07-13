@@ -350,7 +350,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 scope: lookupContext.rootScope
             )
             let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
-            let targetPaths = Set(workspace.repoPaths.map(StandardizedPath.absolute))
+            let targetPaths = Set(workspace.repoPaths.map {
+                StandardizedPath.absolute(lookupContext.translateInputPath($0))
+            })
             guard !targetPaths.isEmpty, targetPaths.isSubset(of: scopedPaths) else {
                 throw MCPError.invalidParams(
                     "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
