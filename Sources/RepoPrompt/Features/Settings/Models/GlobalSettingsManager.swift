@@ -50,10 +50,30 @@ extension Notification.Name {
 enum AgentModelsSettingsNotification {
     static let scopeKey = "scope"
     static let workspaceIDKey = "workspaceID"
+    static let sourceWorkspaceIDKey = "sourceWorkspaceID"
 
     enum Scope: String {
         case global
         case workspace
+    }
+
+    static func userInfo(
+        scope: AgentModelsEditingScope,
+        sourceWorkspaceID: UUID? = nil
+    ) -> [String: Any] {
+        var userInfo: [String: Any] = switch scope {
+        case .global:
+            [scopeKey: Scope.global.rawValue]
+        case let .workspace(workspaceID):
+            [
+                scopeKey: Scope.workspace.rawValue,
+                workspaceIDKey: workspaceID
+            ]
+        }
+        if let sourceWorkspaceID {
+            userInfo[sourceWorkspaceIDKey] = sourceWorkspaceID
+        }
+        return userInfo
     }
 }
 
@@ -303,6 +323,7 @@ class GlobalSettingsStore: ObservableObject {
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring
+    private let invalidAgentModelsProfileAssertion: (String) -> Void
 
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
@@ -333,10 +354,12 @@ class GlobalSettingsStore: ObservableObject {
 
     init(
         defaults: UserDefaults = .standard,
-        fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore()
+        fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore(),
+        invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
         self.defaults = defaults
         self.fileStore = fileStore
+        self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
         ensureFileSystemGlobalIgnoreDefaultsSeeded()
         reconcilePersistenceBlockDismissal()
@@ -533,7 +556,7 @@ class GlobalSettingsStore: ObservableObject {
             )
         }
         save()
-        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+        postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
     }
 
     func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile? {
@@ -559,7 +582,7 @@ class GlobalSettingsStore: ObservableObject {
             newProfile: normalized
         )
         save()
-        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+        postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
     }
 
     func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile {
@@ -637,15 +660,19 @@ class GlobalSettingsStore: ObservableObject {
         let legacyKey = "contextBuilderModel"
         if let raw = defaults.string(forKey: legacyKey) {
             let next = AIModel.rawValueWithoutOpenAIServiceTier(raw)
-            if next != raw { defaults.set(next, forKey: legacyKey) }
+            if next != raw {
+                defaults.set(next, forKey: legacyKey)
+            }
         }
 
         guard globalChanged || !changedWorkspaceIDs.isEmpty else { return }
         objectWillChange.send()
         save()
-        if globalChanged { postAgentModelsSettingsDidChange(scope: .global) }
+        if globalChanged {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
         for workspaceID in changedWorkspaceIDs {
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+            postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
         }
     }
 
@@ -680,7 +707,7 @@ class GlobalSettingsStore: ObservableObject {
                 newProfile: normalized
             )
             save()
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+            postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
         }
     }
 
@@ -2021,7 +2048,7 @@ class GlobalSettingsStore: ObservableObject {
                 newProfile: normalized
             )
             save()
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+            postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
         }
     }
 
@@ -2046,17 +2073,38 @@ class GlobalSettingsStore: ObservableObject {
         line: UInt = #line,
         function: StaticString = #function
     ) {
+        let invalidSyncTuple = invalidSynchronizedProfileReason(newProfile)
         let workspaceSuffix = workspaceID.map { ".\($0.uuidString)" } ?? ""
         recordSettingsWriteDiagnostic(
             key: "agentModelsProfile.\(scope.rawValue)\(workspaceSuffix)",
             oldValue: agentModelsProfileDiagnosticValue(oldProfile),
             newValue: agentModelsProfileDiagnosticValue(newProfile),
             commit: true,
-            reason: "agent_models.profile.\(scope.rawValue)",
+            reason: invalidSyncTuple.map { "agent_models.profile.invalid_sync.\($0)" }
+                ?? "agent_models.profile.\(scope.rawValue)",
             fileID: fileID,
             line: line,
             function: function
         )
+        if let invalidSyncTuple {
+            invalidAgentModelsProfileAssertion(
+                "Invalid sync-enabled Agent Models profile (\(invalidSyncTuple)): planning and compose must be equal and nonblank"
+            )
+        }
+    }
+
+    private func invalidSynchronizedProfileReason(_ profile: AgentModelsSettingsProfile) -> String? {
+        guard profile.syncChatModelWithOracle else { return nil }
+        switch (profile.planningModelRaw, profile.preferredComposeModelRaw) {
+        case (nil, nil):
+            return "both_blank"
+        case (nil, _), (_, nil):
+            return "one_blank"
+        case let (planning?, compose?) where planning != compose:
+            return "divergent"
+        default:
+            return nil
+        }
     }
 
     private func agentModelsProfileDiagnosticValue(_ profile: AgentModelsSettingsProfile?) -> String? {
@@ -2073,20 +2121,13 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     private func postAgentModelsSettingsDidChange(
-        scope: AgentModelsSettingsNotification.Scope,
-        workspaceID: UUID? = nil,
+        scope: AgentModelsEditingScope,
         notificationCenter: NotificationCenter = .default
     ) {
-        var userInfo: [String: Any] = [
-            AgentModelsSettingsNotification.scopeKey: scope.rawValue
-        ]
-        if let workspaceID {
-            userInfo[AgentModelsSettingsNotification.workspaceIDKey] = workspaceID
-        }
         notificationCenter.post(
             name: .agentModelsSettingsDidChange,
             object: self,
-            userInfo: userInfo
+            userInfo: AgentModelsSettingsNotification.userInfo(scope: scope)
         )
     }
 
@@ -2096,12 +2137,23 @@ class GlobalSettingsStore: ObservableObject {
         let oldGlobalProfile = globalAgentModelsProfile()
         let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
         let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
-        let loadedExistingDocument = fileExists ? try? fileStore.load() : nil
-        let existingFileWasCorrupt = fileExists && loadedExistingDocument == nil
+        var loadedExistingDocument: GlobalSettingsDocument?
+        var shouldSyncTelemetryMirror = false
         if !fileExists {
             defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
-        } else if existingFileWasCorrupt {
-            defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
+        } else {
+            do {
+                loadedExistingDocument = try fileStore.load()
+                shouldSyncTelemetryMirror = true
+            } catch GlobalSettingsFileStore.GlobalSettingsFileStoreError.unsupportedFutureSchema,
+                GlobalSettingsFileStore.GlobalSettingsFileStoreError.incompatibleSchema
+            {
+                if defaults.object(forKey: Self.telemetryEnabledDefaultsKey) == nil {
+                    defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
+                }
+            } catch {
+                defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
+            }
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
         copySettings = document.copySettings
@@ -2113,7 +2165,7 @@ class GlobalSettingsStore: ObservableObject {
         agentModelsSettingsByWorkspaceID = document.agentModelsSettings
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
-        if !existingFileWasCorrupt {
+        if shouldSyncTelemetryMirror {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -2213,7 +2265,7 @@ class GlobalSettingsStore: ObservableObject {
         for workspaceID in workspaceIDs.sorted(by: { $0.uuidString < $1.uuidString })
             where oldWorkspaceSettings[workspaceID] != agentModelsSettingsByWorkspaceID[workspaceID]
         {
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+            postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
         }
     }
 

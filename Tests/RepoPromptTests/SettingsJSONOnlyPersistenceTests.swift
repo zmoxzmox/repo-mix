@@ -188,6 +188,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
+        defaults.set(true, forKey: "telemetry.enabled")
         let store = GlobalSettingsStore(
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(fileURL: fileURL, now: { Date(timeIntervalSince1970: 0) })
@@ -195,6 +196,99 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertFalse(store.telemetryEnabled())
         XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, false)
+    }
+
+    func testBlockedSchemaTelemetryMirrorPreservesExistingValueAndDefaultsAbsentMirrorOff() throws {
+        let blockedDocuments: [(name: String, json: String, reason: GlobalSettingsPersistenceBlockReason)] = [
+            (
+                "future",
+                #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-07-11T00:00:00Z"}"#,
+                .unsupportedFutureSchema(
+                    onDiskVersion: 999,
+                    supportedVersion: GlobalSettingsDocument.currentSchemaVersion
+                )
+            ),
+            (
+                "incompatible",
+                #"{"schemaVersion":4,"updatedAt":"2026-07-11T00:00:00Z"}"#,
+                .incompatibleSchema
+            )
+        ]
+
+        for blocked in blockedDocuments {
+            for priorMirror in [Optional(true), Optional(false), nil] {
+                let temp = try makeTempDirectory()
+                defer { try? FileManager.default.removeItem(at: temp) }
+                let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Data(blocked.json.utf8).write(to: fileURL)
+                let defaults = try makeIsolatedDefaults()
+                if let priorMirror {
+                    defaults.set(priorMirror, forKey: "telemetry.enabled")
+                }
+
+                let store = GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+                )
+                let expected = priorMirror ?? false
+
+                XCTAssertEqual(store.persistenceBlockReason, blocked.reason, blocked.name)
+                XCTAssertEqual(defaults.object(forKey: "telemetry.enabled") as? Bool, expected, blocked.name)
+                XCTAssertEqual(store.telemetryEnabled(), expected, blocked.name)
+                XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), blocked.json, blocked.name)
+            }
+        }
+    }
+
+    func testMissingTelemetrySettingsRemovesStaleMirrorAndUsesBuildDefault() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "telemetry.enabled")
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertNil(defaults.object(forKey: "telemetry.enabled"))
+        #if REPOPROMPT_SENTRY_ENABLED
+            XCTAssertTrue(store.telemetryEnabled())
+        #else
+            XCTAssertFalse(store.telemetryEnabled())
+        #endif
+    }
+
+    func testSuccessfulRecoveryResynchronizesTelemetryMirror() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(
+            #"{"schemaVersion":999,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-07-11T00:00:00Z"}"#.utf8
+        ).write(to: fileURL)
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "telemetry.enabled")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertTrue(store.telemetryEnabled())
+
+        XCTAssertTrue(store.recoverBlockedPersistenceAfterBackup())
+
+        XCTAssertNil(store.persistenceBlockReason)
+        XCTAssertNil(defaults.object(forKey: "telemetry.enabled"))
+        #if REPOPROMPT_SENTRY_ENABLED
+            XCTAssertTrue(store.telemetryEnabled())
+        #else
+            XCTAssertFalse(store.telemetryEnabled())
+        #endif
     }
 
     func testTelemetryJSONValueOverridesStaleEnabledMirror() throws {
@@ -1556,7 +1650,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         store.setGlobalAgentModelsProfile(
             AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: nil,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             ),
             contextBuilderWriteIntent: .preserveExistingOwnership
@@ -1566,7 +1660,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(viewModel.currentBuiltinChatModelName, AIModel.gpt54Pro.displayName)
     }
 
-    func testAgentModelsViewModelBlankBuiltinChatDoesNotMirrorToOracleWhenSynced() throws {
+    func testAgentModelsViewModelClearingSynchronizedModelDisablesSyncWithoutClearingSibling() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
             scalarPreferences: seededScalarPreferences()
@@ -1578,7 +1672,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         store.setGlobalAgentModelsProfile(
             AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             ),
             contextBuilderWriteIntent: .preserveExistingOwnership
@@ -1592,13 +1686,33 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         globalViewModel.setBuiltinChatModel(raw: blankRaw)
 
         XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertNil(store.globalAgentModelsProfile().preferredComposeModelRaw)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let globalOracleViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+        globalOracleViewModel.setOracleModel(raw: blankRaw)
+        XCTAssertNil(store.globalAgentModelsProfile().planningModelRaw)
+        XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
 
         let workspaceID = UUID()
         store.setWorkspaceAgentModelsProfile(
             workspaceID: workspaceID,
             profile: AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
                 syncChatModelWithOracle: true
             )
         )
@@ -1615,6 +1729,116 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(
             store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
             AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw)
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            )
+        )
+        let workspaceOracleViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Scoped blank guard",
+            settingsManager: manager,
+            settingsStore: store
+        )
+        workspaceOracleViewModel.setOracleModel(raw: blankRaw)
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+    }
+
+    func testAgentModelsViewModelRejectsSyncWhenOracleModelIsBlank() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -406, store: store)
+        let globalViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        globalViewModel.syncChatWithOracle = true
+
+        XCTAssertFalse(globalViewModel.syncChatWithOracle)
+        XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
+        let workspaceID = UUID()
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(preferredComposeModelRaw: AIModel.gpt54Pro.rawValue)
+        )
+        let workspaceViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Blank Oracle",
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        workspaceViewModel.syncChatWithOracle = true
+
+        XCTAssertFalse(workspaceViewModel.syncChatWithOracle)
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
+    }
+
+    func testDurableAgentModelsSettersDiagnoseEveryInvalidSynchronizedTuple() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        var assertionMessages: [String] = []
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: fileStore,
+            invalidAgentModelsProfileAssertion: { assertionMessages.append($0) }
+        )
+        let workspaceID = UUID()
+        let invalidProfiles = [
+            AgentModelsSettingsProfile(syncChatModelWithOracle: true),
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                syncChatModelWithOracle: true
+            ),
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                syncChatModelWithOracle: true
+            )
+        ]
+
+        for profile in invalidProfiles {
+            store.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .preserveExistingOwnership
+            )
+            store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        }
+
+        let diagnostics = store.recentSettingsWriteDiagnostics()
+        XCTAssertEqual(assertionMessages.count, 6)
+        XCTAssertEqual(
+            diagnostics.map(\.reason),
+            ["both_blank", "both_blank", "one_blank", "one_blank", "divergent", "divergent"]
+                .map { "agent_models.profile.invalid_sync.\($0)" }
+        )
+        XCTAssertEqual(
+            diagnostics.map(\.key),
+            invalidProfiles.flatMap { _ in
+                ["agentModelsProfile.global", "agentModelsProfile.workspace.\(workspaceID.uuidString)"]
+            }
         )
     }
 
