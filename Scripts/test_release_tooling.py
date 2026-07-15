@@ -1567,6 +1567,35 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertNotIn(token, "\n".join(argv))
         self.assertEqual(token_capture.read_text(encoding="utf-8"), token)
 
+        empty_token_file = temp_dir / "empty-sentry-token"
+        empty_token_file.write_text(" \t\r\n", encoding="utf-8")
+        argv_capture.unlink()
+        token_capture.unlink()
+        for token_file_variable in (
+            "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+            "SENTRY_AUTH_TOKEN_FILE",
+        ):
+            with self.subTest(token_file_variable=token_file_variable):
+                explicit_empty_env = env.copy()
+                explicit_empty_env.pop("REPOPROMPT_SENTRY_AUTH_TOKEN_FILE", None)
+                explicit_empty_env.pop("SENTRY_AUTH_TOKEN_FILE", None)
+                explicit_empty_env[token_file_variable] = str(empty_token_file)
+                empty_result = subprocess.run(
+                    [str(SCRIPT_DIR / "upload_sentry_debug_symbols.sh"), str(symbols)],
+                    env=explicit_empty_env,
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertNotEqual(empty_result.returncode, 0)
+                self.assertEqual(empty_result.stdout, "")
+                self.assertEqual(
+                    empty_result.stderr,
+                    "ERROR: Explicit Sentry auth token file contains no token.\n",
+                )
+                self.assertFalse(argv_capture.exists())
+                self.assertFalse(token_capture.exists())
+
     def run_sentry_prepare_fixture(
         self,
         lookup_mode: str,
