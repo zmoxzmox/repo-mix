@@ -41,7 +41,7 @@ enum ProcessExitStatus: Equatable {
     }
 }
 
-enum ProcessTerminationError: Error, LocalizedError {
+enum ProcessTerminationError: Error, Equatable, LocalizedError {
     case childOwnershipLost(pid: pid_t)
     case waitFailed(String)
 
@@ -414,6 +414,49 @@ enum ProcessTermination {
         if processGroupExists(processGroupID) {
             logger("Process group \(processGroupID) remained after bounded SIGKILL cleanup")
         }
+    }
+
+    /// Applies TERM-to-KILL policy to a child whose sole destructive reap is
+    /// already owned by `ChildProcessExitObserver`. No code in this path calls
+    /// `waitpid`; descendant cleanup starts only after observation settles.
+    static func terminateObservedProcessFamily(
+        observer: ChildProcessExitObserver,
+        processGroupID: pid_t?,
+        sigtermGrace: TimeInterval? = nil,
+        sigkillGrace: TimeInterval? = nil,
+        logger: (String) -> Void = { _ in }
+    ) async {
+        let timing = currentTiming()
+        let termGrace = max(sigtermGrace ?? timing.sigtermGrace, 0)
+        let killGrace = max(sigkillGrace ?? timing.sigkillGrace, 0)
+
+        if await observer.wait(timeout: 0) == nil {
+            _ = observer.signalRootProcessFamilyIfUnreaped(
+                processGroupID: processGroupID,
+                signal: SIGTERM,
+                logger: logger
+            )
+        }
+
+        if await observer.wait(timeout: termGrace) == nil {
+            logger("Process \(observer.pid) did not exit after SIGTERM; sending SIGKILL")
+            _ = observer.signalRootProcessFamilyIfUnreaped(
+                processGroupID: processGroupID,
+                signal: SIGKILL,
+                logger: logger
+            )
+            if await observer.wait(timeout: killGrace) == nil {
+                logger("Process \(observer.pid) has not settled after SIGKILL; awaiting the sole reaper")
+                _ = await observer.wait()
+            }
+        }
+
+        await terminateProcessGroupAfterRootReap(
+            processGroupID: processGroupID,
+            sigtermGrace: termGrace,
+            sigkillGrace: killGrace,
+            logger: logger
+        )
     }
 
     static func waitForTermination(
