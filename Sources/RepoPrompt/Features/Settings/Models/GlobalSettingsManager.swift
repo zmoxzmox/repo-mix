@@ -524,7 +524,8 @@ class GlobalSettingsStore: ObservableObject {
             scope: .global,
             workspaceID: nil,
             oldProfile: oldProfile,
-            newProfile: normalized
+            newProfile: normalized,
+            attemptedProfile: profile
         )
 
         objectWillChange.send()
@@ -579,7 +580,8 @@ class GlobalSettingsStore: ObservableObject {
             scope: .workspace,
             workspaceID: workspaceID,
             oldProfile: oldProfile,
-            newProfile: normalized
+            newProfile: normalized,
+            attemptedProfile: profile
         )
         save()
         postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
@@ -704,7 +706,8 @@ class GlobalSettingsStore: ObservableObject {
                 scope: .workspace,
                 workspaceID: workspaceID,
                 oldProfile: oldProfile,
-                newProfile: normalized
+                newProfile: normalized,
+                attemptedProfile: profile
             )
             save()
             postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
@@ -969,19 +972,21 @@ class GlobalSettingsStore: ObservableObject {
         let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
         let oldPlanning = scalarPreferences.modelSelection?.planningModel
-        let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
-        // Never let a blank chat model blank the Oracle. An empty/nil preferred value is
-        // produced by transient fallbacks (e.g. PromptViewModel.pickDiffCapableFallback when
-        // the model list is unhydrated); mirroring it would wipe the global Oracle planningModel
-        // — which is deliberately never auto-healed — and persist the blank across relaunch.
-        // Only mirror real model selections; the chat model can re-heal itself, the Oracle cannot.
-        // Treat whitespace-only as blank too — these raw values can arrive from the MCP/app_settings
-        // API, not just picker-backed AIModel.rawValue.
-        let shouldMirrorModel = shouldMirror && (raw?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        let wasSynchronized = resolvedSyncChatModelWithOracleFromCurrentPreferences()
+        let hasModel = Self.trimmedNonEmptyModelRaw(raw) != nil
+        let shouldMirror = honorSync && wasSynchronized && hasModel
         updateModelSelectionScalar(commit: commit) { settings in
             settings.preferredComposeModel = raw
-            if shouldMirrorModel {
+            if shouldMirror {
                 settings.planningModel = raw
+            }
+            if settings.syncChatModelWithOracle == true,
+               !Self.isValidSynchronizedModelTuple(
+                   planning: settings.planningModel,
+                   compose: settings.preferredComposeModel
+               )
+            {
+                settings.syncChatModelWithOracle = false
             }
         }
         recordSettingsWriteDiagnostic(
@@ -994,7 +999,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        if shouldMirrorModel, oldPlanning != raw {
+        if shouldMirror, oldPlanning != raw {
             recordSettingsWriteDiagnostic(
                 key: "planningModelRaw",
                 oldValue: oldPlanning,
@@ -1027,11 +1032,21 @@ class GlobalSettingsStore: ObservableObject {
         let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldPlanning = scalarPreferences.modelSelection?.planningModel
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
-        let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
+        let wasSynchronized = resolvedSyncChatModelWithOracleFromCurrentPreferences()
+        let hasModel = Self.trimmedNonEmptyModelRaw(raw) != nil
+        let shouldMirror = honorSync && wasSynchronized && hasModel
         updateModelSelectionScalar(commit: commit) { settings in
             settings.planningModel = raw
             if shouldMirror {
                 settings.preferredComposeModel = raw
+            }
+            if settings.syncChatModelWithOracle == true,
+               !Self.isValidSynchronizedModelTuple(
+                   planning: settings.planningModel,
+                   compose: settings.preferredComposeModel
+               )
+            {
+                settings.syncChatModelWithOracle = false
             }
         }
         recordSettingsWriteDiagnostic(
@@ -1069,7 +1084,6 @@ class GlobalSettingsStore: ObservableObject {
         _ enabled: Bool,
         commit: Bool = true,
         reason: String? = nil,
-        snapOnEnableToPlanning: Bool = false,
         fileID: StaticString = #fileID,
         line: UInt = #line,
         function: StaticString = #function
@@ -1077,10 +1091,11 @@ class GlobalSettingsStore: ObservableObject {
         let oldAgentModelsProfile = globalAgentModelsProfile()
         let oldStoredValue = scalarPreferences.modelSelection?.syncChatModelWithOracle.map(String.init)
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
-        let planning = scalarPreferences.modelSelection?.planningModel ?? ""
-        let shouldSnap = enabled && snapOnEnableToPlanning && !planning.isEmpty && planning != oldPreferred
+        let planning = scalarPreferences.modelSelection?.planningModel
+        let canEnable = enabled && Self.trimmedNonEmptyModelRaw(planning) != nil
+        let shouldSnap = canEnable && planning != oldPreferred
         updateModelSelectionScalar(commit: commit) { settings in
-            settings.syncChatModelWithOracle = enabled
+            settings.syncChatModelWithOracle = canEnable
             if shouldSnap {
                 settings.preferredComposeModel = planning
             }
@@ -1088,7 +1103,7 @@ class GlobalSettingsStore: ObservableObject {
         recordSettingsWriteDiagnostic(
             key: "syncChatModelWithOracle",
             oldValue: oldStoredValue,
-            newValue: String(enabled),
+            newValue: String(canEnable),
             commit: commit,
             reason: reason,
             fileID: fileID,
@@ -2045,7 +2060,8 @@ class GlobalSettingsStore: ObservableObject {
                 scope: .workspace,
                 workspaceID: workspaceID,
                 oldProfile: oldProfile,
-                newProfile: normalized
+                newProfile: normalized,
+                attemptedProfile: profile
             )
             save()
             postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
@@ -2053,7 +2069,7 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
-        AgentModelsSettingsProfile(
+        var normalized = AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
@@ -2062,6 +2078,13 @@ class GlobalSettingsStore: ObservableObject {
             mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
             restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels
         )
+        if let invalidReason = invalidSynchronizedProfileReason(normalized) {
+            invalidAgentModelsProfileAssertion(
+                "Invalid sync-enabled Agent Models profile (\(invalidReason)): planning and compose must be equal and nonblank"
+            )
+            normalized.syncChatModelWithOracle = false
+        }
+        return normalized
     }
 
     private func recordAgentModelsProfileWriteDiagnostic(
@@ -2069,11 +2092,13 @@ class GlobalSettingsStore: ObservableObject {
         workspaceID: UUID?,
         oldProfile: AgentModelsSettingsProfile?,
         newProfile: AgentModelsSettingsProfile,
+        attemptedProfile: AgentModelsSettingsProfile? = nil,
         fileID: StaticString = #fileID,
         line: UInt = #line,
         function: StaticString = #function
     ) {
-        let invalidSyncTuple = invalidSynchronizedProfileReason(newProfile)
+        let invalidSyncTuple = attemptedProfile.flatMap { invalidSynchronizedProfileReason($0) }
+            ?? invalidSynchronizedProfileReason(newProfile)
         let workspaceSuffix = workspaceID.map { ".\($0.uuidString)" } ?? ""
         recordSettingsWriteDiagnostic(
             key: "agentModelsProfile.\(scope.rawValue)\(workspaceSuffix)",
@@ -2086,11 +2111,6 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        if let invalidSyncTuple {
-            invalidAgentModelsProfileAssertion(
-                "Invalid sync-enabled Agent Models profile (\(invalidSyncTuple)): planning and compose must be equal and nonblank"
-            )
-        }
     }
 
     private func invalidSynchronizedProfileReason(_ profile: AgentModelsSettingsProfile) -> String? {
@@ -2165,11 +2185,15 @@ class GlobalSettingsStore: ObservableObject {
         agentModelsSettingsByWorkspaceID = document.agentModelsSettings
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+        let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
         if shouldSyncTelemetryMirror {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
+        if disabledInvalidSync, loadedExistingDocument != nil, persistenceBlockReason == nil {
+            save()
+        }
         if notifyAgentModelsChanges {
             postInstalledAgentModelsChanges(
                 oldGlobalProfile: oldGlobalProfile,
@@ -2234,9 +2258,13 @@ class GlobalSettingsStore: ObservableObject {
             agentModelsSettingsByWorkspaceID = document.agentModelsSettings
             globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+            let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
+            if disabledInvalidSync, persistenceBlockReason == nil {
+                save()
+            }
             postInstalledAgentModelsChanges(
                 oldGlobalProfile: oldGlobalProfile,
                 oldWorkspaceSettings: oldWorkspaceSettings
@@ -2252,6 +2280,41 @@ class GlobalSettingsStore: ObservableObject {
             print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
             return false
         }
+    }
+
+    /// Disables invalid persisted sync flags without changing either stored model raw.
+    /// This runs only after a document has passed the file store's schema/lineage checks;
+    /// callers decide whether that compatible load may be repaired on disk.
+    @discardableResult
+    private func disableInvalidLoadedAgentModelsSyncState() -> Bool {
+        var changed = false
+
+        if var modelSelection = scalarPreferences.modelSelection,
+           modelSelection.syncChatModelWithOracle == true,
+           !Self.isValidSynchronizedModelTuple(
+               planning: modelSelection.planningModel,
+               compose: modelSelection.preferredComposeModel
+           )
+        {
+            modelSelection.syncChatModelWithOracle = false
+            scalarPreferences.modelSelection = modelSelection
+            changed = true
+        }
+
+        for workspaceID in agentModelsSettingsByWorkspaceID.keys {
+            guard var settings = agentModelsSettingsByWorkspaceID[workspaceID],
+                  var profile = settings.profile,
+                  invalidSynchronizedProfileReason(profile) != nil
+            else {
+                continue
+            }
+            profile.syncChatModelWithOracle = false
+            settings.profile = profile
+            agentModelsSettingsByWorkspaceID[workspaceID] = settings
+            changed = true
+        }
+
+        return changed
     }
 
     private func postInstalledAgentModelsChanges(
@@ -2378,12 +2441,30 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     private func resolvedSyncChatModelWithOracleFromCurrentPreferences() -> Bool {
+        let planning = scalarPreferences.modelSelection?.planningModel
+        let compose = scalarPreferences.modelSelection?.preferredComposeModel
         if let stored = scalarPreferences.modelSelection?.syncChatModelWithOracle {
-            return stored
+            return stored && Self.isValidSynchronizedModelTuple(planning: planning, compose: compose)
         }
-        let planning = scalarPreferences.modelSelection?.planningModel ?? ""
-        let compose = scalarPreferences.modelSelection?.preferredComposeModel ?? ""
-        return !planning.isEmpty && planning == compose
+        return Self.isValidSynchronizedModelTuple(planning: planning, compose: compose)
+    }
+
+    private static func isValidSynchronizedModelTuple(planning: String?, compose: String?) -> Bool {
+        guard let planning = trimmedNonEmptyModelRaw(planning),
+              let compose = trimmedNonEmptyModelRaw(compose)
+        else {
+            return false
+        }
+        return planning == compose
+    }
+
+    private static func trimmedNonEmptyModelRaw(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else {
+            return nil
+        }
+        return trimmed
     }
 
     private func syncSiblingReason(from reason: String?) -> String? {

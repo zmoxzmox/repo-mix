@@ -1502,6 +1502,84 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertFalse(saved.copySettings.isEmpty)
     }
 
+    func testInvalidSynchronizedAgentModelsStateRepairsGlobalAndDormantWorkspaceProfiles() throws {
+        let invalidTuples: [(planning: String?, compose: String?)] = [
+            (nil, nil),
+            (AIModel.gpt54Pro.rawValue, nil),
+            (AIModel.gpt54Pro.rawValue, AIModel.claude4Sonnet.rawValue)
+        ]
+
+        for tuple in invalidTuples {
+            let temp = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+            let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+            let dormantWorkspaceID = UUID()
+            let workspaceProfile = AgentModelsSettingsProfile(
+                planningModelRaw: tuple.planning,
+                preferredComposeModelRaw: tuple.compose,
+                syncChatModelWithOracle: true
+            )
+            let invalidDocument = GlobalSettingsDocument(
+                agentModelsSettings: [
+                    dormantWorkspaceID: WorkspaceAgentModelsSettings(
+                        inheritanceMode: .useGlobalSettings,
+                        profile: workspaceProfile
+                    )
+                ],
+                scalarPreferences: seededScalarPreferences(modelSelection: .init(
+                    preferredComposeModel: tuple.compose,
+                    planningModel: tuple.planning,
+                    syncChatModelWithOracle: true
+                ))
+            )
+            try fileStore.save(invalidDocument)
+
+            let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+            XCTAssertEqual(store.planningModelRaw(), tuple.planning)
+            XCTAssertEqual(store.preferredComposeModelRaw(), tuple.compose)
+            XCTAssertFalse(store.syncChatModelWithOracle())
+            let repairedWorkspace = try XCTUnwrap(store.workspaceAgentModelsProfile(for: dormantWorkspaceID))
+            XCTAssertEqual(repairedWorkspace.planningModelRaw, tuple.planning)
+            XCTAssertEqual(repairedWorkspace.preferredComposeModelRaw, tuple.compose)
+            XCTAssertFalse(repairedWorkspace.syncChatModelWithOracle)
+
+            store.setShowDatesInMessageTimestamps(true)
+
+            let saved = try fileStore.load()
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.planningModel, tuple.planning)
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.preferredComposeModel, tuple.compose)
+            XCTAssertEqual(saved.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.inheritanceMode, .useGlobalSettings)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.planningModelRaw, tuple.planning)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.preferredComposeModelRaw, tuple.compose)
+            XCTAssertEqual(saved.agentModelsSettings[dormantWorkspaceID]?.profile?.syncChatModelWithOracle, false)
+
+            let bytesAfterUnrelatedSave = try Data(contentsOf: fileURL)
+            let reloaded = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+            XCTAssertEqual(reloaded.planningModelRaw(), tuple.planning)
+            XCTAssertEqual(reloaded.preferredComposeModelRaw(), tuple.compose)
+            XCTAssertFalse(reloaded.syncChatModelWithOracle())
+            XCTAssertEqual(
+                reloaded.workspaceAgentModelsProfile(for: dormantWorkspaceID)?.syncChatModelWithOracle,
+                false
+            )
+            XCTAssertEqual(try Data(contentsOf: fileURL), bytesAfterUnrelatedSave)
+
+            try fileStore.save(invalidDocument)
+            XCTAssertTrue(reloaded.reloadFromDisk())
+            let repairedAfterReload = try fileStore.load()
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.planningModel, tuple.planning)
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.preferredComposeModel, tuple.compose)
+            XCTAssertEqual(repairedAfterReload.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+            XCTAssertEqual(
+                repairedAfterReload.agentModelsSettings[dormantWorkspaceID]?.profile?.syncChatModelWithOracle,
+                false
+            )
+        }
+    }
+
     func testAgentModelsProfilePreservesUnknownContextBuilderProviderAndModelRawValues() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -1562,7 +1640,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         store.setPlanningModelRaw(AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(recorder.snapshot().count, 5)
-        store.setPreferredComposeModelRaw(AIModel.claude4Sonnet.rawValue)
+        store.setPreferredComposeModelRaw(AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(recorder.snapshot().count, 5)
         store.setSyncChatModelWithOracle(true)
         XCTAssertEqual(recorder.snapshot().count, 5)
@@ -1794,7 +1872,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle, false)
     }
 
-    func testDurableAgentModelsSettersDiagnoseEveryInvalidSynchronizedTuple() throws {
+    func testDurableAgentModelsSettersDisableEveryInvalidSynchronizedTuple() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
             scalarPreferences: seededScalarPreferences()
@@ -1824,21 +1902,76 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                 profile,
                 contextBuilderWriteIntent: .preserveExistingOwnership
             )
+            XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, profile.planningModelRaw)
+            XCTAssertEqual(
+                store.globalAgentModelsProfile().preferredComposeModelRaw,
+                profile.preferredComposeModelRaw
+            )
+            XCTAssertFalse(store.globalAgentModelsProfile().syncChatModelWithOracle)
+
             store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+                profile.planningModelRaw
+            )
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.preferredComposeModelRaw,
+                profile.preferredComposeModelRaw
+            )
+            XCTAssertEqual(
+                store.workspaceAgentModelsProfile(for: workspaceID)?.syncChatModelWithOracle,
+                false
+            )
         }
 
         let diagnostics = store.recentSettingsWriteDiagnostics()
-        XCTAssertEqual(assertionMessages.count, 6)
         XCTAssertEqual(
             diagnostics.map(\.reason),
             ["both_blank", "both_blank", "one_blank", "one_blank", "divergent", "divergent"]
                 .map { "agent_models.profile.invalid_sync.\($0)" }
         )
+        XCTAssertEqual(assertionMessages.count, 6)
+        for reason in ["both_blank", "one_blank", "divergent"] {
+            XCTAssertEqual(assertionMessages.count(where: { $0.contains(reason) }), 2)
+        }
+    }
+
+    func testLegacyScalarModelSettersPreserveSiblingAndRejectInvalidSync() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let model = AIModel.gpt54Pro.rawValue
+        let synchronized = AgentModelsSettingsProfile(
+            planningModelRaw: model,
+            preferredComposeModelRaw: model,
+            syncChatModelWithOracle: true
+        )
+
+        store.setGlobalAgentModelsProfile(
+            synchronized,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setPreferredComposeModelRaw(nil, honorSync: true)
+        XCTAssertEqual(store.planningModelRaw(), model)
+        XCTAssertNil(store.preferredComposeModelRaw())
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        store.setGlobalAgentModelsProfile(
+            synchronized,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setPlanningModelRaw(nil, honorSync: true)
+        XCTAssertNil(store.planningModelRaw())
+        XCTAssertEqual(store.preferredComposeModelRaw(), model)
+        XCTAssertFalse(store.syncChatModelWithOracle())
+
+        store.setSyncChatModelWithOracle(true)
+        XCTAssertFalse(store.syncChatModelWithOracle())
         XCTAssertEqual(
-            diagnostics.map(\.key),
-            invalidProfiles.flatMap { _ in
-                ["agentModelsProfile.global", "agentModelsProfile.workspace.\(workspaceID.uuidString)"]
-            }
+            fileStore.document.scalarPreferences?.modelSelection?.syncChatModelWithOracle,
+            false
         )
     }
 
