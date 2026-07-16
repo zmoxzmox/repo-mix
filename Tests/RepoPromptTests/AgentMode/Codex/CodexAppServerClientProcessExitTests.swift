@@ -53,6 +53,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             stderrReleaseURL: stderrReleaseURL
         )
         let expectedPIDEvents = ExpectedAgentPIDEventRecorder()
+        let outcomePublicationGate = ChildExitOutcomePublicationGate()
         let registrar = CodexAppServerClient.ExpectedAgentPIDRegistrar(
             register: { pid, clientName, runID in
                 await expectedPIDEvents.recordRegister(pid: pid, clientName: clientName, runID: runID)
@@ -65,8 +66,18 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             executable: executable,
             launchDirectory: directory,
             timeout: 5,
+            processExitObserverFactory: { pid in
+                ChildProcessExitObserver(
+                    pid: pid,
+                    beforePublishingOutcome: { outcomePublicationGate.hold($0) }
+                )
+            },
             expectedAgentPIDRegistrar: registrar
         )
+        addTeardownBlock {
+            outcomePublicationGate.release()
+            await client.stop()
+        }
         await client.setExpectedAgentPIDRegistration(.init(clientName: "test-client", runID: UUID()))
         let startupCompletion = CompletionFlag()
         let startup = Task {
@@ -78,7 +89,33 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
                 throw error
             }
         }
-        try await waitUntil(timeout: 2) {
+        let deadline = CodexProcessExitTestDeadline(timeout: 5)
+        guard await outcomePublicationGate.waitUntilHolding(timeout: deadline.remaining) else {
+            let debugProcessID = await client.debugProcessID()
+            let observerPresent = await client.debugProcessExitObserver() != nil
+            let terminalProbe = debugProcessID.map {
+                ProcessTermination.childIsTerminalOrAlreadyReaped($0)
+            }
+            let terminalObserverJoinCount = await client.debugTerminalObserverJoinCount()
+            throw WaitUntilError.timedOut(
+                "child exit outcome publication gate " +
+                    "(debugProcessID: \(String(describing: debugProcessID)), " +
+                    "observerPresent: \(observerPresent), " +
+                    "terminalProbe: \(String(describing: terminalProbe)), " +
+                    "terminalObserverJoinCount: \(terminalObserverJoinCount))"
+            )
+        }
+        let heldObserverValue = await client.debugProcessExitObserver()
+        let heldObserver = try XCTUnwrap(heldObserverValue)
+        XCTAssertNil(heldObserver.signalRootProcessFamilyIfUnreaped(processGroupID: nil, signal: 0))
+        try await waitUntil("terminal observer join after settlement timeout", timeout: deadline.remaining) {
+            await client.debugTerminalObserverJoinCount() == 1
+        }
+        let startupCompletedWhileOutcomeWasHeld = await startupCompletion.isComplete
+        XCTAssertFalse(startupCompletedWhileOutcomeWasHeld)
+        outcomePublicationGate.release()
+
+        try await waitUntil("typed exit-23 transport claim", timeout: deadline.remaining) {
             guard case .observedProcessExit(status: .exited(code: 23)) =
                 await client.debugLastTransportTerminationReason()
             else {
@@ -86,7 +123,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             }
             return true
         }
-        try await waitUntil(timeout: 1) {
+        try await waitUntil("expected PID clear", timeout: deadline.remaining) {
             await expectedPIDEvents.clearCount == 1
         }
         let registrationCount = await expectedPIDEvents.registerCount
@@ -124,6 +161,28 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         XCTAssertNil(activePID)
         XCTAssertNil(activeObserver)
         XCTAssertEqual(clearCount, 1)
+    }
+
+    func testStartupStdoutEOFWhileRootLivesKeepsGenericFailure() async throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeLiveAfterStdoutEOFServer(in: directory)
+        let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        addTeardownBlock {
+            await client.stop()
+        }
+
+        do {
+            try await client.startIfNeeded()
+            XCTFail("The stdout-closed fixture must fail startup")
+        } catch CodexAppServerClient.ClientError.processNotRunning {
+            // The root is still live at EOF, so no typed exit exists to preserve.
+        } catch {
+            XCTFail("Expected generic processNotRunning, got \(error)")
+        }
+
+        let terminationReason = await client.debugLastTransportTerminationReason()
+        XCTAssertEqual(terminationReason, .stdoutEOF)
+        await client.stop()
     }
 
     func testStartupSignalExitKeepsSignalSemanticsAndOmitsEmptyStderr() async throws {
@@ -224,6 +283,9 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executable = try makePersistentServer(in: directory, recordURL: recordURL)
         let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        addTeardownBlock {
+            await client.stop()
+        }
         try await client.startIfNeeded()
         let generation = await client.debugTransportGeneration()
         let invalidLine = Data("not-json".utf8)
@@ -231,7 +293,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         for _ in 0 ... CodexAppServerClient.debugMaxDecodeRecoveryAttemptsPerGeneration() {
             await client.debugIngestRawStdoutLine(invalidLine)
         }
-        try await waitUntil(timeout: 2) {
+        try await waitUntil("decode recovery teardown", timeout: 2) {
             await !(client.debugIsProcessRunning())
         }
 
@@ -319,8 +381,14 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             timeout: 5,
             processSpawnPreparation: { await spawnPreparation.prepare() }
         )
+        let restartTaskCleanup = ThrowingTaskCleanup()
+        addTeardownBlock {
+            await spawnPreparation.release()
+            await client.stop()
+            await restartTaskCleanup.finish()
+        }
         try await client.startIfNeeded()
-        try await waitUntil(timeout: 2) {
+        try await waitUntil("initial spawn count", timeout: 2) {
             (try? String(contentsOf: spawnCountURL, encoding: .utf8)) == "1"
         }
         await client.stop()
@@ -328,7 +396,8 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         let restart = Task {
             try await client.startIfNeeded()
         }
-        try await waitUntil(timeout: 2) {
+        await restartTaskCleanup.track(restart)
+        try await waitUntil("restart preparation gate", timeout: 2) {
             await spawnPreparation.isBlocked
         }
         await client.stop()
@@ -397,10 +466,14 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         launchDirectory: URL,
         timeout: TimeInterval,
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
+        processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
+            ChildProcessExitObserver(pid: $0)
+        },
         expectedAgentPIDRegistrar: CodexAppServerClient.ExpectedAgentPIDRegistrar = .serverNetworkManager
     ) async throws -> CodexAppServerClient {
         let client = CodexAppServerClient(
             processSpawnPreparation: processSpawnPreparation,
+            processExitObserverFactory: processExitObserverFactory,
             expectedAgentPIDRegistrar: expectedAgentPIDRegistrar
         )
         await client.updateConfig(.init(
@@ -493,6 +566,22 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         return try writeExecutable(script, to: executable)
     }
 
+    private func makeLiveAfterStdoutEOFServer(in directory: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("live-after-stdout-eof-codex")
+        let script = """
+        #!/usr/bin/env python3
+        import os
+        import sys
+        import time
+
+        sys.stdin.readline()
+        os.close(1)
+        while True:
+            time.sleep(1)
+        """
+        return try writeExecutable(script, to: executable)
+    }
+
     private func makePersistentServer(
         in directory: URL,
         recordURL: URL,
@@ -564,7 +653,18 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         XCTFail("Timed out waiting for \(method)")
     }
 
+    private enum WaitUntilError: LocalizedError {
+        case timedOut(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .timedOut(label): "Timed out waiting for \(label)"
+            }
+        }
+    }
+
     private func waitUntil(
+        _ label: String,
         timeout: TimeInterval,
         condition: @escaping () async -> Bool
     ) async throws {
@@ -573,7 +673,70 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             if await condition() { return }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTFail("Timed out waiting for condition")
+        throw WaitUntilError.timedOut(label)
+    }
+}
+
+private struct CodexProcessExitTestDeadline {
+    private let expiration: TimeInterval
+
+    init(timeout: TimeInterval) {
+        expiration = ProcessInfo.processInfo.systemUptime + max(timeout, 0)
+    }
+
+    var remaining: TimeInterval {
+        max(0, expiration - ProcessInfo.processInfo.systemUptime)
+    }
+}
+
+private final class ChildExitOutcomePublicationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let holdingSemaphore = DispatchSemaphore(value: 0)
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var released = false
+
+    func hold(_: ChildProcessExitObserver.Outcome) {
+        lock.lock()
+        let shouldWait = !released
+        lock.unlock()
+        holdingSemaphore.signal()
+        if shouldWait {
+            releaseSemaphore.wait()
+        }
+    }
+
+    func waitUntilHolding(timeout: TimeInterval) async -> Bool {
+        let timeout = DispatchTime.now() + max(timeout, 0)
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [holdingSemaphore] in
+                continuation.resume(returning: holdingSemaphore.wait(timeout: timeout) == .success)
+            }
+        }
+    }
+
+    func release() {
+        lock.lock()
+        guard !released else {
+            lock.unlock()
+            return
+        }
+        released = true
+        lock.unlock()
+        releaseSemaphore.signal()
+    }
+}
+
+private actor ThrowingTaskCleanup {
+    private var task: Task<Void, Error>?
+
+    func track(_ task: Task<Void, Error>) {
+        self.task = task
+    }
+
+    func finish() async {
+        guard let task else { return }
+        _ = try? await task.value
+        self.task = nil
     }
 }
 

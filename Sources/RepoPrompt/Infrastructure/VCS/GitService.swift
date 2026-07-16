@@ -7207,8 +7207,8 @@ actor GitService {
                     }
                 }
 
-                // Blocking waitpid runs on ProcessTermination's dedicated
-                // queue. This task remains the sole reaping authority.
+                // ProcessTermination retains cancellation-independent ownership
+                // until the child-exit source performs the sole destructive reap.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool
@@ -7602,8 +7602,8 @@ actor GitService {
                     }
                 }
 
-                // Blocking waitpid runs on ProcessTermination's dedicated
-                // queue. This task remains the sole reaping authority.
+                // ProcessTermination retains cancellation-independent ownership
+                // until the child-exit source performs the sole destructive reap.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool

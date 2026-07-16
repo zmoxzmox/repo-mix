@@ -1,9 +1,10 @@
 import Darwin
+import Dispatch
 import Foundation
 
 /// One cancellation-independent owner for a direct child's destructive reap.
-/// Callers may wait repeatedly, but only the detached observation task invokes
-/// `waitpid` through `ProcessTermination.reapChildStatus`.
+/// Callers may wait repeatedly, but only the callback-based observation invokes
+/// `waitpid` through `ProcessTermination.observeChildStatus`.
 final class ChildProcessExitObserver: @unchecked Sendable {
     enum Outcome: Equatable {
         case exited(ProcessExitStatus)
@@ -29,8 +30,8 @@ final class ChildProcessExitObserver: @unchecked Sendable {
                 return
             }
             self.outcome = outcome
-            // An ownership failure also closes PID signaling. Another reaper may
-            // already have consumed the child, so a PID fallback is no longer safe.
+            // Keep publication idempotently closed to PID signaling even if a
+            // future result path reaches finish without the callback boundary.
             rootReaped = true
             let continuations = waiters.values
             waiters.removeAll()
@@ -81,26 +82,33 @@ final class ChildProcessExitObserver: @unchecked Sendable {
 
     let pid: pid_t
     private let state: State
+    private static let outcomePublicationQueue = DispatchQueue(
+        label: "com.repoprompt.child-process-exit-observer.outcome-publication",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
-    init(pid: pid_t) {
+    init(
+        pid: pid_t,
+        beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void = { _ in }
+    ) {
         self.pid = pid
         let state = State()
         self.state = state
 
-        Task.detached {
-            let outcome: Outcome
-            do {
-                let status = try await ProcessTermination.reapChildStatus(
-                    pid: pid,
-                    onReaped: { state.markRootReaped() }
-                )
-                outcome = .exited(status)
-            } catch let error as ProcessTerminationError {
-                outcome = .failed(error)
-            } catch {
-                outcome = .failed(.waitFailed(error.localizedDescription))
+        ProcessTermination.observeChildStatus(pid: pid) { result in
+            state.markRootReaped()
+            let outcome: Outcome = switch result {
+            case let .success(status): .exited(status)
+            case let .failure(error): .failed(error)
             }
-            state.finish(with: outcome)
+            // Publication hooks may deliberately block for diagnostics. Keep
+            // them off the serial reaper registry so unrelated children can
+            // continue closing their ownership windows and publishing exits.
+            Self.outcomePublicationQueue.async {
+                beforePublishingOutcome(outcome)
+                state.finish(with: outcome)
+            }
         }
     }
 
@@ -108,9 +116,9 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         await state.wait(timeout: timeout)
     }
 
-    /// Signals only while this observer still owns an unreaped root PID. Holding
-    /// the same lock used by `onReaped` closes the lifecycle signaling window at
-    /// the sole-reaper boundary rather than after actor scheduling.
+    /// Signals only while this observer still owns an unreaped root PID. The
+    /// callback closes this lock-protected window immediately after waitpid,
+    /// before diagnostic outcome publication can block or change executors.
     func signalRootProcessFamilyIfUnreaped(
         processGroupID: pid_t?,
         signal: Int32,

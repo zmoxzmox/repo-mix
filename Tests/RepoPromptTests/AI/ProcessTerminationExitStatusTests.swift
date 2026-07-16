@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -98,6 +99,70 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         }
     }
 
+    func testBlockedOutcomePublicationDoesNotDelayAnotherChildReap() async throws {
+        let gate = BlockedOutcomePublicationGate()
+        let cleanup = BlockedOutcomePublicationCleanup(gate: gate)
+        addTeardownBlock {
+            await cleanup.run()
+        }
+        let deadline = ProcessTerminationTestDeadline(timeout: 5)
+
+        let childA = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 17"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        let observerA = ChildProcessExitObserver(
+            pid: childA.pid,
+            beforePublishingOutcome: { gate.hold($0) }
+        )
+        await cleanup.track(childA, observer: observerA)
+        closeFixtureHandles(childA)
+
+        guard await gate.waitUntilHolding(timeout: deadline.remaining) else {
+            XCTFail("Timed out waiting for child A's outcome publication gate")
+            return
+        }
+        XCTAssertNil(
+            observerA.signalRootProcessFamilyIfUnreaped(
+                processGroupID: childA.processGroupID,
+                signal: 0
+            )
+        )
+        let heldOutcomeBeforeChildB = await observerA.wait(timeout: 0)
+        XCTAssertNil(heldOutcomeBeforeChildB)
+
+        let childB = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 23"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        let observerB = ChildProcessExitObserver(pid: childB.pid)
+        await cleanup.track(childB, observer: observerB)
+        closeFixtureHandles(childB)
+
+        guard let outcomeB = await observerB.wait(timeout: deadline.remaining) else {
+            XCTFail("Timed out waiting for child B while child A publication remained gated")
+            return
+        }
+        XCTAssertEqual(outcomeB, .exited(.exited(code: 23)))
+        assertAlreadyReaped(childB.pid)
+        let heldOutcomeAfterChildB = await observerA.wait(timeout: 0)
+        XCTAssertNil(heldOutcomeAfterChildB)
+
+        gate.release()
+        guard let outcomeA = await observerA.wait(timeout: deadline.remaining) else {
+            XCTFail("Timed out waiting for child A after releasing its publication gate")
+            return
+        }
+        XCTAssertEqual(outcomeA, .exited(.exited(code: 17)))
+        assertAlreadyReaped(childA.pid)
+
+        await cleanup.run()
+    }
+
     func testChildProcessExitObserverSharesOneDetailedReap() async throws {
         let spawned = try ProcessLauncher.spawn(
             command: "/bin/sh",
@@ -119,6 +184,31 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         } catch let error as ProcessTerminationError {
             XCTAssertEqual(error, .childOwnershipLost(pid: spawned.pid))
         }
+    }
+
+    func testTerminalChildProbeDoesNotConsumeExitStatus() async throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 31"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        spawned.stdin?.closeFile()
+
+        let deadline = Date().addingTimeInterval(2)
+        var observedTerminalStatus = false
+        while Date() < deadline {
+            if ProcessTermination.childIsTerminalOrAlreadyReaped(spawned.pid) {
+                observedTerminalStatus = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        let status = try await ProcessTermination.reapChildStatus(pid: spawned.pid)
+        XCTAssertTrue(observedTerminalStatus)
+        XCTAssertEqual(status, .exited(code: 31))
+        XCTAssertTrue(ProcessTermination.childIsTerminalOrAlreadyReaped(spawned.pid))
     }
 
     func testObservedTerminationEscalatesBeforeGroupOnlyCleanup() async throws {
@@ -237,6 +327,119 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return kill(pid, 0) == -1 && errno == ESRCH
+    }
+
+    private func closeFixtureHandles(_ spawned: SpawnedProcess) {
+        spawned.stdin?.closeFile()
+        spawned.stdout.closeFile()
+        spawned.stderr.closeFile()
+    }
+
+    private func assertAlreadyReaped(
+        _ pid: pid_t,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        var status: Int32 = 0
+        errno = 0
+        let result = Darwin.waitpid(pid, &status, WNOHANG)
+        let waitError = errno
+        XCTAssertEqual(result, -1, file: file, line: line)
+        XCTAssertEqual(waitError, ECHILD, file: file, line: line)
+    }
+}
+
+private struct ProcessTerminationTestDeadline {
+    private let expiration: TimeInterval
+
+    init(timeout: TimeInterval) {
+        expiration = ProcessInfo.processInfo.systemUptime + max(timeout, 0)
+    }
+
+    var remaining: TimeInterval {
+        max(0, expiration - ProcessInfo.processInfo.systemUptime)
+    }
+}
+
+private final class BlockedOutcomePublicationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let holdingSemaphore = DispatchSemaphore(value: 0)
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var released = false
+
+    func hold(_: ChildProcessExitObserver.Outcome) {
+        lock.lock()
+        let shouldWait = !released
+        lock.unlock()
+        holdingSemaphore.signal()
+        if shouldWait {
+            releaseSemaphore.wait()
+        }
+    }
+
+    func waitUntilHolding(timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [holdingSemaphore] in
+                continuation.resume(
+                    returning: holdingSemaphore.wait(timeout: .now() + max(timeout, 0)) == .success
+                )
+            }
+        }
+    }
+
+    func release() {
+        lock.lock()
+        guard !released else {
+            lock.unlock()
+            return
+        }
+        released = true
+        lock.unlock()
+        releaseSemaphore.signal()
+    }
+}
+
+private actor BlockedOutcomePublicationCleanup {
+    private struct ObservedChild {
+        let spawned: SpawnedProcess
+        let observer: ChildProcessExitObserver
+    }
+
+    private let gate: BlockedOutcomePublicationGate
+    private var children: [ObservedChild] = []
+    private var didRun = false
+
+    init(gate: BlockedOutcomePublicationGate) {
+        self.gate = gate
+    }
+
+    func track(_ spawned: SpawnedProcess, observer: ChildProcessExitObserver) {
+        children.append(ObservedChild(spawned: spawned, observer: observer))
+    }
+
+    func run() async {
+        guard !didRun else { return }
+        didRun = true
+        gate.release()
+
+        let ownedChildren = children
+        children.removeAll()
+        for child in ownedChildren {
+            child.spawned.stdin?.closeFile()
+            child.spawned.stdout.closeFile()
+            child.spawned.stderr.closeFile()
+        }
+        for child in ownedChildren {
+            if await child.observer.wait(timeout: 0) == nil {
+                _ = child.observer.signalRootProcessFamilyIfUnreaped(
+                    processGroupID: child.spawned.processGroupID,
+                    signal: SIGKILL
+                )
+            }
+        }
+        for child in ownedChildren {
+            _ = await child.observer.wait(timeout: 1)
+        }
     }
 }
 

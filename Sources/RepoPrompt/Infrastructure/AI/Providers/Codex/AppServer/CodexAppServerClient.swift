@@ -389,7 +389,11 @@ actor CodexAppServerClient {
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
+    private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
+    #if DEBUG
+        private var terminalObserverJoinCount = 0
+    #endif
 
     deinit {
         emergencyTerminateTransportForDeinit()
@@ -403,11 +407,15 @@ actor CodexAppServerClient {
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
+        processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
+            ChildProcessExitObserver(pid: $0)
+        },
         expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
+        self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
     }
 
@@ -765,15 +773,35 @@ actor CodexAppServerClient {
             await existing.task.value
             return
         }
-        if let observer = activeTransport?.exitObservation?.observer,
-           let outcome = await observer.wait(timeout: Self.exitDiagnosticSettlementWindow)
+        if let activeTransport,
+           activeTransport.generation == generation,
+           let observer = activeTransport.exitObservation?.observer
         {
-            await handleObservedProcessExit(
-                outcome,
-                observer: observer,
-                generation: generation
-            )
-            return
+            if let outcome = await observer.wait(timeout: Self.exitDiagnosticSettlementWindow) {
+                await handleObservedProcessExit(
+                    outcome,
+                    observer: observer,
+                    generation: generation
+                )
+                return
+            }
+
+            // A terminal root can race the bounded diagnostic wait without
+            // making a reused-PID signal safe. Join the sole observer so its
+            // typed exit survives; waitid remains non-destructive.
+            if ProcessTermination.childIsTerminalOrAlreadyReaped(activeTransport.process.pid) {
+                #if DEBUG
+                    terminalObserverJoinCount += 1
+                #endif
+                if let outcome = await observer.wait() {
+                    await handleObservedProcessExit(
+                        outcome,
+                        observer: observer,
+                        generation: generation
+                    )
+                    return
+                }
+            }
         }
         await terminateTransport(
             flushStdout: flushStdout,
@@ -979,12 +1007,7 @@ actor CodexAppServerClient {
     private static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
         // Use a non-destructive child-state check so exited/zombie children do not
         // look healthy, while leaving final reap/cleanup to the normal teardown path.
-        var info = siginfo_t()
-        let waitResult = Darwin.waitid(P_PID, id_t(process.pid), &info, WEXITED | WNOHANG | WNOWAIT)
-        if waitResult == 0, info.si_pid == process.pid {
-            return false
-        }
-        if waitResult == -1, errno == ECHILD {
+        if ProcessTermination.childIsTerminalOrAlreadyReaped(process.pid) {
             return false
         }
 
@@ -1260,7 +1283,7 @@ actor CodexAppServerClient {
         // every successful spawn immediately has one cancellation-independent reaper.
         transportGeneration &+= 1
         let generation = transportGeneration
-        let exitObserver = ChildProcessExitObserver(pid: spawned.pid)
+        let exitObserver = processExitObserverFactory(spawned.pid)
         let capture = CodexProcessStderrCapture(byteLimit: Self.stderrTailLimit)
 
         stdoutFramer = LineFramer()
@@ -1950,6 +1973,10 @@ actor CodexAppServerClient {
 
         static func debugDefaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
             defaultProcessAppearsAlive(process)
+        }
+
+        func debugTerminalObserverJoinCount() -> Int {
+            terminalObserverJoinCount
         }
 
         func debugDecodeRecoveryAttempts(generation: UInt64? = nil) -> Int {
