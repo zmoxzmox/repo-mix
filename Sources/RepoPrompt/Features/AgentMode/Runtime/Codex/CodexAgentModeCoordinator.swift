@@ -335,7 +335,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
-        leaseRoutingTimeoutMs: Int = 2000,
+        leaseRoutingTimeoutMs: Int = 10000,
         idleShutdownDelayNanos: UInt64 = 300_000_000_000,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
         stallWatchdogProbeThreshold: TimeInterval = 0,
