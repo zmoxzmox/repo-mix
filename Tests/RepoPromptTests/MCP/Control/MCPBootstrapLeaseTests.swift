@@ -167,6 +167,169 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #endif
     }
 
+    func testRoutingStartupProgressDistinguishesSuccessAndBothTimeoutSides() async throws {
+        #if DEBUG
+            enum Scenario: String, CaseIterable {
+                case success
+                case timeoutBeforeConnection
+                case timeoutAfterConnection
+            }
+
+            await HeadlessAgentConnectionGate.cancelAll()
+
+            for scenario in Scenario.allCases {
+                let runID = UUID()
+                let recorder = BootstrapProgressRecorder()
+                let policyRecorder = PolicyRecorder()
+                await MCPRoutingWaiter.cleanup(runID: runID)
+                let lease = MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: UUID(),
+                        windowID: 1,
+                        tabID: UUID(),
+                        clientName: "bootstrap-progress-\(scenario.rawValue)",
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "routing startup progress regression",
+                        ttl: 10,
+                        purpose: .discoverRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: false
+                    ),
+                    policyInstaller: { _ in await policyRecorder.recordInstall() },
+                    policyClearer: { _ in await policyRecorder.recordClear() }
+                )
+                let acquired = await lease.acquire()
+                XCTAssertTrue(acquired, scenario.rawValue)
+
+                if scenario != .timeoutBeforeConnection {
+                    await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
+                }
+                if scenario == .success {
+                    await MCPRoutingWaiter.notifyRouted(runID: runID)
+                }
+
+                let routed = await lease.releaseWhenRouted(
+                    timeoutMs: 10,
+                    progressReporter: { progress in
+                        await recorder.record(progress)
+                    }
+                )
+                let phases = await recorder.snapshot()
+
+                switch scenario {
+                case .success:
+                    XCTAssertTrue(routed)
+                    XCTAssertEqual(phases, [
+                        .waitingForChildConnection,
+                        .childConnectionObserved,
+                        .waitingForRouting,
+                        .routingConfirmed
+                    ])
+                    let clearCount = await policyRecorder.clearCount
+                    XCTAssertEqual(clearCount, 0)
+                case .timeoutBeforeConnection:
+                    XCTAssertFalse(routed)
+                    XCTAssertEqual(phases, [
+                        .waitingForChildConnection,
+                        .routingTimeoutBeforeConnection
+                    ])
+                    let clearCount = await policyRecorder.clearCount
+                    XCTAssertEqual(clearCount, 1)
+                case .timeoutAfterConnection:
+                    XCTAssertFalse(routed)
+                    XCTAssertEqual(phases, [
+                        .waitingForChildConnection,
+                        .childConnectionObserved,
+                        .waitingForRouting,
+                        .routingTimeoutAfterConnection
+                    ])
+                    let clearCount = await policyRecorder.clearCount
+                    XCTAssertEqual(clearCount, 1)
+                }
+
+                let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                XCTAssertNil(activeGate)
+                XCTAssertEqual(waiterCount, 0)
+                await MCPRoutingWaiter.cleanup(runID: runID)
+            }
+        #else
+            throw XCTSkip("Bootstrap routing progress diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testTimeoutSnapshotFencesLateChildObservationProgress() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let recorder = BootstrapProgressRecorder()
+            let policyClearGate = BootstrapPolicyClearGate()
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-progress-timeout-race",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "routing timeout progress fence regression",
+                    ttl: 10,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in },
+                policyClearer: { _ in
+                    await policyClearGate.block()
+                }
+            )
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            let release = Task {
+                await lease.releaseWhenRouted(
+                    timeoutMs: 10,
+                    progressReporter: { progress in
+                        await recorder.record(progress)
+                    }
+                )
+            }
+
+            await policyClearGate.waitUntilBlocked()
+            await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
+            let stickyObservation = await MCPRoutingWaiter.childConnectionWasObserved(runID: runID)
+            XCTAssertTrue(stickyObservation)
+            await policyClearGate.release()
+
+            let routed = await release.value
+            let phases = await recorder.snapshot()
+            XCTAssertFalse(routed)
+            XCTAssertEqual(phases, [
+                .waitingForChildConnection,
+                .routingTimeoutBeforeConnection
+            ])
+            XCTAssertFalse(phases.contains(.childConnectionObserved))
+            XCTAssertFalse(phases.contains(.waitingForRouting))
+
+            let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            XCTAssertNil(activeGate)
+            XCTAssertEqual(waiterCount, 0)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap routing progress diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
         #if DEBUG
             let runID = UUID()
@@ -909,5 +1072,48 @@ private actor PolicyRecorder {
 
     func recordClear() {
         clearCount += 1
+    }
+}
+
+private actor BootstrapPolicyClearGate {
+    private var blocked = false
+    private var released = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func block() async {
+        blocked = true
+        let waiters = blockedWaiters
+        blockedWaiters = []
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiter = continuation
+        }
+    }
+
+    func waitUntilBlocked() async {
+        guard !blocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+private actor BootstrapProgressRecorder {
+    private var phases: [MCPBootstrapRoutingProgress] = []
+
+    func record(_ phase: MCPBootstrapRoutingProgress) {
+        phases.append(phase)
+    }
+
+    func snapshot() -> [MCPBootstrapRoutingProgress] {
+        phases
     }
 }
