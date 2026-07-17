@@ -212,6 +212,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private weak var viewModel: AgentModeViewModel?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
+    #if DEBUG
+        private var testWorkspaceResolutionFailurePublicationGate: (@Sendable () async -> Void)?
+    #endif
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private let windowID: Int
     private let runtimeWorkspacePathsProvider: (AgentModeViewModel.TabSession) throws -> CodexRuntimeWorkspacePaths
@@ -3643,17 +3646,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 notifyOnCompleted: false,
                 deleteDeferredFilesWhenFailureHasNoInFlight: true
             )
-            return
+        } else {
+            let alreadyReported = session.items.last.map { $0.kind == .error && $0.text == message } ?? false
+            if !alreadyReported {
+                session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+            }
+            session.runState = .failed
+            setRunningStatus(nil, source: nil, session: session)
+            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            viewModel?.scheduleSave(for: session.tabID)
         }
-        let alreadyReported = session.items.last.map { $0.kind == .error && $0.text == message } ?? false
-        if !alreadyReported {
-            session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
-        }
-        session.runState = .failed
-        setRunningStatus(nil, source: nil, session: session)
-        viewModel?.setAgentRunActive(session.tabID, isActive: false)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        #if DEBUG
+            if let testWorkspaceResolutionFailurePublicationGate {
+                await testWorkspaceResolutionFailurePublicationGate()
+            }
+        #endif
     }
 
     private static func providerStartupFailureMessage(for error: Error) -> String {
@@ -3711,6 +3719,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession,
         controller: any CodexSessionControlling
     ) async {
+        guard let activeController = session.codexController,
+              Self.sameCodexControllerInstance(activeController, controller)
+        else {
+            await controller.shutdown()
+            return
+        }
+
         cancelCodexThreadNameSync(for: session.tabID)
         cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexControllerRuntimeState(for: session)
@@ -3725,8 +3740,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.pendingCodexComputerUseActivation = nil
         clearCodexPendingInteractions(in: session)
         clearCodexNativeToolLiveness(session)
-        await controller.shutdown()
         await stopCodexToolTrackingAndWait(for: session)
+        await controller.shutdown()
     }
 
     func ensureCodexNativeSession(
@@ -7061,6 +7076,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        @_spi(TestSupport)
+        public func test_setWorkspaceResolutionFailurePublicationGate(
+            _ gate: (@Sendable () async -> Void)?
+        ) {
+            testWorkspaceResolutionFailurePublicationGate = gate
+        }
+
         @_spi(TestSupport)
         public func test_handleCodexNativeEvent(
             _ event: CodexNativeSessionController.Event,

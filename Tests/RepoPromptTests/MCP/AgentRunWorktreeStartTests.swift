@@ -640,6 +640,84 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
         )
         XCTAssertEqual(controller.shutdownCallCount, 1)
+
+        let staleController = ReplacementIdentityFakeCodexController()
+        session.codexController = staleController
+        session.codexControllerWorkspacePaths = .worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        session.runState = .running
+        session.beginRunAttempt(source: "test.workspace-resolution-publication-race")
+        let publicationGate = AgentRunWorktreeStartAsyncGate()
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate {
+            await publicationGate.markStartedAndWaitForRelease()
+        }
+
+        let failureTask = Task {
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        }
+        await publicationGate.waitUntilStarted()
+
+        let shutdownGate = AgentRunWorktreeStartAsyncGate()
+        let replacementController = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
+        let replacementRunID = UUID()
+        session.codexController = replacementController
+        session.codexControllerWorkspacePaths = .worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        session.codexEventTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        session.codexEventTaskRunID = replacementRunID
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+
+        await publicationGate.release()
+        await failureTask.value
+        viewModel.test_codexCoordinator.test_setWorkspaceResolutionFailurePublicationGate(nil)
+
+        XCTAssertEqual(controllerIdentity(in: session), ObjectIdentifier(replacementController))
+        XCTAssertNotNil(session.codexControllerWorkspacePaths)
+        XCTAssertNotNil(session.codexEventTask)
+        XCTAssertEqual(session.codexEventTaskRunID, replacementRunID)
+        XCTAssertNotNil(session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+        XCTAssertEqual(staleController.shutdownCallCount, 1)
+        XCTAssertEqual(replacementController.shutdownCallCount, 0)
+
+        let matchingCleanupTask = Task {
+            await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        }
+        await shutdownGate.waitUntilStarted()
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+
+        let successorController = ReplacementIdentityFakeCodexController()
+        session.codexController = successorController
+        viewModel.test_codexCoordinator.test_installCodexToolTrackingPlaceholder(
+            for: session.tabID
+        )
+        await shutdownGate.release()
+        await matchingCleanupTask.value
+
+        XCTAssertEqual(replacementController.shutdownCallCount, 1)
+        XCTAssertEqual(controllerIdentity(in: session), ObjectIdentifier(successorController))
+        XCTAssertTrue(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(successorController.shutdownCallCount, 1)
+        XCTAssertFalse(
+            viewModel.test_codexCoordinator.test_hasCodexToolTracking(for: session.tabID)
+        )
     }
 
     func testCodexControllerReplacementKeysOnExecutionChangeAndSurvivesSecondaryBindingChanges() async throws {
@@ -4592,8 +4670,10 @@ private final class ReplacementIdentityFakeCodexController: CodexSessionControll
     private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
     private(set) var shutdownCallCount = 0
     private let eventsStream: AsyncStream<CodexNativeSessionController.Event>
+    private let shutdownGate: AgentRunWorktreeStartAsyncGate?
 
-    init() {
+    init(shutdownGate: AgentRunWorktreeStartAsyncGate? = nil) {
+        self.shutdownGate = shutdownGate
         var continuationRef: AsyncStream<CodexNativeSessionController.Event>.Continuation?
         eventsStream = AsyncStream { continuation in
             continuationRef = continuation
@@ -4611,6 +4691,9 @@ private final class ReplacementIdentityFakeCodexController: CodexSessionControll
 
     func shutdown() async {
         shutdownCallCount += 1
+        if let shutdownGate {
+            await shutdownGate.markStartedAndWaitForRelease()
+        }
         eventsContinuation?.finish()
         eventsContinuation = nil
     }
