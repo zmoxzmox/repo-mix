@@ -1727,12 +1727,13 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
         let policy = CodeMapRootManifestStorePolicy.default
+        let namespaceScope = "\(#function)-shared"
         let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
         for index in 0 ..< 255 {
             let fixture = try await makeFixture(
                 root: root,
                 artifactStore: artifactStore,
-                namespaceScope: "\(#function)-resident-\(index)",
+                namespaceScope: namespaceScope,
                 worktreeByte: UInt8(index),
                 prefix: "",
                 path: "Sources/Resident.swift",
@@ -1750,12 +1751,12 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 data: CodeMapRootManifestCodec.encode(snapshot: snapshot)
             )
             insertion.insertOnce()
-            XCTAssertNil(insertion.failure)
+            XCTAssertNil(insertion.failure, "resident fixture index \(index)")
         }
         let target = try await makeFixture(
             root: root,
             artifactStore: artifactStore,
-            namespaceScope: "\(#function)-target",
+            namespaceScope: namespaceScope,
             worktreeByte: 0xFF,
             prefix: "",
             path: "Sources/Target.swift",
@@ -1778,11 +1779,11 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         )
         let elapsed = started.duration(to: clock.now)
 
-        XCTAssertEqual(work.scanCount, 2)
-        XCTAssertLessThan(elapsed, .seconds(15))
+        XCTAssertEqual(work.scanCount, 2, "target publication scan count")
+        XCTAssertLessThan(elapsed, .seconds(15), "target publication elapsed time")
         let accounting = try await store.accounting()
-        XCTAssertEqual(accounting.manifestCount, 256)
-        XCTAssertFalse(accounting.hasMore)
+        XCTAssertEqual(accounting.manifestCount, 256, "target publication manifest count")
+        XCTAssertFalse(accounting.hasMore, "target publication accounting must be complete")
     }
 
     func testDecodedManifestCacheHonorsEncodedByteBudget() async throws {
