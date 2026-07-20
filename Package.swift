@@ -101,9 +101,8 @@ if benchmarkTestsEnabled {
     repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
-let swift5CompleteConcurrencyChecking: [SwiftSetting] = [
-    .swiftLanguageMode(.v5),
-    .enableExperimentalFeature("StrictConcurrency")
+let swift6LanguageMode: [SwiftSetting] = [
+    .swiftLanguageMode(.v6)
 ]
 
 let package = Package(
@@ -128,7 +127,7 @@ let package = Package(
             name: "RepoPromptRegexCore",
             dependencies: ["CSwiftPCRE2"],
             path: "Sources/RepoPromptRegexCore",
-            swiftSettings: swift5CompleteConcurrencyChecking
+            swiftSettings: swift6LanguageMode
         ),
         .target(
             name: "RepoPromptCodeMapCore",
@@ -151,7 +150,7 @@ let package = Package(
                 .product(name: "TreeSitterPHP", package: "tree-sitter-php")
             ],
             path: "Sources/RepoPromptCodeMapCore",
-            swiftSettings: swift5CompleteConcurrencyChecking + [
+            swiftSettings: swift6LanguageMode + [
                 .define("DEBUG", .when(configuration: .debug))
             ]
         ),
@@ -187,7 +186,7 @@ let package = Package(
             name: "RepoPromptRegexCoreTests",
             dependencies: ["RepoPromptRegexCore"],
             path: "Tests/RepoPromptRegexCoreTests",
-            swiftSettings: swift5CompleteConcurrencyChecking
+            swiftSettings: swift6LanguageMode
         ),
         .testTarget(
             name: "RepoPromptCodeMapCoreTests",
@@ -197,7 +196,7 @@ let package = Package(
                 .copy("Fixtures"),
                 .copy("Goldens")
             ],
-            swiftSettings: swift5CompleteConcurrencyChecking + [
+            swiftSettings: swift6LanguageMode + [
                 .define("DEBUG", .when(configuration: .debug))
             ]
         ),
