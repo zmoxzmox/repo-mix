@@ -629,6 +629,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
         addTeardownBlock { repositories.cleanup() }
         let window = try await makeWindow(root: root)
+        // Let the post-switch Git-data load settle before publishing selection. A late
+        // load can otherwise supersede this test's tab selection on slower runners.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         let store = window.workspaceFileContextStore
         let rootRefs = await store.rootRefs(scope: .visibleWorkspace)
         let loadedRoot = try XCTUnwrap(rootRefs.first)
