@@ -1528,6 +1528,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "Active"
         case .paused:
             "Paused"
+        case .blocked:
+            "Blocked"
+        case .usageLimited:
+            "Usage limited"
         case .budgetLimited:
             "Budget limited"
         case .complete:
