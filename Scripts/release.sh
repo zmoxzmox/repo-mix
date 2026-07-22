@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
 TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
+APPROVED_SOURCE_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
+CODEX_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
@@ -78,6 +80,7 @@ run_preflight() {
     require_command plutil
     require_command shasum
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/swiftpm_notice_guardrails.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_vendor_guardrails.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh"
     require_file "$ROOT_DIR/AppBundle/Info.plist.template"
     require_file "$ROOT_DIR/AppBundle/RepoPrompt.entitlements.template"
@@ -100,6 +103,11 @@ run_preflight() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/patches/keyboardshortcuts-2.3.0-resource-lookup.patch"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
+    require_file "$CODEX_MANIFEST"
+    require_file "$ROOT_DIR/ThirdPartyLicenses/codex/LICENSE"
+    require_file "$ROOT_DIR/ThirdPartyLicenses/codex/NOTICE"
+    require_file "$ROOT_DIR/ThirdPartyLicenses/codex/ZSH-LICENCE"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     require_file "$RUN_WITHOUT_GITHUB_TOKENS"
@@ -118,6 +126,8 @@ run_preflight() {
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/swiftpm_notice_guardrails.sh"
+    REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/codex_vendor_guardrails.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh" --check
 
@@ -154,6 +164,10 @@ validate_public_app() {
     local label="$3"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
+        --manifest "$CODEX_MANIFEST" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \
