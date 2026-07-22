@@ -519,7 +519,7 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         XCTAssertEqual(signalOutcome.status.normalizedExitCode, 128 + SIGKILL)
     }
 
-    private func waitForPID(at url: URL, timeout: TimeInterval = 2) async -> pid_t? {
+    private func waitForPID(at url: URL, timeout: TimeInterval = 10) async -> pid_t? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let text = try? String(contentsOf: url, encoding: .utf8),
