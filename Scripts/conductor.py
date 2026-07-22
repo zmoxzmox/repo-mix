@@ -1244,6 +1244,8 @@ class OperationRegistry:
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "REPOPROMPT_CODEX_ARCH",
+        "REPOPROMPT_CODEX_CACHE_ROOT",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",

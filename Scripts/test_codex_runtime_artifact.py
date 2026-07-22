@@ -36,6 +36,7 @@ class CodexRuntimeArtifactTests(unittest.TestCase):
         self.archives = self.temp / "archives"
         self.archives.mkdir()
         self.cache = self.temp / "cache"
+        self.bundle = self.temp / "Codex"
         self.bin = self.temp / "bin"
         self.bin.mkdir()
         self.lipo = self.bin / "lipo"
@@ -58,12 +59,19 @@ if [[ "$1" == "--verify" ]]; then
 fi
 path="${!#}"
 identifier="$(basename "$path")"
+team_identifier="2DC432GLL2"
+authority="Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)"
 if [[ "${FAKE_SIGNATURE_METADATA_FAILURE:-0}" == "1" ]]; then identifier=wrong; fi
+case "${FAKE_SIGNATURE_PREFIX_COLLISION:-}" in
+  identifier) identifier="${identifier}-collision" ;;
+  team) team_identifier="${team_identifier}-collision" ;;
+  authority) authority="${authority} Collision" ;;
+esac
 cat >&2 <<EOF
 Identifier=$identifier
 CodeDirectory flags=${FAKE_CODE_DIRECTORY_FLAGS:-0x10000(runtime)}
-Authority=Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)
-TeamIdentifier=2DC432GLL2
+Authority=$authority
+TeamIdentifier=$team_identifier
 EOF
 if [[ "${FAKE_OMIT_TIMESTAMP:-0}" != "1" ]]; then
     printf 'Timestamp=Jul 18, 2026 at 22:31:39\n' >&2
@@ -241,6 +249,63 @@ fi
         self.assertTrue((packaged / "bin" / "codex-code-mode-host").is_file())
         self.assertTrue((packaged / "codex-resources" / "zsh" / "bin" / "zsh").is_file())
 
+    def test_stage_and_verify_universal_bundle_uses_exact_target_directories(self) -> None:
+        self.acquire_all()
+        self.run_tool(
+            "stage-bundle",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+            "--bundle",
+            str(self.bundle),
+        )
+
+        self.assertEqual(
+            {path.name for path in self.bundle.iterdir()},
+            {"aarch64-apple-darwin", "x86_64-apple-darwin"},
+        )
+        self.assertEqual(
+            (self.bundle / "aarch64-apple-darwin" / "bin" / "codex").read_text(encoding="utf-8").splitlines()[0],
+            "ARCH=arm64",
+        )
+        self.assertEqual(
+            (self.bundle / "x86_64-apple-darwin" / "bin" / "codex").read_text(encoding="utf-8").splitlines()[0],
+            "ARCH=x86_64",
+        )
+        self.run_tool("verify-bundle", "--arch", "all", "--bundle", str(self.bundle))
+
+    def test_verify_universal_bundle_rejects_missing_or_extra_target(self) -> None:
+        self.acquire_all()
+        self.run_tool(
+            "stage-bundle", "--arch", "all", "--cache-root", str(self.cache),
+            "--bundle", str(self.bundle),
+        )
+        shutil.rmtree(self.bundle / "x86_64-apple-darwin")
+        missing = self.run_tool(
+            "verify-bundle", "--arch", "all", "--bundle", str(self.bundle), expected=1,
+        )
+        self.assertIn("missing=['x86_64-apple-darwin']", missing.stderr)
+
+        (self.bundle / "unexpected").mkdir()
+        extra = self.run_tool(
+            "verify-bundle", "--arch", "arm64", "--bundle", str(self.bundle), expected=1,
+        )
+        self.assertIn("extra=['unexpected']", extra.stderr)
+
+    def test_stage_single_target_bundle_keeps_non_public_packaging_coherent(self) -> None:
+        self.run_tool(
+            "acquire", "--arch", "x86_64", "--archive-dir", str(self.archives),
+            "--cache-root", str(self.cache),
+        )
+        self.run_tool(
+            "stage-bundle", "--arch", "x86_64", "--cache-root", str(self.cache),
+            "--bundle", str(self.bundle),
+        )
+
+        self.assertEqual([path.name for path in self.bundle.iterdir()], ["x86_64-apple-darwin"])
+        self.run_tool("verify-bundle", "--arch", "x86_64", "--bundle", str(self.bundle))
+
     def test_verified_cache_hit_requires_no_source_or_network(self) -> None:
         self.acquire_all()
         shutil.rmtree(self.archives)
@@ -315,7 +380,8 @@ fi
         self.assertEqual(result.stdout.strip(), "0.144.6")
         source = (ROOT / "Scripts" / "package_app.sh").read_text(encoding="utf-8")
         self.assertIn('CODEX_VERSION="$(python3 "$CODEX_ARTIFACT_TOOL"', source)
-        self.assertIn('CODEX_PACKAGE_DIR="$CODEX_CACHE_ROOT/$CODEX_VERSION/$CODEX_TARGET"', source)
+        self.assertIn('stage-bundle', source)
+        self.assertIn('--cache-root "$CODEX_CACHE_ROOT"', source)
         self.assertNotIn("CODEX_CACHE_ROOT/0.144.6", source)
 
     def test_archive_accepts_file_members_before_explicit_parent_directories(self) -> None:
@@ -414,9 +480,25 @@ fi
         )
         self.assertIn("trusted signing timestamp", no_timestamp.stderr)
 
+    def test_signing_metadata_prefix_collisions_are_rejected(self) -> None:
+        self.acquire_all()
+        package = self.cache / "0.144.6" / "aarch64-apple-darwin"
+        for field in ("identifier", "team", "authority"):
+            with self.subTest(field=field):
+                result = self.run_tool(
+                    "verify",
+                    "--arch",
+                    "arm64",
+                    "--package",
+                    str(package),
+                    env={"FAKE_SIGNATURE_PREFIX_COLLISION": field},
+                    expected=1,
+                )
+                self.assertIn("must equal", result.stderr)
+
     def test_package_script_embeds_before_outer_sign_and_never_resigns_codex(self) -> None:
         source = (ROOT / "Scripts" / "package_app.sh").read_text(encoding="utf-8")
-        embed = source.index('phase "Embedding verified Codex $CODEX_VERSION package"')
+        embed = source.index('phase "Embedding verified Codex $CODEX_VERSION target package artifacts"')
         sign = source.index('phase "Signing app bundle"')
         post_sign = source.index("# The outer signature seals the resource tree")
         self.assertLess(embed, sign)
@@ -424,6 +506,9 @@ fi
         signing_section = source[sign:post_sign]
         self.assertNotIn('sign_path "$CODEX_APP_DIR"', signing_section)
         self.assertIn("Contents/Resources/BundledRuntimes/Codex", source)
+        self.assertIn('stage-bundle', source)
+        self.assertIn('verify-bundle', source)
+        self.assertIn('CODEX_BUNDLE_ARCH="all"', source)
 
 
 if __name__ == "__main__":
