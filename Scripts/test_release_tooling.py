@@ -201,6 +201,15 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
 
+    def test_staged_signing_uses_trusted_verifier_with_approved_codex_identity(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
+        self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
+        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
+        self.assertEqual(source.count('--arch all'), 2)
+        self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
@@ -1961,6 +1970,44 @@ sys.stdout.write(str(status))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
 
+    def test_public_app_validation_uses_approved_manifest_from_extracted_stage_layout(self) -> None:
+        for script_name in ("release.sh", "main_tip_release.sh"):
+            with self.subTest(script=script_name):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                self.assertFalse((staged / "Vendor").exists())
+
+                result, capture = self.run_public_app_validation(
+                    approved,
+                    staged,
+                    scripts,
+                    script_name,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), 1)
+                self.assertIn(str(approved / "Vendor" / "Codex" / "manifest.json"), calls[0])
+                self.assertNotIn(str(staged / "Vendor"), calls[0])
+
+    def test_staged_release_validator_rejects_missing_approved_codex_manifest(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        (approved / "Vendor" / "Codex" / "manifest.json").unlink()
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing approved Codex manifest", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_embedded_codex_package_target(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        bundle = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+        shutil.rmtree(bundle / "x86_64-apple-darwin")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
+
     def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
         app = staged / ".build" / "release" / "RepoPrompt.app"
@@ -3536,12 +3583,15 @@ extension Data {
         app = staged / ".build" / "release" / "RepoPrompt.app"
         for directory in (
             approved / "AppBundle",
+            approved / "Vendor" / "Codex",
             approved / "ThirdPartyLicenses" / "fixture",
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -3553,9 +3603,17 @@ extension Data {
             "validate_packaged_legal.sh",
             "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
+            "release_sentry_symbols.sh",
+            "release.sh",
+            "main_tip_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
+        (scripts / "codex_runtime_artifact.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_bundle = Path(os.environ[\"FAKE_CODEX_BUNDLE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n    str(expected_bundle),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not expected_bundle.is_dir() or {path.name for path in expected_bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {expected_bundle}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            encoding="utf-8",
+        )
+        (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
         metadata = """\
 APP_NAME=RepoPrompt
 DISPLAY_NAME="RepoPrompt CE"
@@ -3657,7 +3715,22 @@ esac
         (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
-    def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:
+    def codex_fixture_environment(approved: Path, staged: Path) -> dict[str, str]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        return {
+            "FAKE_CODEX_MANIFEST": str(approved / "Vendor" / "Codex" / "manifest.json"),
+            "FAKE_CODEX_BUNDLE": str(
+                app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+            ),
+        }
+
+    @classmethod
+    def run_staged_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
             {
@@ -3666,6 +3739,7 @@ esac
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
                 "LIPO": str(scripts / "fake-lipo"),
                 "CODESIGN": str(scripts / "fake-codesign"),
+                **cls.codex_fixture_environment(approved, staged),
             }
         )
         return subprocess.run(
@@ -3674,6 +3748,48 @@ esac
             text=True,
             capture_output=True,
         )
+
+    @classmethod
+    def run_public_app_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+        script_name: str,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        artifact_manifest = staged / ".build" / "release" / "RepoPrompt-artifact-manifest.json"
+        capture = staged.parent / f"{script_name}-codex-calls.txt"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RELEASE_COMMIT": "fixture-release-commit",
+                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "TIP_COMMIT": "fixture-release-commit",
+                "TIP_BUILD_NUMBER": "1.1",
+                "LIPO": str(scripts / "fake-lipo"),
+                "CODESIGN": str(scripts / "fake-codesign"),
+                "FAKE_CODEX_CAPTURE": str(capture),
+                **cls.codex_fixture_environment(approved, staged),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; TMP_DIR="$(mktemp -d)"; validate_public_app "$2" "$3" "Extracted stage fixture"',
+                "bash",
+                str(scripts / script_name),
+                str(app),
+                str(artifact_manifest),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        return result, capture
 
     def make_git_remote(self) -> tuple[Path, Path]:
         parent = Path(tempfile.mkdtemp())
