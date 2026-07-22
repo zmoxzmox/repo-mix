@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 METADATA_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
+CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
 source "$SCRIPT_DIR/load_release_metadata.sh"
 load_release_metadata "$METADATA_ROOT"
 
@@ -27,6 +28,10 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$SCRIPT_DIR/validate_staged_release.sh"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
     "$SCRIPT_DIR/verify_sparkle_vendor.sh"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" verify \
+    --arch aarch64-apple-darwin \
+    --package "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 
 rm -rf "$STAGED_SPARKLE_FRAMEWORK"
 mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
@@ -94,6 +99,10 @@ sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" verify \
+    --arch aarch64-apple-darwin \
+    --package "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 "$SCRIPT_DIR/validate_app_architectures.sh" \
     "$APP_BUNDLE" \
     "arm64,x86_64" \

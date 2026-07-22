@@ -1,6 +1,7 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
+CODEX_ARCH ?= all
 
 help:
 	@printf '%s\n' 'Usage: make <target>'
@@ -44,6 +45,8 @@ help:
 	@printf '  %-30s %s\n' 'install-debug-cli' 'Build and install the CE debug CLI'
 	@printf '  %-30s %s\n' 'uninstall-debug-cli' 'Uninstall the CE debug CLI'
 	@printf '  %-30s %s\n' 'debug-cli-status' 'Show CE debug CLI status'
+	@printf '  %-30s %s\n' 'codex-acquire' 'Acquire and verify pinned Codex package(s); override with CODEX_ARCH=host|arm64|x86_64'
+	@printf '  %-30s %s\n' 'codex-status' 'Verify cached pinned Codex packages without network access'
 	@printf '\n%s\n' 'Xcode workspace targets:'
 	@printf '  %-30s %s\n' 'xcode' 'Generate and open the disposable Xcode workspace'
 	@printf '  %-30s %s\n' 'xcode-generate' 'Generate the disposable Xcode workspace'
@@ -97,6 +100,12 @@ uninstall-debug-cli:
 debug-cli-status:
 	./Scripts/install_debug_cli.sh status
 
+codex-acquire:
+	python3 Scripts/codex_runtime_artifact.py acquire --arch $(CODEX_ARCH) --cache-root "$${REPOPROMPT_CODEX_CACHE_ROOT:-.build/codex-runtime}"
+
+codex-status:
+	python3 Scripts/codex_runtime_artifact.py status --cache-root "$${REPOPROMPT_CODEX_CACHE_ROOT:-.build/codex-runtime}"
+
 resolve:
 	swift package resolve
 
@@ -129,6 +138,7 @@ ci-app-test-runner-selftest:
 release-selftest:
 	python3 Scripts/test_release_promotion.py
 	python3 Scripts/test_release_tooling.py
+	python3 Scripts/test_codex_runtime_artifact.py
 
 release-sync-cli-version:
 	./Scripts/release.sh sync-cli-version

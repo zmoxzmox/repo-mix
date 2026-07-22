@@ -21,6 +21,74 @@ RepoPrompt CE starts a new public release line at `1.0.0 (1)`. Its separate
 bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
 the closed app's version history.
 
+## Bundled Codex artifact
+
+Debug and release packaging include the complete official OpenAI Codex 0.144.6
+standalone package. The authority is the repository-owned
+[`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
+official [`rust-v0.144.6` release](https://github.com/openai/codex/releases/tag/rust-v0.144.6),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.144.6/codex-package_SHA256SUMS),
+both macOS package assets, their complete extracted layouts, file hashes,
+architectures, and primary executable signing identities. The upstream release
+publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
+verification procedure, so acquisition requires both the fixed HTTPS release
+URLs and agreement between the official checksum file and the independently
+pinned repository manifest.
+
+Packaging is the only automatic acquisition boundary; the app never downloads
+Codex at runtime. To acquire or inspect the cache explicitly:
+
+```bash
+make codex-acquire                         # verifies both macOS packages
+make codex-acquire CODEX_ARCH=host         # current host only
+make codex-status                          # offline verification of both caches
+```
+
+The verified cache lives under `.build/codex-runtime/<manifest-version>/<target>/`
+by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Debug packages
+select the host architecture unless `REPOPROMPT_CODEX_ARCH` is set. Public
+universal release builds acquire and verify both official macOS packages and
+deterministically embed the `aarch64-apple-darwin` package; public packaging
+rejects any other selection. Runtime authority, architecture
+fallback, `CODEX_HOME`/`CODEX_SQLITE_HOME`, and override UI are intentionally
+not decided by this packaging milestone.
+
+The intact package is copied to
+`Contents/Resources/BundledRuntimes/Codex`. This preserves `codex-package.json`,
+`bin/codex`, `bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and
+all additional package resources. The two primary macOS executables are
+Developer ID signed by `OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened
+runtime and timestamps. RepoPrompt's signing scripts do **not** thin, mutate, or
+re-sign anything in this subtree. The outer app signature seals the resource
+tree, after which the artifact verifier rechecks every byte, architecture, and
+upstream signature. Privileged staged signing and post-notarization validation
+run the verifier implementation from trusted control-plane tooling while reading
+artifact identity from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`;
+the intentionally minimal staged payload does not carry a second manifest copy.
+This mixed-authority layout passes macOS strict deep code
+signature verification without changing the upstream binary hashes. Actual
+notarization remains enforced by the protected release workflow; if Apple ever
+rejects this policy, stop rather than silently re-signing the upstream payload.
+
+The standalone package also contains the upstream Zsh executable at
+`codex-resources/zsh/bin/zsh`. Its exact Zsh 5.9 licence is included as
+[`ThirdPartyLicenses/codex/ZSH-LICENCE`](../ThirdPartyLicenses/codex/ZSH-LICENCE)
+and is covered by the packaged legal inventory checksum contract.
+
+To diagnose acquisition independently of a build, run:
+
+```bash
+python3 Scripts/codex_runtime_artifact.py acquire --arch all
+python3 Scripts/codex_runtime_artifact.py verify \
+  --arch aarch64-apple-darwin \
+  --package .build/codex-runtime/0.144.6/aarch64-apple-darwin
+```
+
+Rotate the pin only by reviewing a new official release and its checksum asset,
+updating every archive and exact-tree hash in the manifest, capturing the new
+license/notice files, and rerunning the offline artifact tests plus a protected
+release candidate. Never derive a new pin from an unverified local installation.
+
 ## Release ownership
 
 Ordinary contributors prepare release candidates. They do not need Apple
